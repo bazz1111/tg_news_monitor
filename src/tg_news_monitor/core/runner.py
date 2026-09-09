@@ -27,6 +27,7 @@ except ImportError:
 from tg_news_monitor.config import Settings, get_config
 from tg_news_monitor.core.policy import DeliveryPolicy, fingerprint, is_fresh, urgent
 from tg_news_monitor.core import schedule as alert_schedule
+from tg_news_monitor.core.quiet_hours import QuietHours, BEIJING
 from tg_news_monitor.core.filters import (
     _COARSE_EMPTY_MAX_LEN,
     _COARSE_SPAM_RES,
@@ -73,6 +74,7 @@ class NewsMonitorRunner:
         self.storage = storage or PostRepository(db_path=self.config.db_path)
 
         self.policy = DeliveryPolicy(self.storage.db_path)
+        self.quiet = QuietHours(self.storage.db_path, self.config)
 
         # Scraper client
         if scraper_client is not None:
@@ -124,6 +126,9 @@ class NewsMonitorRunner:
             "total_alerts_sent": 0,
             "errors": [],
         }
+
+    def _now(self):
+        return datetime.now(timezone.utc)
 
     def stop(self) -> None:
         """Signals the continuous daemon loop to exit gracefully."""
@@ -360,7 +365,7 @@ class NewsMonitorRunner:
     ) -> float:
         if not pending_pairs:
             return 0.0
-        clock = now or datetime.now(timezone.utc)
+        clock = now or self._now()
         oldest = min(scraped_at for _, scraped_at in pending_pairs)
         if oldest.tzinfo is None:
             oldest = oldest.replace(tzinfo=timezone.utc)
@@ -375,6 +380,77 @@ class NewsMonitorRunner:
             return max(1, min(10, int(raw_score)))
         except (TypeError, ValueError):
             return max(1, min(10, 11 - int(item.rank)))
+
+    def _morning_report(self, pending_pairs, summary, now, live_clock=True):
+        overnight = [p for p, _ in pending_pairs if self.quiet.in_window(p.published_at, now)]
+        ranked = {(p.channel.lower(), p.message_id): (p, i.score or 7) for p, i in self.quiet.archived(now)}
+        for post in overnight:
+            ranked.setdefault((post.channel.lower(), post.message_id), (post, 7))
+        posts = [p for p, _ in sorted(ranked.values(), key=lambda pair: (pair[1], pair[0].published_at), reverse=True)]
+        posts, _, _ = coarse_filter_posts(posts)
+        unique = {}
+        for post in posts:
+            unique.setdefault(fingerprint(post.text), post)
+        candidates = list(unique.values())[:self.config.digest_max_batch_size]
+        if not candidates:
+            if self.quiet.claim_morning(now):
+                self.quiet.complete_morning(now, 'empty')
+            return summary
+        if not self.policy.reserve_call(self.config.digest_min_interval_seconds, self.config.digest_max_calls_per_day, now):
+            return summary
+        start, end = self.quiet.window(now)
+        self.evaluator.recent_history = ''
+        self.evaluator.digest_context = f"生成北京时间夜间摘要，范围 {start.isoformat()} 至 {end.isoformat()}，不是实时快讯。允许复盘已提醒的重大新闻。仅按输入判断最新进展，合并同事件；更正覆盖旧说法，剔除撤回信息，不得声称已核实输入以外的最新状态。精选最多5个事件，不凑数，保留event_at与来源ID。"
+        try:
+            digest = self.evaluator.evaluate_digest(candidates)
+        except Exception as exc:
+            logger.error(f'Morning evaluation failed; archive retained: {exc}')
+            return summary
+        finally:
+            self.policy.record_usage(getattr(self.evaluator, 'last_usage', None))
+            self.evaluator.digest_context = ''
+        summary['posts_evaluated'] = len(candidates)
+        self.stats['total_posts_evaluated'] += len(candidates)
+        allowed = {(p.channel.lower().lstrip('@'), p.message_id): p for p in candidates}
+        items, keys = [], set()
+        for item in digest.items if digest.has_material_news else []:
+            key = (item.channel.lower().lstrip('@'), item.message_id)
+            if key not in allowed or key in keys or not self.quiet.in_window(item.event_at, now):
+                continue
+            if _text_looks_crypto(item.model_dump_json()) or (item.score or 11 - item.rank) < self.config.morning_flush_hotness_threshold:
+                continue
+            keys.add(key)
+            items.append(item)
+        # Never send yesterday's or late-recovered morning report as a current alert.
+        checked_at = self._now() if live_clock else now
+        if not self.quiet.morning_due(checked_at) or self.quiet.day(checked_at) != self.quiet.day(now):
+            return summary
+        if not self.quiet.claim_morning(now):
+            return summary
+        self._mark_all_filtered(overnight, 'morning_processed')
+        if not items:
+            self.quiet.complete_morning(now, 'empty')
+            return summary
+        elements = [{'tag': 'markdown', 'content': f'北京时间 {start:%m-%d %H:%M}—{end:%m-%d %H:%M} · 夜间回顾，非即时快讯；截至本次已采集材料。'}]
+        for index, item in enumerate(items[:5], 1):
+            post = allowed[(item.channel.lower().lstrip('@'), item.message_id)]
+            event_time = item.event_at.astimezone(BEIJING).strftime('%H:%M')
+            elements.append({'tag': 'markdown', 'content': f'**{index}. {item.title}**\n{item.summary}\n关注：{item.impact_overall}\n事件时间：{event_time}（北京时间） · [原文](https://t.me/{post.channel}/{post.message_id})'})
+        payload = {'msg_type': 'interactive', 'card': {'schema': '2.0', 'header': {'title': {'tag': 'plain_text', 'content': f'{end:%m月%d日} 夜间摘要'}, 'template': 'blue'}, 'body': {'elements': elements}}}
+        try:
+            sender = getattr(self.webhook_sender, 'send', None) or self.webhook_sender.send_alert
+            sent = bool(sender(payload))
+        except Exception as exc:
+            logger.error(f'Morning delivery uncertain; do not resend automatically: {exc}')
+            sent = False
+        self.quiet.complete_morning(now, 'sent' if sent else 'unknown')
+        for item in items[:5]:
+            post = allowed[(item.channel.lower().lstrip('@'), item.message_id)]
+            if self.policy.claim(post.text, item.title + ': ' + item.summary):
+                self.policy.complete(post.text, sent)
+        summary['alerts_sent'] = int(sent)
+        self.stats['total_alerts_sent'] += int(sent)
+        return summary
 
     def run_once(self, ingest_only=False) -> Dict[str, Any]:
         """Single pass: ingest all channels, pending+coarse filter, threshold gate, multi cards."""
@@ -419,7 +495,7 @@ class NewsMonitorRunner:
 
     def process_pending(self, pass_summary=None, now=None):
         pass_summary = pass_summary or {"posts_evaluated": 0, "alerts_sent": 0, "details": []}
-        clock = now or datetime.now(timezone.utc)
+        clock = now or self._now()
         if clock.tzinfo is None:
             clock = clock.replace(tzinfo=timezone.utc)
         tz_name = getattr(self.config, "timezone", "Asia/Shanghai") or "Asia/Shanghai"
@@ -427,12 +503,7 @@ class NewsMonitorRunner:
         quiet_hours = getattr(self.config, "quiet_hours", "") or ""
         shoulder_hours = getattr(self.config, "shoulder_hours", "") or ""
         mode = alert_schedule.classify_alert_mode(local, quiet_hours, shoulder_hours)
-        is_flush = False
-        if bool(getattr(self.config, "morning_flush_enabled", True)) and mode == "day":
-            is_flush = self.policy.peek_morning_flush(
-                mode, local, alert_schedule.day_start_minutes(quiet_hours, shoulder_hours)
-            )
-        knobs = alert_schedule.knobs_for(self.config, mode, is_morning_flush=is_flush, now_local=local)
+        knobs = alert_schedule.knobs_for(self.config, mode, now_local=local)
         self.policy.sync_quiet_window(mode, knobs.quiet_window_id)
         logger.info(
             f"Alert window: mode={knobs.mode} tz={tz_name} local={local.isoformat()} "
@@ -441,11 +512,12 @@ class NewsMonitorRunner:
         )
 
         try:
-            return self._process_pending_with_knobs(pass_summary, clock, knobs)
+            return self._process_pending_with_knobs(pass_summary, clock, knobs, live_clock=now is None)
         finally:
             self.policy.note_mode(mode, clock)
 
-    def _process_pending_with_knobs(self, pass_summary, clock, knobs):
+    def _process_pending_with_knobs(self, pass_summary, clock, knobs, live_clock=True):
+        quiet = knobs.mode == "quiet"
         # 2. Load ALL pending posts (this pass new + previously buffered)
         if hasattr(self.storage, "list_pending_with_scraped_at"):
             pending_pairs = self.storage.list_pending_with_scraped_at()
@@ -457,9 +529,10 @@ class NewsMonitorRunner:
             )
             pending_pairs = [(p, clock) for p in pending_posts]
 
+        if self.quiet.morning_due(clock):
+            return self._morning_report(pending_pairs, pass_summary, clock, live_clock)
+
         if not pending_pairs:
-            if knobs.is_morning_flush:
-                self.policy.mark_morning_flush(alert_schedule.local_now(clock, getattr(self.config, "timezone", "Asia/Shanghai")))
             logger.info(
                 "Batch digest mode: no pending posts (evaluated_at IS NULL); "
                 "skipping LLM and Feishu cards."
@@ -467,9 +540,11 @@ class NewsMonitorRunner:
             return pass_summary
 
         pending_posts = [p for p, _ in pending_pairs]
-        expired = [p for p in pending_posts if not is_fresh(p.published_at, knobs.max_age_seconds, now=clock)]
+        def eligible(post):
+            return (quiet and self.quiet.in_window(post.published_at, clock)) or is_fresh(post.published_at, knobs.max_age_seconds, clock)
+        expired = [p for p in pending_posts if not eligible(p)]
         self._mark_all_filtered(expired, "expired_or_invalid_time")
-        pending_posts = [p for p in pending_posts if is_fresh(p.published_at, knobs.max_age_seconds, now=clock)]
+        pending_posts = [p for p in pending_posts if eligible(p)]
         unique, duplicates, seen = [], [], set()
         for post in sorted(pending_posts, key=lambda p: p.published_at, reverse=True):
             key = fingerprint(post.text)
@@ -500,8 +575,6 @@ class NewsMonitorRunner:
             self._mark_all_filtered(crypto_dropped, "crypto_filter")
 
         if not candidates:
-            if knobs.is_morning_flush:
-                self.policy.mark_morning_flush(alert_schedule.local_now(clock, getattr(self.config, "timezone", "Asia/Shanghai")))
             logger.info("No candidates after coarse/crypto filter; skipping LLM and Feishu cards.")
             return pass_summary
 
@@ -521,25 +594,13 @@ class NewsMonitorRunner:
             for p in candidates
         ]
 
-        # 4. Buffering gate (quiet ignores max_wait so overnight backlog can morning-flush)
-        min_candidates = knobs.min_candidates
-        max_wait = knobs.max_wait_seconds
+        min_candidates, max_wait = knobs.min_candidates, knobs.max_wait_seconds
         oldest_age = self._oldest_age_seconds(candidate_pairs, now=clock)
-        has_urgent = any(urgent(p.text) for p in candidates)
-
-        if not knobs.is_morning_flush and knobs.require_urgent_to_evaluate:
-            if not has_urgent and len(candidates) < min_candidates:
-                logger.info(
-                    f"Quiet hours: holding {len(candidates)} non-urgent candidate(s) "
-                    f"(min_candidates={min_candidates}); no LLM until break-glass or morning flush."
-                )
+        has_urgent = any(urgent(p.text) and is_fresh(p.published_at, self.config.news_max_age_seconds, clock) for p in candidates)
+        if quiet:
+            if not has_urgent and oldest_age < self.config.quiet_digest_min_interval_seconds:
                 return pass_summary
-        elif not knobs.is_morning_flush and len(candidates) < min_candidates and oldest_age < max_wait and not has_urgent:
-            logger.info(
-                f"Buffering: {len(candidates)} candidate(s) < min_candidates={min_candidates} "
-                f"and oldest_age={oldest_age:.0f}s < max_wait={max_wait}s; "
-                "skipping LLM, leaving posts unevaluated."
-            )
+        elif len(candidates) < min_candidates and oldest_age < max_wait and not has_urgent:
             return pass_summary
 
         logger.info(
@@ -548,13 +609,17 @@ class NewsMonitorRunner:
             f"(max_wait={max_wait}s, flush={knobs.is_morning_flush}); calling evaluate_digest."
         )
 
-        if not self.policy.reserve_call(knobs.min_interval_seconds, self.config.digest_max_calls_per_day):
+        interval = self.config.digest_min_interval_seconds if quiet and has_urgent else knobs.min_interval_seconds
+        if not self.policy.reserve_call(interval, self.config.digest_max_calls_per_day, clock):
             logger.info("LLM cooldown/daily call budget: pending messages retained until expiry")
             return pass_summary
-        if knobs.is_morning_flush:
-            self.policy.mark_morning_flush(alert_schedule.local_now(clock, getattr(self.config, "timezone", "Asia/Shanghai")))
         candidates = sorted(candidates, key=lambda p: (urgent(p.text), p.published_at), reverse=True)[:self.config.digest_max_batch_size]
         self.evaluator.recent_history = self.policy.history()
+        self.evaluator.digest_context = ""
+        if quiet:
+            start, end = self.quiet.window(clock)
+            self.evaluator.digest_context = f"北京时间夜间模式，保存 {start.isoformat()} 至 {end.isoformat()} 的重要新闻用于晨报；窗口内事件允许超过30分钟，不得作为实时快讯。night_alert仅在已确认重大事件时为true；confirmed_source填写正文明确标注的原始来源；普通言论、传闻不准打断。is_update与update_reason只能描述相对历史的实质升级。"
+            self.evaluator.recent_history += "\n夜间已收录（有新事实才再选）：\n" + "\n".join(i.title + ': ' + i.summary[:200] for _, i in self.quiet.archived(clock)[-20:])
         # 5. One LLM call for the candidate batch
         if hasattr(self.evaluator, "evaluate_digest"):
             try:
@@ -633,6 +698,12 @@ class NewsMonitorRunner:
                     ).strip("; ")
 
         # 6. Persist short evaluation summaries
+        # Archive before marking evaluated, so an interrupted pass retains the morning material.
+        by_key = {(p.channel.lower().lstrip('@'), p.message_id): p for p in candidates}
+        for item in digest.items:
+            post = by_key[(item.channel.lower().lstrip('@'), item.message_id)]
+            if quiet and (item.score or 11 - item.rank) >= self.config.hotness_threshold and self.quiet.in_window(post.published_at, clock) and self.quiet.in_window(item.event_at, clock):
+                self.quiet.archive(post, item, clock)
         self._apply_digest_evaluations(candidates, digest)
 
         # 7. Send ONE card PER DigestItem when material items exist
@@ -659,29 +730,31 @@ class NewsMonitorRunner:
                     if matched_post is not None
                     else getattr(item, "published_at", None)
                 )
-                if not is_fresh(published_at, knobs.max_age_seconds, now=clock):
+                send_time = self._now() if live_clock else clock
+                send_local = alert_schedule.local_now(send_time, self.config.timezone)
+                send_mode = alert_schedule.classify_alert_mode(send_local, self.config.quiet_hours, self.config.shoulder_hours)
+                send_knobs = alert_schedule.knobs_for(self.config, send_mode, now_local=send_local)
+                if quiet and send_mode != 'quiet':
                     continue
-                if not is_fresh(item.event_at, knobs.max_age_seconds, now=clock):
-                    self._mark_all_filtered([matched_post], "event_time_unknown_or_expired")
+                if not is_fresh(published_at, self.config.news_max_age_seconds, send_time):
+                    continue
+                if not is_fresh(item.event_at, self.config.news_max_age_seconds, send_time):
+                    self._mark_all_filtered([matched_post], 'event_time_unknown_or_expired')
                     continue
                 score = self._digest_item_score(item)
-                score_ok = score >= knobs.hotness_threshold
-                if (
-                    not score_ok
-                    and knobs.allow_urgent_score_bypass
-                    and matched_post is not None
-                    and urgent(matched_post.text)
-                ):
-                    score_ok = True
-                if not score_ok:
+                if score < send_knobs.hotness_threshold:
                     continue
-                if knobs.quiet_card_cap is not None and knobs.quiet_window_id:
-                    if self.policy.quiet_cards_sent(knobs.quiet_window_id) >= knobs.quiet_card_cap:
+                if send_knobs.quiet_card_cap is not None and send_knobs.quiet_window_id:
+                    if self.policy.quiet_cards_sent(send_knobs.quiet_window_id) >= send_knobs.quiet_card_cap:
                         logger.info(
                             f"Quiet-hour Feishu card cap reached "
-                            f"({knobs.quiet_card_cap}/{knobs.quiet_window_id}); skipping remaining cards."
+                            f"({send_knobs.quiet_card_cap}/{send_knobs.quiet_window_id}); skipping remaining cards."
                         )
                         break
+                if send_mode == 'quiet' and not self.quiet.claim_alert(item, matched_post, send_time):
+                    if self.quiet.in_window(published_at, send_time) and self.quiet.in_window(item.event_at, send_time):
+                        self.quiet.archive(matched_post, item, send_time)
+                    continue
                 if not self.policy.claim(matched_post.text, item.title + ": " + item.summary):
                     continue
                 try:
@@ -692,8 +765,8 @@ class NewsMonitorRunner:
                 self.policy.complete(matched_post.text, send_ok)
                 if send_ok:
                     alerts_ok += 1
-                    if knobs.quiet_card_cap is not None and knobs.quiet_window_id:
-                        self.policy.record_quiet_card(knobs.quiet_window_id)
+                    if send_knobs.quiet_card_cap is not None and send_knobs.quiet_window_id:
+                        self.policy.record_quiet_card(send_knobs.quiet_window_id)
                     summary = f"[digest#{item.rank}] {item.title}"
                     self.storage.mark_alert_sent(
                         channel=ch,

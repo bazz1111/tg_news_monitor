@@ -292,11 +292,11 @@ class Settings(_BaseClass):
         description="IANA timezone for alert windows (default Asia/Shanghai)",
     )
     quiet_hours: str = Field(
-        default="01:00-08:00",
+        default="00:00-08:00",
         description="Local quiet window START-END; empty disables. May wrap midnight.",
     )
     shoulder_hours: str = Field(
-        default="23:00-01:00",
+        default="22:00-00:00",
         description="Local shoulder window START-END; empty disables. May wrap midnight.",
     )
     shoulder_hotness_threshold: int = Field(default=8, ge=1, le=10)
@@ -307,6 +307,7 @@ class Settings(_BaseClass):
     quiet_digest_min_interval_seconds: int = Field(default=1800, ge=0)
     quiet_digest_min_candidates: int = Field(default=16, ge=1)
     quiet_digest_card_interval_seconds: float = Field(default=15.0, ge=0)
+    quiet_alert_interval_seconds: int = Field(default=1800, ge=60)
     quiet_card_cap: int = Field(
         default=5,
         ge=0,

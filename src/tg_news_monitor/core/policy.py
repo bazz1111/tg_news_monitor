@@ -42,8 +42,8 @@ class DeliveryPolicy:
             )
             conn.execute('INSERT OR IGNORE INTO alert_schedule_state(id, quiet_cards_sent) VALUES (1, 0)')
 
-    def reserve_call(self, interval, daily_limit):
-        now = datetime.now(timezone.utc)
+    def reserve_call(self, interval, daily_limit, now=None):
+        now = now or datetime.now(timezone.utc)
         with db_session(self.db_path) as conn:
             conn.execute('BEGIN IMMEDIATE')
             last = conn.execute('SELECT MAX(started) FROM digest_calls').fetchone()[0]

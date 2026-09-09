@@ -39,8 +39,8 @@ class TestConfigDefaultsAndParsing:
         assert settings.deepseek_model == "deepseek-chat"
         assert settings.hotness_threshold == 7
         assert settings.timezone == "Asia/Shanghai"
-        assert settings.quiet_hours == "01:00-08:00"
-        assert settings.shoulder_hours == "23:00-01:00"
+        assert settings.quiet_hours == "00:00-08:00"
+        assert settings.shoulder_hours == "22:00-00:00"
         assert settings.quiet_card_cap == 5
         assert settings.db_path == "data/tg_news.db"
         assert settings.log_level == "INFO"

@@ -90,11 +90,11 @@ class TestClassifyDefaultBeijingWindows:
     def test_day_shoulder_quiet_boundaries(self):
         assert classify_alert_mode(local(8, 0)) == MODE_DAY
         assert classify_alert_mode(local(12, 0)) == MODE_DAY
-        assert classify_alert_mode(local(22, 59)) == MODE_DAY
+        assert classify_alert_mode(local(21, 59)) == MODE_DAY
         assert classify_alert_mode(local(23, 0)) == MODE_SHOULDER
         assert classify_alert_mode(local(23, 30)) == MODE_SHOULDER
-        assert classify_alert_mode(local(0, 30)) == MODE_SHOULDER
-        assert classify_alert_mode(local(0, 59)) == MODE_SHOULDER
+        assert classify_alert_mode(local(0, 30)) == MODE_QUIET
+        assert classify_alert_mode(local(0, 59)) == MODE_QUIET
         assert classify_alert_mode(local(1, 0)) == MODE_QUIET
         assert classify_alert_mode(local(2, 0)) == MODE_QUIET
         assert classify_alert_mode(local(7, 59)) == MODE_QUIET
@@ -115,7 +115,7 @@ class TestClassifyDefaultBeijingWindows:
     def test_utc_instant_converts_via_local_clock(self):
         # 16:00 UTC = 00:00 next day in Shanghai → still shoulder (23:00-01:00).
         utc = datetime(2026, 9, 8, 16, 0, tzinfo=timezone.utc).astimezone(SH)
-        assert classify_alert_mode(utc) == MODE_SHOULDER
+        assert classify_alert_mode(utc) == MODE_QUIET
         assert minute_of_day(utc) == 0
 
     def test_day_start_follows_quiet_end(self):
@@ -143,7 +143,7 @@ class TestKnobsAndSettings:
         assert quiet.hotness_threshold == 9
         assert quiet.min_interval_seconds == 1800
         assert quiet.require_urgent_to_evaluate
-        assert quiet.allow_urgent_score_bypass
+        assert not quiet.allow_urgent_score_bypass
         assert quiet.quiet_card_cap == 5
         assert quiet.quiet_window_id == "2026-09-09"
 
@@ -157,8 +157,8 @@ class TestKnobsAndSettings:
     def test_settings_defaults_and_bad_window(self):
         s = Settings()
         assert s.timezone == "Asia/Shanghai"
-        assert s.quiet_hours == "01:00-08:00"
-        assert s.shoulder_hours == "23:00-01:00"
+        assert s.quiet_hours == "00:00-08:00"
+        assert s.shoulder_hours == "22:00-00:00"
         assert s.quiet_card_cap == 5
         assert s.morning_flush_max_age_seconds == 7200
         with pytest.raises(ValidationError):
