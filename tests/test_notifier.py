@@ -307,8 +307,9 @@ class TestCardFormattingAndEdgeCases:
         """When post has no forward_from, the note element must not mention forward attribution."""
         card = build_card(sample_telegram_post_no_forward, sample_news_eval_score_7)
         elements = card["card"]["body"]["elements"]
-        note_el = [el for el in elements if el.get("tag") == "note"][0]
-        note_content = note_el["elements"][0]["content"]
+        note_el = elements[3]
+        assert note_el["tag"] == "div"
+        note_content = note_el["text"]["content"]
 
         assert "🔁 转发自:" not in note_content
         assert "📢 来源频道: @coindesk" in note_content

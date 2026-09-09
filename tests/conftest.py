@@ -489,18 +489,14 @@ class MockFeishuReceiver:
         if len(elements) == 0:
             return False, "Card body elements cannot be empty"
 
-        # Check for direct action button
+        # Schema 2.0 uses a direct button and open_url behaviors.
         has_button = False
         for el in elements:
-            if el.get("tag") == "action":
-                actions = el.get("actions", [])
-                for act in actions:
-                    if act.get("tag") == "button" and "url" in act:
-                        has_button = True
-                        break
+            if el.get("tag") == "button":
+                has_button = any(b.get("type") == "open_url" and b.get("default_url", "").startswith("https://") for b in el.get("behaviors", [])) or has_button
 
         if not has_button:
-            return False, "Card must include an action block with a direct hyperlink button"
+            return False, "Card must include a button with an HTTPS open_url behavior"
 
         return True, "Schema 2.0 Valid"
 

@@ -15,6 +15,7 @@ from __future__ import annotations
 import logging
 import signal
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -24,6 +25,7 @@ except ImportError:
     logger = logging.getLogger(__name__)  # type: ignore
 
 from tg_news_monitor.config import Settings, get_config
+from tg_news_monitor.core.policy import DeliveryPolicy, fingerprint, is_fresh, urgent
 from tg_news_monitor.core.filters import (
     _COARSE_EMPTY_MAX_LEN,
     _COARSE_SPAM_RES,
@@ -69,6 +71,8 @@ class NewsMonitorRunner:
         self.config = config or get_config()
         self.storage = storage or PostRepository(db_path=self.config.db_path)
 
+        self.policy = DeliveryPolicy(self.storage.db_path)
+
         # Scraper client
         if scraper_client is not None:
             self.scraper_client = scraper_client
@@ -92,7 +96,8 @@ class NewsMonitorRunner:
                 api_base=self.config.deepseek_api_base,
                 model=self.config.deepseek_model,
                 provider="deepseek",
-                timeout=max(60.0, 30.0),
+                timeout=60.0,
+                max_retries=1,
             )
             logger.info(
                 f"DeepSeek Evaluator initialized: model={self.config.deepseek_model}, "
@@ -107,6 +112,7 @@ class NewsMonitorRunner:
             self.webhook_sender = FeishuWebhookSender(
                 webhook_url=self.config.feishu_webhook_url,
                 secret=secret,
+                max_retries=1,
             )
 
         self._stop_requested = False
@@ -335,6 +341,10 @@ class NewsMonitorRunner:
             published_at=published_at,
             subtitle="投资情报快报",
         )
+        payload["card"]["body"]["elements"].append({
+            "tag": "markdown",
+            "content": f"[频道原文](https://t.me/{item.channel.lstrip('@')}/{item.message_id}) · 事件时间：{item.event_at.isoformat() if item.event_at else '未确认'} · 模型解读需核实",
+        })
         if hasattr(self.webhook_sender, "send"):
             return bool(self.webhook_sender.send(payload))
         if hasattr(self.webhook_sender, "send_alert"):
@@ -354,7 +364,7 @@ class NewsMonitorRunner:
             oldest = oldest.replace(tzinfo=timezone.utc)
         return max(0.0, (now - oldest).total_seconds())
 
-    def run_once(self) -> Dict[str, Any]:
+    def run_once(self, ingest_only=False) -> Dict[str, Any]:
         """Single pass: ingest all channels, pending+coarse filter, threshold gate, multi cards."""
         channels = self.config.telegram_channels
         if not channels:
@@ -389,10 +399,14 @@ class NewsMonitorRunner:
 
             if idx < len(channels) - 1 and not self._stop_requested:
                 pause = self.config.inter_channel_delay_seconds
-                if hasattr(self.scraper_client, "calculate_inter_channel_delay"):
-                    pause = self.scraper_client.calculate_inter_channel_delay()
                 time.sleep(max(0.1, pause))
 
+        if ingest_only:
+            return pass_summary
+        return self.process_pending(pass_summary)
+
+    def process_pending(self, pass_summary=None):
+        pass_summary = pass_summary or {"posts_evaluated": 0, "alerts_sent": 0, "details": []}
         # 2. Load ALL pending posts (this pass new + previously buffered)
         if hasattr(self.storage, "list_pending_with_scraped_at"):
             pending_pairs = self.storage.list_pending_with_scraped_at()
@@ -413,6 +427,19 @@ class NewsMonitorRunner:
             return pass_summary
 
         pending_posts = [p for p, _ in pending_pairs]
+        expired = [p for p in pending_posts if not is_fresh(p.published_at, self.config.news_max_age_seconds)]
+        self._mark_all_filtered(expired, "expired_or_invalid_time")
+        pending_posts = [p for p in pending_posts if is_fresh(p.published_at, self.config.news_max_age_seconds)]
+        unique, duplicates, seen = [], [], set()
+        for post in sorted(pending_posts, key=lambda p: p.published_at, reverse=True):
+            key = fingerprint(post.text)
+            if key in seen or self.policy.seen(post.text):
+                duplicates.append(post)
+            else:
+                seen.add(key)
+                unique.append(post)
+        self._mark_all_filtered(duplicates, "duplicate_content")
+        pending_posts = unique
         logger.info(
             f"Pending buffer: {len(pending_posts)} unevaluated post(s) after ingest."
         )
@@ -454,10 +481,10 @@ class NewsMonitorRunner:
 
         # 4. Buffering gate
         min_candidates = int(getattr(self.config, "digest_min_candidates", 3) or 3)
-        max_wait = int(getattr(self.config, "digest_max_wait_seconds", 900) or 900)
+        max_wait = int(self.config.digest_max_wait_seconds)
         oldest_age = self._oldest_age_seconds(candidate_pairs)
 
-        if len(candidates) < min_candidates and oldest_age < max_wait:
+        if len(candidates) < min_candidates and oldest_age < max_wait and not any(urgent(p.text) for p in candidates):
             logger.info(
                 f"Buffering: {len(candidates)} candidate(s) < min_candidates={min_candidates} "
                 f"and oldest_age={oldest_age:.0f}s < max_wait={max_wait}s; "
@@ -471,9 +498,20 @@ class NewsMonitorRunner:
             f"(max_wait={max_wait}s); calling evaluate_digest."
         )
 
+        if not self.policy.reserve_call(self.config.digest_min_interval_seconds, self.config.digest_max_calls_per_day):
+            logger.info("LLM cooldown/daily call budget: pending messages retained until expiry")
+            return pass_summary
+        candidates = sorted(candidates, key=lambda p: (urgent(p.text), p.published_at), reverse=True)[:self.config.digest_max_batch_size]
+        self.evaluator.recent_history = self.policy.history()
         # 5. One LLM call for the candidate batch
         if hasattr(self.evaluator, "evaluate_digest"):
-            digest = self.evaluator.evaluate_digest(candidates)
+            try:
+                digest = self.evaluator.evaluate_digest(candidates)
+            except Exception as exc:
+                logger.error(f"Digest failed; pending retained: {exc}")
+                return pass_summary
+            finally:
+                self.policy.record_usage(getattr(self.evaluator, "last_usage", None))
         else:
             digest = DigestBrief(
                 headline="本轮快讯",
@@ -486,6 +524,15 @@ class NewsMonitorRunner:
         pass_summary["posts_evaluated"] = len(candidates)
         self.stats["total_posts_evaluated"] += len(candidates)
 
+        valid = {(p.channel.lower().lstrip("@"), p.message_id) for p in candidates}
+        selected_once = set()
+        checked = []
+        for item in digest.items:
+            key = (item.channel.lower().lstrip("@"), item.message_id)
+            if key in valid and key not in selected_once:
+                selected_once.add(key)
+                checked.append(item)
+        digest.items = checked
         # 5b. Hard-drop crypto items even if the model selected them
         if digest.items:
             kept_items = []
@@ -539,12 +586,6 @@ class NewsMonitorRunner:
         # 7. Send ONE card PER DigestItem when material items exist
         if digest.has_material_news and digest.items:
             alerts_ok = 0
-            selected = self._selected_keys(digest)
-            item_by_key = {}
-            for item in digest.items:
-                ch = str(item.channel).lower().lstrip("@").strip()
-                item_by_key[(ch, int(item.message_id))] = item
-
             post_by_key = {
                 (p.channel.lower().lstrip("@").strip(), int(p.message_id)): p
                 for p in candidates
@@ -568,7 +609,21 @@ class NewsMonitorRunner:
                     if matched_post is not None
                     else getattr(item, "published_at", None)
                 )
-                send_ok = self._send_digest_item_card(item, published_at=published_at)
+                if not is_fresh(published_at, self.config.news_max_age_seconds):
+                    continue
+                if not is_fresh(item.event_at, self.config.news_max_age_seconds):
+                    self._mark_all_filtered([matched_post], "event_time_unknown_or_expired")
+                    continue
+                if (item.score or 11 - item.rank) < self.config.hotness_threshold:
+                    continue
+                if not self.policy.claim(matched_post.text, item.title + ": " + item.summary):
+                    continue
+                try:
+                    send_ok = self._send_digest_item_card(item, published_at=published_at)
+                except Exception as exc:
+                    logger.error(f"Delivery uncertain, do not automatically resend: {exc}")
+                    send_ok = False
+                self.policy.complete(matched_post.text, send_ok)
                 if send_ok:
                     alerts_ok += 1
                     summary = f"[digest#{item.rank}] {item.title}"
@@ -600,23 +655,6 @@ class NewsMonitorRunner:
                         error_msg="Feishu item card webhook delivery failed after retries",
                     )
 
-            # Mark non-selected candidates as filtered (already done in _apply_digest_evaluations,
-            # but reinforce digest_not_selected for clarity when send path runs)
-            for post in candidates:
-                ch = post.channel.lower().lstrip("@").strip()
-                key = (ch, int(post.message_id))
-                if key not in selected:
-                    self.storage.update_evaluation(
-                        channel=ch,
-                        message_id=post.message_id,
-                        score=1,
-                        summary="[filtered] not_selected_in_digest",
-                        alert_sent=False,
-                        is_filtered=True,
-                        filter_reason="digest_not_selected",
-                        key_takeaways=[],
-                    )
-
             pass_summary["alerts_sent"] = alerts_ok
             self.stats["total_alerts_sent"] += alerts_ok
             for detail in pass_summary["details"]:
@@ -644,7 +682,7 @@ class NewsMonitorRunner:
         Handles SIGINT and SIGTERM gracefully.
         """
         min_c = int(getattr(self.config, "digest_min_candidates", 3) or 3)
-        max_w = int(getattr(self.config, "digest_max_wait_seconds", 900) or 900)
+        max_w = int(self.config.digest_max_wait_seconds)
         card_gap = float(getattr(self.config, "digest_card_interval_seconds", 10.0) or 0.0)
         logger.info("=" * 60)
         logger.info("Starting Telegram News Monitor 24/7 Daemon (batch digest mode)")
@@ -673,10 +711,19 @@ class NewsMonitorRunner:
         except (ValueError, AttributeError):
             pass
 
+        executor = ThreadPoolExecutor(max_workers=1)
+        worker = None
         while not self._stop_requested:
             try:
                 start_time = time.time()
-                summary = self.run_once()
+                summary = self.run_once(ingest_only=True)
+                if worker is None or worker.done():
+                    if worker is not None:
+                        try:
+                            worker.result()
+                        except Exception as exc:
+                            logger.error(f"Digest worker failed: {exc}")
+                    worker = executor.submit(self.process_pending)
                 elapsed = time.time() - start_time
 
                 logger.info(
@@ -694,6 +741,7 @@ class NewsMonitorRunner:
                 delay = self.scraper_client.calculate_jittered_delay(
                     float(self.config.poll_interval_seconds)
                 )
+                delay = max(0.0, delay - elapsed)
                 logger.debug(f"Sleeping for {delay:.1f}s until next polling pass...")
 
                 sleep_end = time.time() + delay
@@ -708,4 +756,5 @@ class NewsMonitorRunner:
                 logger.error(f"Unexpected error in runner main loop: {exc}")
                 time.sleep(5.0)
 
+        executor.shutdown(wait=True)
         logger.info("NewsMonitorRunner daemon loop exited cleanly.")

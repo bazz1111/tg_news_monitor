@@ -94,6 +94,8 @@ class DigestItem(BaseModel):
     impact_us: str = Field(..., description="Impact on US stocks")
     impact_cn: str = Field(..., description="Impact on China equities (上证/中国市场)")
     impact_commodities: str = Field(..., description="Impact on commodities (黄金/原油等)")
+    event_at: Optional[datetime] = None
+    is_update: bool = False
     published_at: Optional[datetime] = Field(
         default=None,
         description="UTC publication time; prefer runner post.published_at when building card",
