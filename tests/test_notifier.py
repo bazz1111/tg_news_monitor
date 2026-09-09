@@ -165,14 +165,14 @@ class TestFeishuCardSchema2:
         assert "突发安全" in header.get("title", {}).get("content", "")
         assert "巨额以太坊异动" in header.get("title", {}).get("content", "")
         assert header.get("subtitle", {}).get("tag") == "plain_text"
-        assert header.get("ud_icon", {}).get("token") == "alarm_outlined"
+        assert "ud_icon" not in header  # webhook bots reject ud_icon
 
     def test_card_body_elements_order_and_tags(
         self,
         sample_telegram_post: TelegramPost,
         sample_news_eval_score_9: NewsEvaluation,
     ) -> None:
-        """Body elements must include markdown summary, hr divider, takeaways, note, and action button."""
+        """Body elements must include markdown summary, hr divider, takeaways, metadata div, and action button."""
         card_payload = build_feishu_card(sample_telegram_post, sample_news_eval_score_9)
         elements = card_payload["card"]["body"]["elements"]
 
@@ -180,8 +180,8 @@ class TestFeishuCardSchema2:
         tags = [el.get("tag") for el in elements]
         assert "div" in tags
         assert "hr" in tags
-        assert "note" in tags
-        assert "action" in tags
+        assert tags.count("div") >= 3  # summary, takeaways, metadata
+        assert "button" in tags
 
         # 1. Summary Markdown Element (first div)
         summary_div = elements[0]
@@ -204,25 +204,23 @@ class TestFeishuCardSchema2:
         assert "**💡 关键影响**" in content_takeaways
         assert "**🎯 关注建议**" in content_takeaways
 
-        # 4. Note Element with metadata
+        # 4. Metadata Element (div; Schema 2.0 rejects note)
         note_el = elements[3]
-        assert note_el.get("tag") == "note"
-        note_text = note_el.get("elements", [])[0].get("content", "")
+        assert note_el.get("tag") == "div"
+        note_text = note_el.get("text", {}).get("content", "")
         assert "📢 来源频道: @whale_alert" in note_text
         assert "2026-09-08 21:30:00 UTC" in note_text
         assert "🆔 消息ID: #40921" in note_text
         assert "🔁 转发自: CryptoWire News" in note_text
 
-        # 5. Action element with direct permalink
+        # 5. Button with open_url behavior (Schema 2.0)
         action_el = elements[4]
-        assert action_el.get("tag") == "action"
-        actions = action_el.get("actions", [])
-        assert len(actions) == 1
-        btn = actions[0]
-        assert btn.get("tag") == "button"
-        assert btn.get("type") == "primary"
-        assert btn.get("url") == "https://t.me/whale_alert/40921"
-        assert "查看 Telegram 原文" in btn.get("text", {}).get("content", "")
+        assert action_el.get("tag") == "button"
+        assert action_el.get("type") == "primary"
+        assert "查看 Telegram 原文" in action_el.get("text", {}).get("content", "")
+        behaviors = action_el.get("behaviors", [])
+        assert behaviors and behaviors[0].get("type") == "open_url"
+        assert behaviors[0].get("default_url") == "https://t.me/whale_alert/40921"
 
 
 # ==============================================================================
@@ -291,7 +289,7 @@ class TestColorTemplateAndIconMapping:
             expected_icon = get_header_icon(score)
 
             assert card["card"]["header"]["template"] == expected_color
-            assert card["card"]["header"]["ud_icon"]["token"] == expected_icon
+            assert "ud_icon" not in card["card"]["header"]
 
 
 # ==============================================================================

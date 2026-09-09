@@ -14,8 +14,9 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Union
+from zoneinfo import ZoneInfo
 
-from tg_news_monitor.core.models import NewsEvaluation, TelegramPost
+from tg_news_monitor.core.models import DigestBrief, DigestItem, NewsEvaluation, TelegramPost
 
 
 # ==============================================================================
@@ -138,8 +139,6 @@ class FeishuCardBuilder:
             score = 1
 
         color_template = get_color_template(score)
-        icon_token = get_header_icon(score)
-
         # Header Title with tier emoji & category tag
         if score >= 9:
             tier_prefix = "🚨"
@@ -233,29 +232,34 @@ class FeishuCardBuilder:
         if forward_from and str(forward_from).strip():
             note_parts.append(f"🔁 转发自: {str(forward_from).strip()}")
 
+        # Schema 2.0 webhook cards reject tag "note" (ErrCode 200861).
+        # Use a markdown div for the same metadata.
         note_element = {
-            "tag": "note",
-            "elements": [
-                {
-                    "tag": "plain_text",
-                    "content": "  |  ".join(note_parts),
-                }
-            ],
+            "tag": "div",
+            "text": {
+                "tag": "lark_md",
+                "content": "📝 " + "  |  ".join(note_parts),
+            },
         }
 
         # 5. Action element: primary button linking directly to original post
         action_url = direct_url if direct_url else f"https://t.me/{channel}/{message_id}"
+        # Schema 2.0 rejects legacy "action" wrapper (ErrCode 200861).
+        # Use a button with open_url behaviors, plus a markdown fallback link.
         action_element = {
-            "tag": "action",
-            "actions": [
+            "tag": "button",
+            "text": {
+                "tag": "plain_text",
+                "content": "🔗 查看 Telegram 原文",
+            },
+            "type": "primary",
+            "behaviors": [
                 {
-                    "tag": "button",
-                    "text": {
-                        "tag": "plain_text",
-                        "content": "🔗 查看 Telegram 原文",
-                    },
-                    "type": "primary",
-                    "url": action_url,
+                    "type": "open_url",
+                    "default_url": action_url,
+                    "pc_url": action_url,
+                    "ios_url": action_url,
+                    "android_url": action_url,
                 }
             ],
         }
@@ -281,10 +285,7 @@ class FeishuCardBuilder:
                     "content": subtitle,
                 },
                 "template": color_template,
-                "ud_icon": {
-                    "tag": "standard_icon",
-                    "token": icon_token,
-                },
+                # webhook 自定义机器人不支持 header.ud_icon（会报 200621）
             },
             "body": {
                 "elements": elements,
@@ -295,6 +296,252 @@ class FeishuCardBuilder:
             "msg_type": "interactive",
             "card": card_schema_2,
         }
+
+
+    @classmethod
+    def build_digest_card(
+        cls,
+        digest: DigestBrief,
+        subtitle: str = "Telegram 批量快讯汇总",
+    ) -> Dict[str, Any]:
+        """Build a Schema 2.0 interactive digest card (NO Telegram links/buttons)."""
+        headline = (digest.headline or "本轮快讯汇总").strip()
+        item_count = len(digest.items or [])
+        # Prefer orange when material news exists, else blue
+        color_template = "orange" if digest.has_material_news and item_count else "blue"
+
+        elements: List[Dict[str, Any]] = []
+
+        overview = (digest.overview or "").strip() or "本轮暂无概述。"
+        elements.append(
+            {
+                "tag": "div",
+                "text": {
+                    "tag": "lark_md",
+                    "content": f"**📰 本轮总览**\n{overview}",
+                },
+            }
+        )
+        elements.append({"tag": "hr"})
+
+        for item in digest.items or []:
+            rank = getattr(item, "rank", 0)
+            title = getattr(item, "title", "") or "未命名"
+            summary = getattr(item, "summary", "") or ""
+            category = getattr(item, "category", "") or "行业快讯"
+            channel = str(getattr(item, "channel", "") or "").lstrip("@")
+            mid = getattr(item, "message_id", 0)
+            impact_block = (
+                f"**① 总体**：{getattr(item, 'impact_overall', '') or '影响有限'}\n"
+                f"**② 美股**：{getattr(item, 'impact_us', '') or '影响有限'}\n"
+                f"**③ 上证**：{getattr(item, 'impact_cn', '') or '影响有限'}\n"
+                f"**④ 大宗（黄金/原油等）**：{getattr(item, 'impact_commodities', '') or '影响有限'}"
+            )
+            content = (
+                f"**#{rank} [{category}] {title}**\n"
+                f"来源：@{channel} / #{mid}\n"
+                f"{summary}\n\n"
+                f"**四维影响**\n{impact_block}"
+            )
+            elements.append(
+                {
+                    "tag": "div",
+                    "text": {
+                        "tag": "lark_md",
+                        "content": content,
+                    },
+                }
+            )
+            elements.append({"tag": "hr"})
+
+        # Drop trailing hr if present
+        if elements and elements[-1].get("tag") == "hr":
+            elements.pop()
+
+        note = (digest.filtered_note or "").strip()
+        if note:
+            elements.append(
+                {
+                    "tag": "div",
+                    "text": {
+                        "tag": "lark_md",
+                        "content": f"**🧹 过滤说明**：{note}",
+                    },
+                }
+            )
+
+        card_schema_2 = {
+            "schema": "2.0",
+            "header": {
+                "title": {
+                    "tag": "plain_text",
+                    "content": headline,
+                },
+                "subtitle": {
+                    "tag": "plain_text",
+                    "content": subtitle,
+                },
+                "template": color_template,
+            },
+            "body": {
+                "elements": elements,
+            },
+        }
+        return {
+            "msg_type": "interactive",
+            "card": card_schema_2,
+        }
+
+    @classmethod
+    def build_digest_item_card(
+        cls,
+        item: DigestItem,
+        published_at: Optional[datetime] = None,
+        subtitle: str = "投资情报快报",
+    ) -> Dict[str, Any]:
+        """Build Schema 2.0 single-item card. No Telegram/links/buttons/italics.
+
+        Urgency via header color. Investment impact uses column_set for alignment
+        (label | bias | detail). Falls back to stacked rows if needed at send time
+        is not handled here — column_set is the primary layout.
+        """
+        rank = int(getattr(item, "rank", 1) or 1)
+        title = (getattr(item, "title", None) or "未命名").strip()
+        category = (getattr(item, "category", None) or "行业快讯").strip()
+
+        raw_score = getattr(item, "score", None)
+        if raw_score is None:
+            score = max(1, min(10, 11 - rank))
+        else:
+            try:
+                score = max(1, min(10, int(raw_score)))
+            except (TypeError, ValueError):
+                score = max(1, min(10, 11 - rank))
+
+        color_template = get_color_template(score)
+        if score >= 9:
+            tier_emoji, urgency_label = "🚨", "特急"
+        elif score >= 7:
+            tier_emoji, urgency_label = "⚡", "重要"
+        elif score >= 5:
+            tier_emoji, urgency_label = "📢", "一般"
+        else:
+            tier_emoji, urgency_label = "ℹ️", "低优"
+
+        header_title = f"{tier_emoji} {category}｜{title}"
+
+        dt = published_at if published_at is not None else getattr(item, "published_at", None)
+        if isinstance(dt, datetime):
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            bj = dt.astimezone(ZoneInfo("Asia/Shanghai"))
+            time_str = bj.strftime("%Y-%m-%d %H:%M")
+        else:
+            time_str = "未知"
+
+        flames = "🔥" * min(5, max(1, (score + 1) // 2))
+        time_md = (
+            f"🕒 **时间** {time_str}（北京时间）\n"
+            f"🎚️ **紧急** **{urgency_label}** {flames}"
+        )
+
+        bullets = getattr(item, "summary_bullets", None) or []
+        if isinstance(bullets, str):
+            bullets_list = [bullets]
+        else:
+            bullets_list = [str(b).strip() for b in bullets if str(b).strip()]
+        if not bullets_list:
+            summary = (getattr(item, "summary", None) or "").strip()
+            bullets_list = [summary] if summary else ["暂无详细摘要要点"]
+        bullets_list = bullets_list[:4]
+        bullet_icons = ["1️⃣", "2️⃣", "3️⃣", "4️⃣"]
+        bullets_md = "\n".join(
+            f"{bullet_icons[i]} {b.lstrip('•-* ')}" for i, b in enumerate(bullets_list)
+        )
+        overview_md = f"**📌 核心速览**\n{bullets_md}"
+
+        allowed_bias = {"利多", "利空", "中性", "不确定"}
+        bias_emoji = {
+            "利多": "🟢 利多",
+            "利空": "🔴 利空",
+            "中性": "⚪ 中性",
+            "不确定": "🟡 不确定",
+        }
+
+        def _bias(name: str) -> str:
+            val = str(getattr(item, name, None) or "不确定").strip()
+            if val not in allowed_bias:
+                val = "不确定"
+            return bias_emoji[val]
+
+        def _impact(name: str, fallback: str = "影响有限") -> str:
+            val = str(getattr(item, name, None) or "").strip()
+            return val or fallback
+
+        def _md_div(content: str) -> Dict[str, Any]:
+            return {"tag": "div", "text": {"tag": "lark_md", "content": content}}
+
+        def _impact_row(label: str, bias_key: str, impact_key: str) -> Dict[str, Any]:
+            # Compact: fixed-narrow label/bias, detail takes remaining width (less wrap)
+            return {
+                "tag": "column_set",
+                "flex_mode": "none",
+                "background_style": "default",
+                "horizontal_spacing": "4px",
+                "columns": [
+                    {
+                        "tag": "column",
+                        "width": "90px",
+                        "vertical_align": "center",
+                        "elements": [_md_div(f"**{label}**")],
+                    },
+                    {
+                        "tag": "column",
+                        "width": "72px",
+                        "vertical_align": "center",
+                        "elements": [_md_div(f"**{_bias(bias_key)}**")],
+                    },
+                    {
+                        "tag": "column",
+                        "width": "weighted",
+                        "weight": 1,
+                        "vertical_align": "center",
+                        "elements": [_md_div(_impact(impact_key))],
+                    },
+                ],
+            }
+
+        insight = getattr(item, "actionable_insight", None)
+        if insight and str(insight).strip():
+            insight_md = f"**🎯 关注建议**\n💡 {str(insight).strip()}"
+        else:
+            insight_md = "**🎯 关注建议**\n💡 紧密跟踪后续进展与官方确认信息。"
+
+        elements: List[Dict[str, Any]] = [
+            _md_div(time_md),
+            {"tag": "hr"},
+            _md_div(overview_md),
+            {"tag": "hr"},
+            _md_div("**💹 投资影响**"),
+            # Match reference card: emoji + 两字标签 | 圆点方向 | 说明（上证替换 A股）
+            _impact_row("🌐 整体", "bias_overall", "impact_overall"),
+            _impact_row("📈 美股", "bias_us", "impact_us"),
+            _impact_row("📊 上证", "bias_cn", "impact_cn"),
+            _impact_row("🛢️ 大宗", "bias_commodities", "impact_commodities"),
+            {"tag": "hr"},
+            _md_div(insight_md),
+        ]
+
+        card_schema_2 = {
+            "schema": "2.0",
+            "header": {
+                "title": {"tag": "plain_text", "content": header_title},
+                "subtitle": {"tag": "plain_text", "content": subtitle or "投资情报快报"},
+                "template": color_template,
+            },
+            "body": {"elements": elements},
+        }
+        return {"msg_type": "interactive", "card": card_schema_2}
 
     def build(
         self,

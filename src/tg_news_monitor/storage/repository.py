@@ -280,6 +280,70 @@ class PostRepository:
                 cursor = conn.execute("SELECT COUNT(*) AS c FROM posts")
             return cursor.fetchone()["c"]
 
+    @staticmethod
+    def _parse_iso_dt(value: Optional[str]) -> datetime:
+        if not value:
+            return datetime.now(timezone.utc)
+        try:
+            dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except Exception:
+            return datetime.now(timezone.utc)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+
+    def _row_to_telegram_post(self, row) -> TelegramPost:
+        """Reconstruct TelegramPost from a SQLite row."""
+        media_raw = row["media_urls"] if "media_urls" in row.keys() else None
+        try:
+            media_urls = json.loads(media_raw) if media_raw else []
+            if not isinstance(media_urls, list):
+                media_urls = []
+        except Exception:
+            media_urls = []
+        published_at = self._parse_iso_dt(
+            row["published_at"] if "published_at" in row.keys() else None
+        )
+        return TelegramPost(
+            channel=str(row["channel"]),
+            message_id=int(row["message_id"]),
+            published_at=published_at,
+            text=row["text"] or "",
+            has_media=bool(row["has_media"]) if "has_media" in row.keys() else False,
+            media_type=row["media_type"] if "media_type" in row.keys() else None,
+            direct_url=row["direct_url"]
+            or f"https://t.me/{row['channel']}/{row['message_id']}",
+            forward_from=row["forward_from"] if "forward_from" in row.keys() else None,
+            media_urls=media_urls,
+            views=row["views"] if "views" in row.keys() else None,
+        )
+
+    def list_pending_with_scraped_at(self) -> List[tuple]:
+        """Return unevaluated posts as (TelegramPost, scraped_at) ordered by scraped_at ASC."""
+        with db_session(self.db_path) as conn:
+            cursor = conn.execute(
+                """
+                SELECT * FROM posts
+                WHERE evaluated_at IS NULL
+                ORDER BY scraped_at ASC, message_id ASC
+                """
+            )
+            rows = cursor.fetchall()
+
+        result: List[tuple] = []
+        for row in rows:
+            post = self._row_to_telegram_post(row)
+            scraped_at = self._parse_iso_dt(
+                row["scraped_at"] if "scraped_at" in row.keys() else None
+            )
+            result.append((post, scraped_at))
+        return result
+
+    def list_pending_posts(self) -> List[TelegramPost]:
+        """Return all posts with evaluated_at IS NULL as TelegramPost models."""
+        return [post for post, _ in self.list_pending_with_scraped_at()]
+
+
     def update_channel_state(
         self,
         channel: str,

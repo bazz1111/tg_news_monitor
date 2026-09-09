@@ -256,6 +256,23 @@ class Settings(_BaseClass):
         description="Urgency score threshold (1-10) to trigger interactive Feishu alerts",
     )
 
+    # Digest buffering gate (batch LLM + multi single cards)
+    digest_min_candidates: int = Field(
+        default=3,
+        ge=1,
+        description="Minimum pending candidates before calling evaluate_digest (unless max wait reached)",
+    )
+    digest_max_wait_seconds: int = Field(
+        default=900,
+        ge=0,
+        description="Max seconds to buffer pending candidates before forcing a digest LLM call",
+    )
+    digest_card_interval_seconds: float = Field(
+        default=10.0,
+        ge=0,
+        description="Seconds to wait between Feishu single-card sends in the same digest batch",
+    )
+
     # Feishu (Lark) Webhook dispatcher
     feishu_webhook_url: str = Field(
         default="",

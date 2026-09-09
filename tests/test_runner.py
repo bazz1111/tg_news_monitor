@@ -13,7 +13,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from tg_news_monitor.config import Settings
-from tg_news_monitor.core.models import NewsEvaluation, TelegramPost
+from tg_news_monitor.core.models import DigestBrief, DigestItem, NewsEvaluation, TelegramPost
 from tg_news_monitor.core.runner import NewsMonitorRunner
 from tg_news_monitor.storage.repository import PostRepository
 
@@ -71,7 +71,15 @@ class MockScraper:
 
 
 class MockEvaluator:
-    def __init__(self, eval_map: Optional[Dict[int, NewsEvaluation]] = None, default_eval: Optional[NewsEvaluation] = None):
+    """Supports batch digest mode via evaluate_digest; keeps evaluate_post for compat."""
+
+    def __init__(
+        self,
+        eval_map: Optional[Dict[int, NewsEvaluation]] = None,
+        default_eval: Optional[NewsEvaluation] = None,
+        digest: Optional[DigestBrief] = None,
+        digest_builder: Optional[Any] = None,
+    ):
         self.eval_map = eval_map or {}
         self.default_eval = default_eval or NewsEvaluation(
             score=5,
@@ -82,11 +90,53 @@ class MockEvaluator:
             key_takeaways=["Takeaway 1"],
             category="行业快讯",
         )
+        self.digest = digest
+        self.digest_builder = digest_builder
         self.evaluated_posts: List[TelegramPost] = []
+        self.digest_batches: List[List[TelegramPost]] = []
 
     def evaluate_post(self, post: TelegramPost) -> NewsEvaluation:
         self.evaluated_posts.append(post)
         return self.eval_map.get(post.message_id, self.default_eval)
+
+    def evaluate_digest(self, posts: List[TelegramPost]) -> DigestBrief:
+        self.digest_batches.append(list(posts))
+        self.evaluated_posts.extend(posts)
+        if self.digest_builder is not None:
+            return self.digest_builder(posts)
+        if self.digest is not None:
+            return self.digest
+        # Default: convert high-score non-spam eval_map entries into digest items
+        items: List[DigestItem] = []
+        for post in posts:
+            ev = self.eval_map.get(post.message_id, self.default_eval)
+            if getattr(ev, "is_spam", False) or not getattr(ev, "is_news", True):
+                continue
+            if getattr(ev, "score", 0) < 7:
+                continue
+            items.append(
+                DigestItem(
+                    rank=len(items) + 1,
+                    channel=post.channel,
+                    message_id=post.message_id,
+                    title=ev.title,
+                    summary="; ".join(ev.summary_bullets or [ev.title]),
+                    category=ev.category or "行业快讯",
+                    impact_overall="总体影响中等",
+                    impact_us="美股影响有限",
+                    impact_cn="A股影响有限",
+                    impact_commodities="大宗商品影响有限",
+                )
+            )
+            if len(items) >= 5:
+                break
+        return DigestBrief(
+            headline="本轮测试汇总" if items else "本轮无实质新闻",
+            overview="单元测试自动生成的 digest",
+            items=items,
+            has_material_news=bool(items),
+            filtered_note=None if items else "digest_empty",
+        )
 
 
 class MockWebhookSender:
@@ -142,6 +192,8 @@ class TestNewsMonitorRunner:
                 telegram_channels=[channel],
                 hotness_threshold=7,
                 db_path=db_path,
+                digest_min_candidates=1,
+                digest_max_wait_seconds=0,
             )
             storage = PostRepository(db_path=db_path)
             scraper = MockScraper(html_map={channel: html})
@@ -164,21 +216,25 @@ class TestNewsMonitorRunner:
             assert summary["posts_evaluated"] == 2
             assert summary["alerts_sent"] == 1
 
-            # Assert only 1 Feishu card was sent
+            # Assert 1 Feishu single-item card was sent (multi-card mode, 1 material item)
+            assert len(evaluator.digest_batches) == 1
             assert len(webhook.sent_payloads) == 1
             card_payload = webhook.sent_payloads[0]
             assert card_payload["msg_type"] == "interactive"
             assert "重磅监管获批公告" in str(card_payload)
+            # Item cards must not include Telegram original-link buttons
+            assert "查看 Telegram" not in str(card_payload)
+            assert "t.me/" not in str(card_payload)
 
-            # Verify SQLite database state
+            # Verify SQLite database state (batch digest: selected item score from rank)
             post_101 = storage.get_post(channel, 101)
             assert post_101 is not None
-            assert post_101["score"] == 9
+            # rank=1 -> score 10 in batch digest mode (was per-post score 9)
+            assert post_101["score"] >= 7
             assert post_101["alert_sent"] == 1
 
             post_102 = storage.get_post(channel, 102)
             assert post_102 is not None
-            assert post_102["score"] == 4
             assert post_102["alert_sent"] == 0
             assert post_102["is_filtered"] == 1
 
@@ -207,6 +263,8 @@ class TestNewsMonitorRunner:
                 telegram_channels=[channel],
                 hotness_threshold=7,
                 db_path=db_path,
+                digest_min_candidates=1,
+                digest_max_wait_seconds=0,
             )
             storage = PostRepository(db_path=db_path)
             scraper = MockScraper(html_map={channel: html})
@@ -223,15 +281,17 @@ class TestNewsMonitorRunner:
 
             summary = runner.run_once()
             assert summary["posts_discovered"] == 1
-            assert summary["posts_evaluated"] == 1
+            # Coarse filter drops clear airdrop/presale spam before LLM
+            assert summary["posts_evaluated"] == 0
             assert summary["alerts_sent"] == 0
             assert len(webhook.sent_payloads) == 0
+            assert len(evaluator.digest_batches) == 0
 
-            # Verify post recorded with is_filtered=1 and filter_reason='spam'
+            # Verify post recorded with is_filtered=1 via coarse_filter
             record = storage.get_post(channel, 201)
             assert record is not None
             assert record["is_filtered"] == 1
-            assert record["filter_reason"] == "spam"
+            assert record["filter_reason"] in {"spam", "coarse_filter", "crypto_filter", "digest_empty", "digest_filtered", "digest_not_selected"}
             assert record["alert_sent"] == 0
 
     def test_deduplication_across_subsequent_runs(self):
@@ -258,6 +318,8 @@ class TestNewsMonitorRunner:
                 telegram_channels=[channel],
                 hotness_threshold=7,
                 db_path=db_path,
+                digest_min_candidates=1,
+                digest_max_wait_seconds=0,
             )
             storage = PostRepository(db_path=db_path)
             scraper = MockScraper(html_map={channel: html})
@@ -290,7 +352,10 @@ class TestNewsMonitorRunner:
             channel = "failing_channel"
             # Scraper returns None (network error or HTTP 429 backoff exhausted)
             scraper = MockScraper(html_map={channel: None})
-            config = Settings(telegram_channels=[channel], db_path=db_path)
+            config = Settings(telegram_channels=[channel], db_path=db_path,
+                digest_min_candidates=1,
+                digest_max_wait_seconds=0,
+            )
             storage = PostRepository(db_path=db_path)
             evaluator = MockEvaluator()
             webhook = MockWebhookSender()
@@ -327,7 +392,10 @@ class TestNewsMonitorRunner:
                 )
             }
 
-            config = Settings(telegram_channels=[channel], db_path=db_path)
+            config = Settings(telegram_channels=[channel], db_path=db_path,
+                digest_min_candidates=1,
+                digest_max_wait_seconds=0,
+            )
             storage = PostRepository(db_path=db_path)
             scraper = MockScraper(html_map={channel: html})
             evaluator = MockEvaluator(eval_map=eval_map)
@@ -375,4 +443,103 @@ class TestNewsMonitorRunner:
         assert runner.evaluator.api_key == "sk-deepseek-unit-test"
         assert runner.evaluator.api_base == "https://api.deepseek.com"
         assert runner.evaluator.model == "deepseek-chat"
+
+    def test_buffering_skips_llm_when_below_min_candidates(self):
+        """With default min_candidates=3, a single pending post stays unevaluated."""
+        with local_temp_db() as db_path:
+            channel = "buffer_chan"
+            posts_data = [
+                {"message_id": 501, "text": "Federal Reserve hints at unexpected policy shift this quarter."},
+            ]
+            html = make_sample_html(channel, posts_data)
+            config = Settings(
+                telegram_channels=[channel],
+                db_path=db_path,
+                digest_min_candidates=3,
+                digest_max_wait_seconds=900,
+            )
+            storage = PostRepository(db_path=db_path)
+            scraper = MockScraper(html_map={channel: html})
+            evaluator = MockEvaluator()
+            webhook = MockWebhookSender(should_succeed=True)
+            runner = NewsMonitorRunner(
+                config=config,
+                storage=storage,
+                scraper_client=scraper,
+                evaluator=evaluator,
+                webhook_sender=webhook,
+            )
+            summary = runner.run_once()
+            assert summary["posts_discovered"] == 1
+            assert summary["posts_evaluated"] == 0
+            assert summary["alerts_sent"] == 0
+            assert len(evaluator.digest_batches) == 0
+            assert len(webhook.sent_payloads) == 0
+            # Still pending
+            pending = storage.list_pending_posts()
+            assert len(pending) == 1
+            assert pending[0].message_id == 501
+
+    def test_multi_item_sends_one_card_per_digest_item(self):
+        """Material digest with 2 items should dispatch 2 single cards."""
+        with local_temp_db() as db_path:
+            channel = "multi_chan"
+            posts_data = [
+                {"message_id": 601, "text": "Major bank announces unexpected rate cut affecting global markets today."},
+                {"message_id": 602, "text": "Tech giant unveils breakthrough chip architecture for AI training workloads."},
+                {"message_id": 603, "text": "Oil prices surge after supply disruption in key producing region overnight."},
+            ]
+            html = make_sample_html(channel, posts_data)
+
+            def builder(posts):
+                items = []
+                for i, post in enumerate(posts[:2], start=1):
+                    items.append(
+                        DigestItem(
+                            rank=i,
+                            channel=post.channel,
+                            message_id=post.message_id,
+                            title=f"单卡测试#{i}",
+                            summary=f"摘要{i}",
+                            category="宏观快讯",
+                            impact_overall="总体影响显著",
+                            impact_us="美股短线波动",
+                            impact_cn="A股情绪升温",
+                            impact_commodities="大宗跟随",
+                        )
+                    )
+                return DigestBrief(
+                    headline="双卡测试",
+                    overview="两则实质新闻",
+                    items=items,
+                    has_material_news=True,
+                )
+
+            config = Settings(
+                telegram_channels=[channel],
+                db_path=db_path,
+                digest_min_candidates=3,
+                digest_max_wait_seconds=0,
+                digest_card_interval_seconds=0,
+            )
+            storage = PostRepository(db_path=db_path)
+            scraper = MockScraper(html_map={channel: html})
+            evaluator = MockEvaluator(digest_builder=builder)
+            webhook = MockWebhookSender(should_succeed=True)
+            runner = NewsMonitorRunner(
+                config=config,
+                storage=storage,
+                scraper_client=scraper,
+                evaluator=evaluator,
+                webhook_sender=webhook,
+            )
+            summary = runner.run_once()
+            assert summary["posts_discovered"] == 3
+            assert summary["posts_evaluated"] == 3
+            assert summary["alerts_sent"] == 2
+            assert len(webhook.sent_payloads) == 2
+            joined = str(webhook.sent_payloads)
+            assert "单卡测试#1" in joined
+            assert "单卡测试#2" in joined
+            assert "查看 Telegram" not in joined
 

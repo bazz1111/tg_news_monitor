@@ -258,3 +258,26 @@ class TestPostLifecycleAndStateTracking:
             row = cursor.fetchone()
             assert row["consecutive_errors"] == 1
             assert row["last_error"] == "Connection timed out"
+
+
+    def test_list_pending_with_scraped_at(self, repo):
+        p1 = create_sample_post("pending_ch", 1, "Real pending news about markets moving higher today.")
+        p2 = create_sample_post("pending_ch", 2, "Another pending article on policy changes.")
+        repo.save_post(p1)
+        repo.save_post(p2)
+        repo.update_evaluation(
+            channel="pending_ch",
+            message_id=1,
+            score=5,
+            summary="done",
+            is_filtered=False,
+        )
+        pending = repo.list_pending_posts()
+        assert len(pending) == 1
+        assert pending[0].message_id == 2
+        pairs = repo.list_pending_with_scraped_at()
+        assert len(pairs) == 1
+        post, scraped_at = pairs[0]
+        assert post.message_id == 2
+        assert scraped_at.tzinfo is not None
+
