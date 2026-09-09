@@ -14,7 +14,7 @@ import json
 import os
 import re
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Annotated, Any, Dict, List, Optional, Union
 
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
 
@@ -36,6 +36,14 @@ try:
     HAS_PYDANTIC_SETTINGS = True
 except ImportError:
     HAS_PYDANTIC_SETTINGS = False
+
+try:
+    from pydantic_settings import NoDecode  # type: ignore
+except ImportError:
+    NoDecode = None  # type: ignore
+
+# pydantic-settings JSON-decodes list env vars; keep comma-separated TELEGRAM_CHANNELS as text.
+_ChannelList = Annotated[List[str], NoDecode] if NoDecode is not None else List[str]
 
 
 # ==============================================================================
@@ -212,7 +220,7 @@ class Settings(_BaseClass):
     )
 
     # Monitored Telegram channels
-    telegram_channels: List[str] = Field(
+    telegram_channels: _ChannelList = Field(
         default_factory=list,
         description="Target Telegram channel handles to monitor without @ prefix",
     )

@@ -26,12 +26,7 @@ except ImportError:
 
 from tg_news_monitor.config import Settings, get_config
 from tg_news_monitor.core.policy import DeliveryPolicy, fingerprint, is_fresh, urgent
-from tg_news_monitor.core.schedule import (
-    classify_alert_mode,
-    day_start_minutes,
-    knobs_for,
-    local_now,
-)
+from tg_news_monitor.core import schedule as alert_schedule
 from tg_news_monitor.core.filters import (
     _COARSE_EMPTY_MAX_LEN,
     _COARSE_SPAM_RES,
@@ -428,16 +423,16 @@ class NewsMonitorRunner:
         if clock.tzinfo is None:
             clock = clock.replace(tzinfo=timezone.utc)
         tz_name = getattr(self.config, "timezone", "Asia/Shanghai") or "Asia/Shanghai"
-        local = local_now(clock, tz_name)
+        local = alert_schedule.local_now(clock, tz_name)
         quiet_hours = getattr(self.config, "quiet_hours", "") or ""
         shoulder_hours = getattr(self.config, "shoulder_hours", "") or ""
-        mode = classify_alert_mode(local, quiet_hours, shoulder_hours)
+        mode = alert_schedule.classify_alert_mode(local, quiet_hours, shoulder_hours)
         is_flush = False
         if bool(getattr(self.config, "morning_flush_enabled", True)) and mode == "day":
             is_flush = self.policy.peek_morning_flush(
-                mode, local, day_start_minutes(quiet_hours, shoulder_hours)
+                mode, local, alert_schedule.day_start_minutes(quiet_hours, shoulder_hours)
             )
-        knobs = knobs_for(self.config, mode, is_morning_flush=is_flush, now_local=local)
+        knobs = alert_schedule.knobs_for(self.config, mode, is_morning_flush=is_flush, now_local=local)
         self.policy.sync_quiet_window(mode, knobs.quiet_window_id)
         logger.info(
             f"Alert window: mode={knobs.mode} tz={tz_name} local={local.isoformat()} "
@@ -464,7 +459,7 @@ class NewsMonitorRunner:
 
         if not pending_pairs:
             if knobs.is_morning_flush:
-                self.policy.mark_morning_flush(local_now(clock, getattr(self.config, "timezone", "Asia/Shanghai")))
+                self.policy.mark_morning_flush(alert_schedule.local_now(clock, getattr(self.config, "timezone", "Asia/Shanghai")))
             logger.info(
                 "Batch digest mode: no pending posts (evaluated_at IS NULL); "
                 "skipping LLM and Feishu cards."
@@ -506,7 +501,7 @@ class NewsMonitorRunner:
 
         if not candidates:
             if knobs.is_morning_flush:
-                self.policy.mark_morning_flush(local_now(clock, getattr(self.config, "timezone", "Asia/Shanghai")))
+                self.policy.mark_morning_flush(alert_schedule.local_now(clock, getattr(self.config, "timezone", "Asia/Shanghai")))
             logger.info("No candidates after coarse/crypto filter; skipping LLM and Feishu cards.")
             return pass_summary
 
@@ -557,7 +552,7 @@ class NewsMonitorRunner:
             logger.info("LLM cooldown/daily call budget: pending messages retained until expiry")
             return pass_summary
         if knobs.is_morning_flush:
-            self.policy.mark_morning_flush(local_now(clock, getattr(self.config, "timezone", "Asia/Shanghai")))
+            self.policy.mark_morning_flush(alert_schedule.local_now(clock, getattr(self.config, "timezone", "Asia/Shanghai")))
         candidates = sorted(candidates, key=lambda p: (urgent(p.text), p.published_at), reverse=True)[:self.config.digest_max_batch_size]
         self.evaluator.recent_history = self.policy.history()
         # 5. One LLM call for the candidate batch

@@ -82,7 +82,8 @@ class TestMidnightWrap:
         start, end = 23 * 60, 60
         assert window_id_for(local(23, 30, day=8), start, end) == "2026-09-08"
         assert window_id_for(local(0, 30, day=9), start, end) == "2026-09-08"
-        assert window_id_for(local(2, 0, day=9), start, end) == "2026-09-09"
+        # After the wrap ends, id stays on the start-side date until the next 23:00.
+        assert window_id_for(local(2, 0, day=9), start, end) == "2026-09-08"
 
 
 class TestClassifyDefaultBeijingWindows:
