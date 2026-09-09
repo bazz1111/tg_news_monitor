@@ -243,12 +243,19 @@ class TestZeroCredentialDynamicNetwork:
         captured_requests: List[Dict[str, Any]] = []
 
         # Client factory or adapter
-        def capture_request(method: str, url: str, headers: Dict[str, str] = None, cookies: Dict[str, str] = None, **kwargs):
+        def capture_request(*args, method: str = "GET", url: str = "", headers: Dict[str, str] = None, cookies: Dict[str, str] = None, **kwargs):
+            # httpx.Client.get(url, headers=...) vs requests.get(url) vs (method, url)
+            if len(args) >= 2:
+                method, url = args[0], args[1]
+            elif len(args) == 1:
+                url = args[0]
+            headers = headers or kwargs.get("headers") or {}
+            cookies = cookies or kwargs.get("cookies") or {}
             captured_requests.append({
-                "method": method.upper(),
+                "method": str(method).upper(),
                 "url": url,
-                "headers": headers or {},
-                "cookies": cookies or {},
+                "headers": headers,
+                "cookies": cookies,
             })
             # Return a mock response with valid minimal Telegram preview HTML
             mock_resp = MagicMock()

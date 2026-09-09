@@ -17,7 +17,18 @@ class TestConfigDefaultsAndParsing:
     def test_default_values(self, monkeypatch: pytest.MonkeyPatch):
         # Clear any environment variables that might interfere
         for k in list(os.environ.keys()):
-            if k.startswith("TELEGRAM_") or k.startswith("GROK_") or k.startswith("DEEPSEEK_") or k.startswith("FEISHU_") or k.startswith("POLL_") or k.startswith("HOTNESS_"):
+            if (
+                k.startswith("TELEGRAM_")
+                or k.startswith("GROK_")
+                or k.startswith("DEEPSEEK_")
+                or k.startswith("FEISHU_")
+                or k.startswith("POLL_")
+                or k.startswith("HOTNESS_")
+                or k.startswith("QUIET_")
+                or k.startswith("SHOULDER_")
+                or k.startswith("MORNING_")
+                or k == "TIMEZONE"
+            ):
                 monkeypatch.delenv(k, raising=False)
 
         settings = Settings()
@@ -27,6 +38,10 @@ class TestConfigDefaultsAndParsing:
         assert settings.deepseek_api_base == "https://api.deepseek.com"
         assert settings.deepseek_model == "deepseek-chat"
         assert settings.hotness_threshold == 7
+        assert settings.timezone == "Asia/Shanghai"
+        assert settings.quiet_hours == "01:00-08:00"
+        assert settings.shoulder_hours == "23:00-01:00"
+        assert settings.quiet_card_cap == 5
         assert settings.db_path == "data/tg_news.db"
         assert settings.log_level == "INFO"
         assert settings.telegram_channels == []
