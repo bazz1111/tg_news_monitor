@@ -1,0 +1,39 @@
+# ==============================================================================
+# Telegram News Monitor - YAML Configuration Alternative Template
+# Copy this file to config.yaml and configure your settings.
+# ==============================================================================
+
+# Target Telegram channel handles (without @ prefix)
+telegram_channels:
+  - durov
+  - telegram
+  - whale_alert
+
+# Ingestion Polling Interval & Timing Defenses
+poll_interval_seconds: 60
+max_jitter_seconds: 15
+inter_channel_delay_seconds: 2.0
+
+# DeepSeek LLM Evaluator (https://platform.deepseek.com/)
+deepseek_api_key: "sk-your-deepseek-api-key-here"
+deepseek_api_base: "https://api.deepseek.com"
+deepseek_model: "deepseek-chat"
+
+# Severity / Hotness Gating Threshold (1 to 10 scale)
+# 9-10: Red tier (Disaster, extreme exploit, critical regulatory)
+# 7-8:  Orange tier (Major breaking event, institutional move)
+# 5-6:  Blue tier (Routine industry announcement)
+# 1-4:  Grey tier (Filtered chatter, noise, or promotions)
+hotness_threshold: 7
+
+# Feishu (Lark) Custom Bot Webhook Dispatcher
+feishu_webhook_url: "https://open.feishu.cn/open-apis/bot/v2/hook/your-bot-uuid-here"
+feishu_webhook_secret: ""
+
+# Persistent Storage & Runtime Logging
+db_path: "data/tg_news.db"
+log_level: "INFO"
+
+# Optional Proxy Configuration
+# http_proxy: "http://127.0.0.1:7890"
+# https_proxy: "http://127.0.0.1:7890"

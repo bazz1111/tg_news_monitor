@@ -1,0 +1,20 @@
+services:
+  tg_news_monitor:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: tg_news_monitor
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      # Persistent volume mount for SQLite WAL database
+      - ./data:/app/data
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    environment:
+      - PYTHONUNBUFFERED=1
+      - DB_PATH=/app/data/tg_news.db
