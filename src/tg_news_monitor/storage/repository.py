@@ -283,13 +283,13 @@ class PostRepository:
     @staticmethod
     def _parse_iso_dt(value: Optional[str]) -> datetime:
         if not value:
-            return datetime.now(timezone.utc)
+            return datetime.fromtimestamp(0, timezone.utc)
         try:
             dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
         except Exception:
-            return datetime.now(timezone.utc)
+            return datetime.fromtimestamp(0, timezone.utc)
         if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
+            return datetime.fromtimestamp(0, timezone.utc)
         return dt
 
     def _row_to_telegram_post(self, row) -> TelegramPost:

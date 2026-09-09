@@ -39,7 +39,7 @@ def make_sample_html(channel: str, posts_data: List[Dict[str, Any]]) -> str:
     for p in posts_data:
         msg_id = p["message_id"]
         text = p.get("text", "")
-        dt = p.get("published_at", "2026-09-08T21:00:00+00:00")
+        dt = p.get("published_at", datetime.now(timezone.utc).isoformat())
         is_service = p.get("is_service", False)
         service_class = "tgme_widget_message_service" if is_service else ""
 
@@ -119,6 +119,7 @@ class MockEvaluator:
                     rank=len(items) + 1,
                     channel=post.channel,
                     message_id=post.message_id,
+                    event_at=post.published_at,
                     title=ev.title,
                     summary="; ".join(ev.summary_bullets or [ev.title]),
                     category=ev.category or "行业快讯",
@@ -224,7 +225,7 @@ class TestNewsMonitorRunner:
             assert "重磅监管获批公告" in str(card_payload)
             # Item cards must not include Telegram original-link buttons
             assert "查看 Telegram" not in str(card_payload)
-            assert "t.me/" not in str(card_payload)
+            assert "https://t.me/whale_wire/101" in str(card_payload)
 
             # Verify SQLite database state (batch digest: selected item score from rank)
             post_101 = storage.get_post(channel, 101)
@@ -499,6 +500,7 @@ class TestNewsMonitorRunner:
                             rank=i,
                             channel=post.channel,
                             message_id=post.message_id,
+                    event_at=post.published_at,
                             title=f"单卡测试#{i}",
                             summary=f"摘要{i}",
                             category="宏观快讯",

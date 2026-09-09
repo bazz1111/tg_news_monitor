@@ -256,6 +256,11 @@ class Settings(_BaseClass):
         description="Urgency score threshold (1-10) to trigger interactive Feishu alerts",
     )
 
+    news_max_age_seconds: int = Field(default=1800, ge=60)
+    digest_min_interval_seconds: int = Field(default=180, ge=0)
+    digest_max_batch_size: int = Field(default=20, ge=1, le=50)
+    digest_max_calls_per_day: int = Field(default=288, ge=1)
+
     # Digest buffering gate (batch LLM + multi single cards)
     digest_min_candidates: int = Field(
         default=3,

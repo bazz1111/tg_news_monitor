@@ -6,6 +6,7 @@ import json
 import logging
 import random
 import time
+from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Union
 
 import httpx
@@ -136,6 +137,7 @@ class GrokClient:
             "model": self.model,
             "temperature": self.temperature,
             "response_format": {"type": "json_object"},
+            "max_tokens": 3000,
             # DeepSeek non-thinking mode (ignored by providers that do not support it)
             "thinking": {"type": "disabled"},
             "messages": [
@@ -344,11 +346,12 @@ class GrokClient:
             "model": self.model,
             "temperature": self.temperature,
             "response_format": {"type": "json_object"},
+            "max_tokens": 3000,
             # DeepSeek non-thinking mode (ignored by providers that do not support it)
             "thinking": {"type": "disabled"},
             "messages": [
                 {"role": "system", "content": build_digest_system_prompt()},
-                {"role": "user", "content": build_digest_user_prompt(posts)},
+                {"role": "user", "content": build_digest_user_prompt(posts) + "\n当前UTC时间：" + datetime.now(timezone.utc).isoformat() + "\n过去24小时最近已推送或投递状态待核实的事件（无新事实则勿重复）：\n" + getattr(self, "recent_history", "")},
             ],
         }
 
@@ -370,8 +373,7 @@ class GrokClient:
     def evaluate_digest(self, posts: List[TelegramPost]) -> DigestBrief:
         """Evaluate a batch of posts into one DigestBrief (single LLM call).
 
-        Uses the same retry/backoff pattern as evaluate_post. On parse failure
-        returns an empty DigestBrief with has_material_news=False.
+        Raises on API/parse failure so the caller can retain pending posts.
         Timeout for this call is at least 60 seconds.
         """
         if not posts:
@@ -383,6 +385,7 @@ class GrokClient:
                 filtered_note="empty_batch",
             )
 
+        self.last_usage = None
         payload = self._build_digest_request_payload(posts)
         last_error: Optional[Exception] = None
         digest_timeout = max(60.0, float(self.timeout or 30.0))
@@ -456,6 +459,7 @@ class GrokClient:
                         except Exception:
                             raw_response = response.text
 
+                self.last_usage = (response.json().get("usage") or {}).get("total_tokens")
                 return self._parse_digest_response(raw_response)
             except (GrokRateLimitError, GrokServerError, GrokNetworkError) as err:
                 last_error = err
@@ -483,13 +487,7 @@ class GrokClient:
 
         err_msg = str(last_error) if last_error else "unknown digest failure"
         logger.error("Digest evaluation failed after retries: %s", err_msg)
-        return DigestBrief(
-            headline="本轮快讯",
-            overview="模型解析失败",
-            items=[],
-            has_material_news=False,
-            filtered_note=err_msg,
-        )
+        raise GrokError(err_msg) from last_error
 
     def evaluate_text(
         self,

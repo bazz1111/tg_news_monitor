@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Union
-from zoneinfo import ZoneInfo
+from datetime import timedelta
 
 from tg_news_monitor.core.models import DigestBrief, DigestItem, NewsEvaluation, TelegramPost
 
@@ -434,14 +434,14 @@ class FeishuCardBuilder:
         if isinstance(dt, datetime):
             if dt.tzinfo is None:
                 dt = dt.replace(tzinfo=timezone.utc)
-            bj = dt.astimezone(ZoneInfo("Asia/Shanghai"))
+            bj = dt.astimezone(timezone(timedelta(hours=8)))
             time_str = bj.strftime("%Y-%m-%d %H:%M")
         else:
             time_str = "未知"
 
         flames = "🔥" * min(5, max(1, (score + 1) // 2))
         time_md = (
-            f"🕒 **时间** {time_str}（北京时间）\n"
+            f"🕒 **频道发布时间** {time_str}（北京时间）\n"
             f"🎚️ **紧急** **{urgency_label}** {flames}"
         )
 

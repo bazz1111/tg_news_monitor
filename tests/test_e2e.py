@@ -232,18 +232,10 @@ def execute_e2e_pipeline(
                                 "tag": "hr",
                             },
                             {
-                                "tag": "action",
-                                "actions": [
-                                    {
-                                        "tag": "button",
-                                        "text": {
-                                            "tag": "plain_text",
-                                            "content": "🔗 查看 Telegram 原文",
-                                        },
-                                        "type": "primary",
-                                        "url": f"https://t.me/{channel}/{msg_id}",
-                                    }
-                                ],
+                                "tag": "button",
+                                "text": {"tag": "plain_text", "content": "🔗 查看 Telegram 原文"},
+                                "type": "primary",
+                                "behaviors": [{"type": "open_url", "default_url": f"https://t.me/{channel}/{msg_id}"}],
                             },
                         ]
                     },
@@ -350,8 +342,8 @@ class TestE2EAcceptance:
         assert header_1["template"] == "red", f"Expected red template for score 9, got '{header_1['template']}'"
         assert "以太坊" in header_1["title"]["content"]
         # Verify direct link button
-        btn_1 = cards[0]["card"]["body"]["elements"][-1]["actions"][0]
-        assert btn_1["url"] == "https://t.me/whale_alert/101"
+        btn_1 = cards[0]["card"]["body"]["elements"][-1]
+        assert btn_1["behaviors"][0]["default_url"] == "https://t.me/whale_alert/101"
 
         # Verify Card 2 (Post 103, Score 8, Orange Template)
         valid_2, msg_2 = MockFeishuReceiver.validate_card_schema(cards[1])
@@ -359,8 +351,8 @@ class TestE2EAcceptance:
         header_2 = cards[1]["card"]["header"]
         assert header_2["template"] == "orange", f"Expected orange template for score 8, got '{header_2['template']}'"
         assert "ETF" in header_2["title"]["content"]
-        btn_2 = cards[1]["card"]["body"]["elements"][-1]["actions"][0]
-        assert btn_2["url"] == "https://t.me/whale_alert/103"
+        btn_2 = cards[1]["card"]["body"]["elements"][-1]
+        assert btn_2["behaviors"][0]["default_url"] == "https://t.me/whale_alert/103"
 
         # 3. Database State Assertions (Below-threshold recorded in DB with alert_dispatched = 0)
         conn = sqlite3.connect(str(temp_sqlite_db_path))

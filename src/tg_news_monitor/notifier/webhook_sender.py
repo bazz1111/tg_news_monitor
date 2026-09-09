@@ -174,7 +174,7 @@ class FeishuWebhookSender:
 
             try:
                 logger.debug(
-                    f"Posting to Feishu webhook (attempt {attempt}/{self.max_retries}): {target_url}"
+                    f"Posting to Feishu webhook (attempt {attempt}/{self.max_retries})"
                 )
                 response = client.post(
                     target_url,

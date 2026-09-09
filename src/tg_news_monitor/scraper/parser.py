@@ -122,7 +122,7 @@ class TelegramWebParser:
                 return datetime.fromisoformat(raw_dt.replace("Z", "+00:00"))
             except ValueError:
                 pass
-        return datetime.now(timezone.utc)
+        return datetime.fromtimestamp(0, timezone.utc)  # Unknown time must never become fresh news.
 
     @classmethod
     def _extract_formatted_text(cls, text_el: Tag) -> str:

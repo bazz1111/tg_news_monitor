@@ -33,7 +33,7 @@ _CRYPTO_RES = [
     re.compile(r"(比特币|以太坊|加密货币|加密资产|数字货币|虚拟货币|区块链)", re.I),
     re.compile(r"(代币|山寨币|稳定币|迷因币|狗狗币|莱特币|瑞波币)", re.I),
     re.compile(r"(币安|火币|欧易|抹茶交易所|数字藏品)", re.I),
-    re.compile(r"(链上|链游|挖矿收益|矿工费|gas\s*费|聪)", re.I),
+    re.compile(r"(链上|链游|挖矿收益|矿工费|gas\s*费|中本聪)", re.I),
 ]
 
 
