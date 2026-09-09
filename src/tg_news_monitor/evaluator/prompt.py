@@ -173,6 +173,7 @@ summary用一句话，summary_bullets最多3条事实；影响分析与事实分
  "bias_overall":"不确定","bias_us":"中性","bias_cn":"中性","bias_commodities":"中性",
  "impact_overall":"影响分析","impact_us":"无直接影响","impact_cn":"无直接影响","impact_commodities":"无直接影响"}]}
 items为空时has_material_news必须为false。
+每条可增加night_alert（仅已确认的重大突发为true）、confirmed_source（正文明确标注的来源名称或域名，不得推测）、update_reason（相对历史记录的实质升级事实，否则空字符串）。
 """
 
 

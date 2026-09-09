@@ -34,9 +34,13 @@ def make_post(mid: int, text: str, published_at: datetime, channel: str = "wire"
     )
 
 
-def item_for(post: TelegramPost, score: int, title: str, rank: int = 1) -> DigestItem:
+def item_for(post: TelegramPost, score: int, title: str, rank: int = 1, escalation: bool = False) -> DigestItem:
     return DigestItem(
         rank=rank,
+        night_alert=True,
+        confirmed_source="reuters",
+        is_update=escalation,
+        update_reason="New confirmed escalation" if escalation else "",
         channel=post.channel,
         message_id=post.message_id,
         title=title,
@@ -59,6 +63,8 @@ def make_runner(tmp_path, **cfg_kw):
         digest_min_candidates=1,
         digest_max_wait_seconds=0,
         digest_card_interval_seconds=0,
+        quiet_digest_card_interval_seconds=0,
+        shoulder_digest_card_interval_seconds=0,
         digest_min_interval_seconds=0,
         news_max_age_seconds=1800,
         hotness_threshold=7,
@@ -87,7 +93,7 @@ class TestQuietAndShoulderSendRules:
         assert sender.sent_payloads == []
         assert len(repository.list_pending_posts()) == 1
 
-    def test_quiet_break_glass_urgent_keyword_sends_below_score(self, tmp_path):
+    def test_quiet_keyword_does_not_bypass_score_or_source(self, tmp_path):
         now = sh_time(2, 0)
         runner, repository, evaluator, sender = make_runner(tmp_path)
 
@@ -104,8 +110,8 @@ class TestQuietAndShoulderSendRules:
 
         summary = runner.process_pending(now=now)
         assert summary["posts_evaluated"] == 1
-        assert summary["alerts_sent"] == 1
-        assert len(sender.sent_payloads) == 1
+        assert summary["alerts_sent"] == 0
+        assert len(sender.sent_payloads) == 0
 
     def test_quiet_score_nine_sends_score_eight_does_not(self, tmp_path):
         now = sh_time(3, 0)
@@ -125,8 +131,8 @@ class TestQuietAndShoulderSendRules:
 
         evaluator.digest_builder = select
         repository.save_posts([
-            make_post(1, "Major bank reports unexpected quarterly loss in Europe.", now),
-            make_post(2, "Global oil supply shock after a new pipeline shutdown.", now),
+            make_post(1, "Reuters reports emergency rate cut in Europe.", now),
+            make_post(2, "Reuters reports emergency rate cut in America.", now),
         ])
 
         summary = runner.process_pending(now=now)
@@ -145,7 +151,7 @@ class TestQuietAndShoulderSendRules:
                 headline="cap",
                 overview="",
                 items=[
-                    item_for(p, score=9, title=f"夜报{p.message_id}", rank=min(i, 5))
+                    item_for(p, score=9, title=f"夜报{p.message_id}", rank=min(i, 5), escalation=True)
                     for i, p in enumerate(posts, start=1)
                 ],
                 has_material_news=True,
@@ -153,7 +159,7 @@ class TestQuietAndShoulderSendRules:
 
         evaluator.digest_builder = select
         repository.save_posts([
-            make_post(i, f"Serious macroeconomic shock number {i} hits global markets.", now)
+            make_post(i, f"Reuters emergency rate cut number {i} hits global markets.", now)
             for i in range(1, 4)
         ])
 
@@ -162,7 +168,7 @@ class TestQuietAndShoulderSendRules:
         assert runner.policy.quiet_cards_sent("2026-09-09") == 2
 
         later = sh_time(4, 40)
-        repository.save_posts([make_post(4, "Another serious macroeconomic shock hits overnight.", later)])
+        repository.save_posts([make_post(4, "Reuters reports another emergency rate cut overnight.", later)])
         runner.config.digest_min_interval_seconds = 0
         # Quiet interval is 1800s; force the next night eval by using a later clock + zeroed quiet interval.
         runner.config.quiet_digest_min_interval_seconds = 0

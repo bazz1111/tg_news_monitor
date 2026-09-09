@@ -48,7 +48,7 @@ def parse_hour_window(spec: str) -> Optional[tuple[int, int]]:
     """Parse 'HH:MM-HH:MM' into (start_minute, end_minute). Empty spec → None (disabled).
 
     A window with start == end is treated as disabled. Wrapping windows (start > end)
-    are valid, e.g. 23:00-01:00.
+    are valid, e.g. 22:00-00:00.
     """
     text = (spec or "").strip()
     if not text:
@@ -93,8 +93,8 @@ def window_id_for(now_local: datetime, start: int, end: int) -> str:
 
 def classify_alert_mode(
     now_local: datetime,
-    quiet_hours: str = "01:00-08:00",
-    shoulder_hours: str = "23:00-01:00",
+    quiet_hours: str = "00:00-08:00",
+    shoulder_hours: str = "22:00-00:00",
 ) -> str:
     """Return day | shoulder | quiet. Quiet wins overlaps, then shoulder."""
     minute = minute_of_day(now_local)
@@ -221,7 +221,7 @@ def knobs_for(config, mode: str, *, is_morning_flush: bool = False, now_local: O
             card_interval_seconds=_cfg_float(config, "quiet_digest_card_interval_seconds", 15.0),
             max_age_seconds=base.max_age_seconds,
             require_urgent_to_evaluate=True,
-            allow_urgent_score_bypass=True,
+            allow_urgent_score_bypass=False,
             quiet_card_cap=_cfg_int(config, "quiet_card_cap", 5),
             quiet_window_id=quiet_window_id,
         )

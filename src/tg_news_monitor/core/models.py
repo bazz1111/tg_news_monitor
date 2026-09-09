@@ -96,6 +96,9 @@ class DigestItem(BaseModel):
     impact_commodities: str = Field(..., description="Impact on commodities (黄金/原油等)")
     event_at: Optional[datetime] = None
     is_update: bool = False
+    night_alert: bool = False
+    confirmed_source: str = ""
+    update_reason: str = ""
     published_at: Optional[datetime] = Field(
         default=None,
         description="UTC publication time; prefer runner post.published_at when building card",

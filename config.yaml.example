@@ -28,10 +28,10 @@ hotness_threshold: 7
 
 # Elastic quiet hours (Asia/Shanghai). Empty quiet_hours/shoulder_hours disables a window.
 timezone: Asia/Shanghai
-shoulder_hours: "23:00-01:00"
-quiet_hours: "01:00-08:00"
+shoulder_hours: "22:00-00:00"
+quiet_hours: "00:00-08:00"
+quiet_alert_interval_seconds: 1800
 quiet_card_cap: 5
-morning_flush_max_age_seconds: 7200
 
 # Feishu (Lark) Custom Bot Webhook Dispatcher
 feishu_webhook_url: "https://open.feishu.cn/open-apis/bot/v2/hook/your-bot-uuid-here"
