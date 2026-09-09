@@ -564,6 +564,21 @@ def temp_sqlite_conn(temp_sqlite_db_path: Path):
 # 5. Environment & Settings Mock Fixture
 # ==============================================================================
 
+@pytest.fixture(autouse=True)
+def _force_day_alert_mode(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep existing runner tests on daytime knobs unless marked real_schedule."""
+    if request.node.get_closest_marker("real_schedule"):
+        return
+    monkeypatch.setattr(
+        "tg_news_monitor.core.schedule.classify_alert_mode",
+        lambda *args, **kwargs: "day",
+    )
+    monkeypatch.setattr(
+        "tg_news_monitor.core.policy.DeliveryPolicy.peek_morning_flush",
+        lambda self, *args, **kwargs: False,
+    )
+
+
 @pytest.fixture
 def mock_env_config(monkeypatch: pytest.MonkeyPatch, temp_sqlite_db_path: Path) -> Dict[str, str]:
     """Sets standard environment variables for tg_news_monitor configuration."""

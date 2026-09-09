@@ -34,3 +34,6 @@ minversion = "8.0"
 testpaths = ["tests"]
 pythonpath = ["src"]
 addopts = "-p no:cacheprovider"
+markers = [
+    "real_schedule: use real Asia/Shanghai alert-window classification",
+]

@@ -26,6 +26,12 @@ except ImportError:
 
 from tg_news_monitor.config import Settings, get_config
 from tg_news_monitor.core.policy import DeliveryPolicy, fingerprint, is_fresh, urgent
+from tg_news_monitor.core.schedule import (
+    classify_alert_mode,
+    day_start_minutes,
+    knobs_for,
+    local_now,
+)
 from tg_news_monitor.core.filters import (
     _COARSE_EMPTY_MAX_LEN,
     _COARSE_SPAM_RES,
@@ -355,14 +361,25 @@ class NewsMonitorRunner:
     def _oldest_age_seconds(
         self,
         pending_pairs: List[Tuple[TelegramPost, datetime]],
+        now: Optional[datetime] = None,
     ) -> float:
         if not pending_pairs:
             return 0.0
-        now = datetime.now(timezone.utc)
+        clock = now or datetime.now(timezone.utc)
         oldest = min(scraped_at for _, scraped_at in pending_pairs)
         if oldest.tzinfo is None:
             oldest = oldest.replace(tzinfo=timezone.utc)
-        return max(0.0, (now - oldest).total_seconds())
+        return max(0.0, (clock - oldest).total_seconds())
+
+    @staticmethod
+    def _digest_item_score(item: DigestItem) -> int:
+        raw_score = getattr(item, "score", None)
+        if raw_score is None:
+            return max(1, min(10, 11 - int(item.rank)))
+        try:
+            return max(1, min(10, int(raw_score)))
+        except (TypeError, ValueError):
+            return max(1, min(10, 11 - int(item.rank)))
 
     def run_once(self, ingest_only=False) -> Dict[str, Any]:
         """Single pass: ingest all channels, pending+coarse filter, threshold gate, multi cards."""
@@ -405,8 +422,35 @@ class NewsMonitorRunner:
             return pass_summary
         return self.process_pending(pass_summary)
 
-    def process_pending(self, pass_summary=None):
+    def process_pending(self, pass_summary=None, now=None):
         pass_summary = pass_summary or {"posts_evaluated": 0, "alerts_sent": 0, "details": []}
+        clock = now or datetime.now(timezone.utc)
+        if clock.tzinfo is None:
+            clock = clock.replace(tzinfo=timezone.utc)
+        tz_name = getattr(self.config, "timezone", "Asia/Shanghai") or "Asia/Shanghai"
+        local = local_now(clock, tz_name)
+        quiet_hours = getattr(self.config, "quiet_hours", "") or ""
+        shoulder_hours = getattr(self.config, "shoulder_hours", "") or ""
+        mode = classify_alert_mode(local, quiet_hours, shoulder_hours)
+        is_flush = False
+        if bool(getattr(self.config, "morning_flush_enabled", True)) and mode == "day":
+            is_flush = self.policy.peek_morning_flush(
+                mode, local, day_start_minutes(quiet_hours, shoulder_hours)
+            )
+        knobs = knobs_for(self.config, mode, is_morning_flush=is_flush, now_local=local)
+        self.policy.sync_quiet_window(mode, knobs.quiet_window_id)
+        logger.info(
+            f"Alert window: mode={knobs.mode} tz={tz_name} local={local.isoformat()} "
+            f"flush={knobs.is_morning_flush} hotness>={knobs.hotness_threshold} "
+            f"min_interval={knobs.min_interval_seconds}s"
+        )
+
+        try:
+            return self._process_pending_with_knobs(pass_summary, clock, knobs)
+        finally:
+            self.policy.note_mode(mode, clock)
+
+    def _process_pending_with_knobs(self, pass_summary, clock, knobs):
         # 2. Load ALL pending posts (this pass new + previously buffered)
         if hasattr(self.storage, "list_pending_with_scraped_at"):
             pending_pairs = self.storage.list_pending_with_scraped_at()
@@ -416,10 +460,11 @@ class NewsMonitorRunner:
                 if hasattr(self.storage, "list_pending_posts")
                 else []
             )
-            now = datetime.now(timezone.utc)
-            pending_pairs = [(p, now) for p in pending_posts]
+            pending_pairs = [(p, clock) for p in pending_posts]
 
         if not pending_pairs:
+            if knobs.is_morning_flush:
+                self.policy.mark_morning_flush(local_now(clock, getattr(self.config, "timezone", "Asia/Shanghai")))
             logger.info(
                 "Batch digest mode: no pending posts (evaluated_at IS NULL); "
                 "skipping LLM and Feishu cards."
@@ -427,9 +472,9 @@ class NewsMonitorRunner:
             return pass_summary
 
         pending_posts = [p for p, _ in pending_pairs]
-        expired = [p for p in pending_posts if not is_fresh(p.published_at, self.config.news_max_age_seconds)]
+        expired = [p for p in pending_posts if not is_fresh(p.published_at, knobs.max_age_seconds, now=clock)]
         self._mark_all_filtered(expired, "expired_or_invalid_time")
-        pending_posts = [p for p in pending_posts if is_fresh(p.published_at, self.config.news_max_age_seconds)]
+        pending_posts = [p for p in pending_posts if is_fresh(p.published_at, knobs.max_age_seconds, now=clock)]
         unique, duplicates, seen = [], [], set()
         for post in sorted(pending_posts, key=lambda p: p.published_at, reverse=True):
             key = fingerprint(post.text)
@@ -460,6 +505,8 @@ class NewsMonitorRunner:
             self._mark_all_filtered(crypto_dropped, "crypto_filter")
 
         if not candidates:
+            if knobs.is_morning_flush:
+                self.policy.mark_morning_flush(local_now(clock, getattr(self.config, "timezone", "Asia/Shanghai")))
             logger.info("No candidates after coarse/crypto filter; skipping LLM and Feishu cards.")
             return pass_summary
 
@@ -473,18 +520,26 @@ class NewsMonitorRunner:
                 p,
                 scraped_map.get(
                     (p.channel.lower().lstrip("@").strip(), int(p.message_id)),
-                    datetime.now(timezone.utc),
+                    clock,
                 ),
             )
             for p in candidates
         ]
 
-        # 4. Buffering gate
-        min_candidates = int(getattr(self.config, "digest_min_candidates", 3) or 3)
-        max_wait = int(self.config.digest_max_wait_seconds)
-        oldest_age = self._oldest_age_seconds(candidate_pairs)
+        # 4. Buffering gate (quiet ignores max_wait so overnight backlog can morning-flush)
+        min_candidates = knobs.min_candidates
+        max_wait = knobs.max_wait_seconds
+        oldest_age = self._oldest_age_seconds(candidate_pairs, now=clock)
+        has_urgent = any(urgent(p.text) for p in candidates)
 
-        if len(candidates) < min_candidates and oldest_age < max_wait and not any(urgent(p.text) for p in candidates):
+        if not knobs.is_morning_flush and knobs.require_urgent_to_evaluate:
+            if not has_urgent and len(candidates) < min_candidates:
+                logger.info(
+                    f"Quiet hours: holding {len(candidates)} non-urgent candidate(s) "
+                    f"(min_candidates={min_candidates}); no LLM until break-glass or morning flush."
+                )
+                return pass_summary
+        elif not knobs.is_morning_flush and len(candidates) < min_candidates and oldest_age < max_wait and not has_urgent:
             logger.info(
                 f"Buffering: {len(candidates)} candidate(s) < min_candidates={min_candidates} "
                 f"and oldest_age={oldest_age:.0f}s < max_wait={max_wait}s; "
@@ -495,12 +550,14 @@ class NewsMonitorRunner:
         logger.info(
             f"Digest gate open: candidates={len(candidates)} "
             f"(min={min_candidates}), oldest_age={oldest_age:.0f}s "
-            f"(max_wait={max_wait}s); calling evaluate_digest."
+            f"(max_wait={max_wait}s, flush={knobs.is_morning_flush}); calling evaluate_digest."
         )
 
-        if not self.policy.reserve_call(self.config.digest_min_interval_seconds, self.config.digest_max_calls_per_day):
+        if not self.policy.reserve_call(knobs.min_interval_seconds, self.config.digest_max_calls_per_day):
             logger.info("LLM cooldown/daily call budget: pending messages retained until expiry")
             return pass_summary
+        if knobs.is_morning_flush:
+            self.policy.mark_morning_flush(local_now(clock, getattr(self.config, "timezone", "Asia/Shanghai")))
         candidates = sorted(candidates, key=lambda p: (urgent(p.text), p.published_at), reverse=True)[:self.config.digest_max_batch_size]
         self.evaluator.recent_history = self.policy.history()
         # 5. One LLM call for the candidate batch
@@ -591,9 +648,7 @@ class NewsMonitorRunner:
                 for p in candidates
             }
 
-            card_gap = float(
-                getattr(self.config, "digest_card_interval_seconds", 10.0) or 0.0
-            )
+            card_gap = float(knobs.card_interval_seconds or 0.0)
             for idx, item in enumerate(digest.items):
                 if idx > 0 and card_gap > 0:
                     logger.info(
@@ -609,13 +664,29 @@ class NewsMonitorRunner:
                     if matched_post is not None
                     else getattr(item, "published_at", None)
                 )
-                if not is_fresh(published_at, self.config.news_max_age_seconds):
+                if not is_fresh(published_at, knobs.max_age_seconds, now=clock):
                     continue
-                if not is_fresh(item.event_at, self.config.news_max_age_seconds):
+                if not is_fresh(item.event_at, knobs.max_age_seconds, now=clock):
                     self._mark_all_filtered([matched_post], "event_time_unknown_or_expired")
                     continue
-                if (item.score or 11 - item.rank) < self.config.hotness_threshold:
+                score = self._digest_item_score(item)
+                score_ok = score >= knobs.hotness_threshold
+                if (
+                    not score_ok
+                    and knobs.allow_urgent_score_bypass
+                    and matched_post is not None
+                    and urgent(matched_post.text)
+                ):
+                    score_ok = True
+                if not score_ok:
                     continue
+                if knobs.quiet_card_cap is not None and knobs.quiet_window_id:
+                    if self.policy.quiet_cards_sent(knobs.quiet_window_id) >= knobs.quiet_card_cap:
+                        logger.info(
+                            f"Quiet-hour Feishu card cap reached "
+                            f"({knobs.quiet_card_cap}/{knobs.quiet_window_id}); skipping remaining cards."
+                        )
+                        break
                 if not self.policy.claim(matched_post.text, item.title + ": " + item.summary):
                     continue
                 try:
@@ -626,15 +697,9 @@ class NewsMonitorRunner:
                 self.policy.complete(matched_post.text, send_ok)
                 if send_ok:
                     alerts_ok += 1
+                    if knobs.quiet_card_cap is not None and knobs.quiet_window_id:
+                        self.policy.record_quiet_card(knobs.quiet_window_id)
                     summary = f"[digest#{item.rank}] {item.title}"
-                    raw_score = getattr(item, "score", None)
-                    if raw_score is None:
-                        score = max(1, min(10, 11 - int(item.rank)))
-                    else:
-                        try:
-                            score = max(1, min(10, int(raw_score)))
-                        except (TypeError, ValueError):
-                            score = max(1, min(10, 11 - int(item.rank)))
                     self.storage.mark_alert_sent(
                         channel=ch,
                         message_id=mid,
@@ -694,6 +759,11 @@ class NewsMonitorRunner:
         logger.info(
             f"Alert Mode      : batch LLM + multi single cards; "
             f"min_candidates={min_c}; max_wait={max_w}s; card_gap={card_gap:.0f}s"
+        )
+        logger.info(
+            f"Quiet Hours     : tz={getattr(self.config, 'timezone', 'Asia/Shanghai')} "
+            f"quiet={getattr(self.config, 'quiet_hours', '')!r} "
+            f"shoulder={getattr(self.config, 'shoulder_hours', '')!r}"
         )
         logger.info(
             f"DeepSeek Model  : {self.config.deepseek_model} ({self.config.deepseek_api_base})"

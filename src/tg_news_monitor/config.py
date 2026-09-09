@@ -278,6 +278,37 @@ class Settings(_BaseClass):
         description="Seconds to wait between Feishu single-card sends in the same digest batch",
     )
 
+    # Elastic quiet hours (local clock; windows may wrap midnight)
+    timezone: str = Field(
+        default="Asia/Shanghai",
+        description="IANA timezone for alert windows (default Asia/Shanghai)",
+    )
+    quiet_hours: str = Field(
+        default="01:00-08:00",
+        description="Local quiet window START-END; empty disables. May wrap midnight.",
+    )
+    shoulder_hours: str = Field(
+        default="23:00-01:00",
+        description="Local shoulder window START-END; empty disables. May wrap midnight.",
+    )
+    shoulder_hotness_threshold: int = Field(default=8, ge=1, le=10)
+    shoulder_digest_min_interval_seconds: int = Field(default=600, ge=0)
+    shoulder_digest_min_candidates: int = Field(default=16, ge=1)
+    shoulder_digest_card_interval_seconds: float = Field(default=15.0, ge=0)
+    quiet_hotness_threshold: int = Field(default=9, ge=1, le=10)
+    quiet_digest_min_interval_seconds: int = Field(default=1800, ge=0)
+    quiet_digest_min_candidates: int = Field(default=16, ge=1)
+    quiet_digest_card_interval_seconds: float = Field(default=15.0, ge=0)
+    quiet_card_cap: int = Field(
+        default=5,
+        ge=0,
+        description="Max Feishu cards during one quiet window; 0 disables sends in quiet",
+    )
+    morning_flush_enabled: bool = Field(default=True)
+    morning_flush_max_age_seconds: int = Field(default=7200, ge=60)
+    morning_flush_hotness_threshold: int = Field(default=7, ge=1, le=10)
+    morning_flush_card_interval_seconds: float = Field(default=10.0, ge=0)
+
     # Feishu (Lark) Webhook dispatcher
     feishu_webhook_url: str = Field(
         default="",
@@ -363,6 +394,29 @@ class Settings(_BaseClass):
         if value < 1 or value > 10:
             raise ValueError("hotness_threshold must be between 1 and 10")
         return value
+
+    @field_validator("quiet_hours", "shoulder_hours")
+    @classmethod
+    def validate_hour_window(cls, value: Any) -> str:
+        """Accepts empty (disabled) or START-END; rejects malformed windows."""
+        from tg_news_monitor.core.schedule import parse_hour_window
+
+        if value is None:
+            return ""
+        text = str(value).strip()
+        if not text:
+            return ""
+        parse_hour_window(text)
+        return text
+
+    @field_validator("timezone")
+    @classmethod
+    def validate_timezone(cls, value: Any) -> str:
+        text = str(value or "").strip() or "Asia/Shanghai"
+        from tg_news_monitor.core.schedule import load_zone
+
+        load_zone(text)
+        return text
 
     @field_validator("deepseek_api_key", mode="before")
     @classmethod
