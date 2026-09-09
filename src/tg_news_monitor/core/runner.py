@@ -431,6 +431,7 @@ class NewsMonitorRunner:
         if not items:
             self.quiet.complete_morning(now, 'empty')
             return summary
+        items = sorted(items[:5], key=lambda item: allowed[(item.channel.lower().lstrip('@'), item.message_id)].published_at)
         elements = [{'tag': 'markdown', 'content': f'北京时间 {start:%m-%d %H:%M}—{end:%m-%d %H:%M} · 夜间回顾，非即时快讯；截至本次已采集材料。'}]
         for index, item in enumerate(items[:5], 1):
             post = allowed[(item.channel.lower().lstrip('@'), item.message_id)]
@@ -714,6 +715,7 @@ class NewsMonitorRunner:
                 for p in candidates
             }
 
+            digest.items.sort(key=lambda item: post_by_key[(item.channel.lower().lstrip('@').strip(), int(item.message_id))].published_at)
             card_gap = float(knobs.card_interval_seconds or 0.0)
             for idx, item in enumerate(digest.items):
                 if idx > 0 and card_gap > 0:
