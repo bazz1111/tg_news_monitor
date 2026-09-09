@@ -1,5 +1,17 @@
 """Core models and interfaces."""
 
-from tg_news_monitor.core.models import AlertPayload, NewsEvaluation, TelegramPost
+from tg_news_monitor.core.models import (
+    AlertPayload,
+    DigestBrief,
+    DigestItem,
+    NewsEvaluation,
+    TelegramPost,
+)
 
-__all__ = ["TelegramPost", "NewsEvaluation", "AlertPayload"]
+__all__ = [
+    "TelegramPost",
+    "NewsEvaluation",
+    "AlertPayload",
+    "DigestItem",
+    "DigestBrief",
+]

@@ -5,10 +5,12 @@ services:
       dockerfile: Dockerfile
     container_name: tg_news_monitor
     restart: unless-stopped
+    # Nested Docker custom bridge cannot reach t.me (TCP timeout);
+    # host net shares host egress. No host ports published by this app.
+    network_mode: host
     env_file:
       - .env
     volumes:
-      # Persistent volume mount for SQLite WAL database
       - ./data:/app/data
     logging:
       driver: "json-file"

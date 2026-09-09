@@ -10,7 +10,7 @@ from typing import Any, Callable, Dict, List, Optional, Union
 
 import httpx
 
-from tg_news_monitor.core.models import NewsEvaluation, TelegramPost
+from tg_news_monitor.core.models import DigestBrief, NewsEvaluation, TelegramPost
 from tg_news_monitor.evaluator.fallback import (
     MultiStageFallbackHandler,
     calculate_backoff_delay,
@@ -19,6 +19,8 @@ from tg_news_monitor.evaluator.fallback import (
     strip_markdown_code_fences,
 )
 from tg_news_monitor.evaluator.prompt import (
+    build_digest_system_prompt,
+    build_digest_user_prompt,
     build_system_prompt,
     build_user_prompt,
 )
@@ -134,6 +136,8 @@ class GrokClient:
             "model": self.model,
             "temperature": self.temperature,
             "response_format": {"type": "json_object"},
+            # DeepSeek non-thinking mode (ignored by providers that do not support it)
+            "thinking": {"type": "disabled"},
             "messages": [
                 {"role": "system", "content": build_system_prompt()},
                 {"role": "user", "content": build_user_prompt(post)},
@@ -332,6 +336,160 @@ class GrokClient:
         if last_error:
             raise last_error
         raise GrokError("Grok evaluation failed.")
+
+
+    def _build_digest_request_payload(self, posts: List[TelegramPost]) -> Dict[str, Any]:
+        """Constructs chat completion payload for batch digest evaluation."""
+        return {
+            "model": self.model,
+            "temperature": self.temperature,
+            "response_format": {"type": "json_object"},
+            # DeepSeek non-thinking mode (ignored by providers that do not support it)
+            "thinking": {"type": "disabled"},
+            "messages": [
+                {"role": "system", "content": build_digest_system_prompt()},
+                {"role": "user", "content": build_digest_user_prompt(posts)},
+            ],
+        }
+
+    def _parse_digest_response(self, raw_response: str) -> DigestBrief:
+        """Parse LLM JSON into DigestBrief with light fence stripping."""
+        cleaned = strip_markdown_code_fences(raw_response)
+        data = json.loads(cleaned)
+        if not isinstance(data, dict):
+            raise ValueError("Digest response is not a JSON object")
+        # Clamp items length defensively
+        items = data.get("items") or []
+        if isinstance(items, list) and len(items) > 5:
+            data["items"] = items[:5]
+        brief = DigestBrief.model_validate(data)
+        if not brief.items:
+            brief.has_material_news = False
+        return brief
+
+    def evaluate_digest(self, posts: List[TelegramPost]) -> DigestBrief:
+        """Evaluate a batch of posts into one DigestBrief (single LLM call).
+
+        Uses the same retry/backoff pattern as evaluate_post. On parse failure
+        returns an empty DigestBrief with has_material_news=False.
+        Timeout for this call is at least 60 seconds.
+        """
+        if not posts:
+            return DigestBrief(
+                headline="本轮快讯",
+                overview="本轮无新帖",
+                items=[],
+                has_material_news=False,
+                filtered_note="empty_batch",
+            )
+
+        payload = self._build_digest_request_payload(posts)
+        last_error: Optional[Exception] = None
+        digest_timeout = max(60.0, float(self.timeout or 30.0))
+
+        for attempt in range(self.max_retries):
+            try:
+                # Prefer a longer timeout for batch digests without permanently
+                # mutating shared external clients when possible.
+                url = f"{self.api_base}/chat/completions"
+                headers = self._get_headers()
+                if self._external_client is not None:
+                    response = self._external_client.post(
+                        url, headers=headers, json=payload, timeout=digest_timeout
+                    )
+                    # Reuse status handling from _execute_http_request path
+                    if response.status_code == 429:
+                        retry_after_str = response.headers.get("Retry-After")
+                        retry_after = (
+                            float(retry_after_str)
+                            if retry_after_str and retry_after_str.isdigit()
+                            else None
+                        )
+                        raise GrokRateLimitError(
+                            f"Grok API 429 Rate Limit: {response.text}",
+                            retry_after=retry_after,
+                        )
+                    if response.status_code >= 500:
+                        raise GrokServerError(response.status_code, response.text)
+                    if response.status_code != 200:
+                        raise GrokError(
+                            f"Grok API error HTTP {response.status_code}: {response.text}"
+                        )
+                    try:
+                        data = response.json()
+                        raw_response = self._extract_content_from_openai_payload(data)
+                    except Exception:
+                        raw_response = response.text
+                else:
+                    with httpx.Client(timeout=digest_timeout) as client:
+                        try:
+                            response = client.post(url, headers=headers, json=payload)
+                        except (httpx.TimeoutException, httpx.ConnectTimeout, httpx.ReadTimeout) as err:
+                            raise GrokNetworkError(
+                                f"Request timeout communicating with Grok API: {err}"
+                            ) from err
+                        except httpx.RequestError as err:
+                            raise GrokNetworkError(
+                                f"Network error communicating with Grok API: {err}"
+                            ) from err
+
+                        if response.status_code == 429:
+                            retry_after_str = response.headers.get("Retry-After")
+                            retry_after = (
+                                float(retry_after_str)
+                                if retry_after_str and retry_after_str.isdigit()
+                                else None
+                            )
+                            raise GrokRateLimitError(
+                                f"Grok API 429 Rate Limit: {response.text}",
+                                retry_after=retry_after,
+                            )
+                        if response.status_code >= 500:
+                            raise GrokServerError(response.status_code, response.text)
+                        if response.status_code != 200:
+                            raise GrokError(
+                                f"Grok API error HTTP {response.status_code}: {response.text}"
+                            )
+                        try:
+                            data = response.json()
+                            raw_response = self._extract_content_from_openai_payload(data)
+                        except Exception:
+                            raw_response = response.text
+
+                return self._parse_digest_response(raw_response)
+            except (GrokRateLimitError, GrokServerError, GrokNetworkError) as err:
+                last_error = err
+                logger.warning(
+                    "Digest API call attempt %d/%d failed: %s (posts=%d)",
+                    attempt + 1,
+                    self.max_retries,
+                    err,
+                    len(posts),
+                )
+                if attempt < self.max_retries - 1:
+                    if isinstance(err, GrokRateLimitError) and err.retry_after is not None:
+                        delay = err.retry_after
+                    else:
+                        delay = calculate_backoff_delay(attempt, base_delay=self.base_delay)
+                    time.sleep(delay)
+            except Exception as err:
+                last_error = err
+                logger.warning(
+                    "Digest parse/response error on attempt %d: %s",
+                    attempt + 1,
+                    err,
+                )
+                break
+
+        err_msg = str(last_error) if last_error else "unknown digest failure"
+        logger.error("Digest evaluation failed after retries: %s", err_msg)
+        return DigestBrief(
+            headline="本轮快讯",
+            overview="模型解析失败",
+            items=[],
+            has_material_news=False,
+            filtered_note=err_msg,
+        )
 
     def evaluate_text(
         self,

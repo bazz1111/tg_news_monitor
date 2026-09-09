@@ -47,3 +47,72 @@ class AlertPayload(BaseModel):
     post: TelegramPost = Field(..., description="Original Telegram post")
     evaluation: NewsEvaluation = Field(..., description="Grok evaluation result")
     card_json: Dict[str, Any] = Field(..., description="Feishu Interactive Card Schema 2.0 payload")
+
+
+class DigestItem(BaseModel):
+    """Single ranked item inside a batch digest brief."""
+
+    model_config = ConfigDict(extra="ignore", from_attributes=True)
+
+    rank: int = Field(..., ge=1, le=5, description="Rank position 1-5 (1 = most important)")
+    channel: str = Field(..., description="Source channel username without @")
+    message_id: int = Field(..., description="Telegram message ID of the source post")
+    title: str = Field(..., description="Concise Chinese headline")
+    summary: str = Field(default="", description="One-paragraph Chinese summary of the item (compat)")
+    category: str = Field(default="行业快讯", description="News category")
+    score: Optional[int] = Field(
+        default=None,
+        ge=1,
+        le=10,
+        description="Urgency score 1-10; if missing, card falls back to 11-rank",
+    )
+    summary_bullets: List[str] = Field(
+        default_factory=list,
+        description="3-4 concise factual bullets for the single-card body",
+    )
+    actionable_insight: Optional[str] = Field(
+        default=None,
+        description="1-2 sentence watch / action advice",
+    )
+    bias_overall: str = Field(
+        default="不确定",
+        description="Direction tag: 利多|利空|中性|不确定",
+    )
+    bias_us: str = Field(
+        default="不确定",
+        description="US equities direction tag: 利多|利空|中性|不确定",
+    )
+    bias_cn: str = Field(
+        default="不确定",
+        description="A-shares direction tag: 利多|利空|中性|不确定",
+    )
+    bias_commodities: str = Field(
+        default="不确定",
+        description="Commodities direction tag: 利多|利空|中性|不确定",
+    )
+    impact_overall: str = Field(..., description="Overall market / industry impact analysis")
+    impact_us: str = Field(..., description="Impact on US stocks")
+    impact_cn: str = Field(..., description="Impact on China equities (上证/中国市场)")
+    impact_commodities: str = Field(..., description="Impact on commodities (黄金/原油等)")
+    published_at: Optional[datetime] = Field(
+        default=None,
+        description="UTC publication time; prefer runner post.published_at when building card",
+    )
+
+
+class DigestBrief(BaseModel):
+    """Batch digest result: filtered ranking of material news for one polling pass."""
+
+    model_config = ConfigDict(extra="ignore", from_attributes=True)
+
+    headline: str = Field(..., description="Card headline summarizing this digest pass")
+    overview: str = Field(..., description="Short overview of the pass / market tone")
+    items: List[DigestItem] = Field(default_factory=list, description="0-5 ranked material items")
+    filtered_note: Optional[str] = Field(
+        default=None,
+        description="Optional note about filtered duplicate/noise posts",
+    )
+    has_material_news: bool = Field(
+        default=True,
+        description="False when no material items remain after filtering",
+    )
