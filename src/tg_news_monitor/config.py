@@ -130,7 +130,10 @@ class CardProfile(BaseModel):
     subtitle: str = Field(default="投资情报快报", description="Card header subtitle")
     include_investment_impact: bool = Field(
         default=True,
-        description="Whether to render the four-dimension investment-impact block",
+        description=(
+            "Group-level switch for the investment-impact block; "
+            "card still requires score>=9 and category in {军事, 地缘政治, 宏观财经}"
+        ),
     )
     prompt_overlay: Optional[str] = Field(
         default=None,
