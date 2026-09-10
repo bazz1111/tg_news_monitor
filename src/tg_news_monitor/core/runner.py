@@ -414,6 +414,14 @@ class NewsMonitorRunner:
                     group_id=self._group_id,
                 )
             else:
+                existing = None
+                if hasattr(self.storage, "get_post"):
+                    try:
+                        existing = self.storage.get_post(ch, post.message_id, group_id=self._group_id)
+                    except TypeError:
+                        existing = self.storage.get_post(ch, post.message_id)
+                if existing and existing.get("is_filtered"):
+                    continue
                 note = digest.filtered_note or "filtered"
                 self.storage.update_evaluation(
                     channel=ch,
@@ -456,15 +464,13 @@ class NewsMonitorRunner:
         self,
         item: DigestItem,
         published_at: Optional[datetime] = None,
-        post: Optional[TelegramPost] = None,
     ) -> bool:
         """Send one Feishu card for a single DigestItem."""
         profile = self._card_profile
         if self._is_wechat_photo():
-            urls = list((post.media_urls if post is not None else None) or getattr(item, "media_urls", None) or [])
             payload = FeishuCardBuilder.build_wechat_photo_card(
                 item,
-                media_urls=urls,
+                media_urls=list(getattr(item, "media_urls", None) or []),
                 subtitle=profile.subtitle or "公众号图片素材",
             )
         else:
@@ -1035,10 +1041,10 @@ class NewsMonitorRunner:
                 delivery_text = self._delivery_text(matched_post)
                 if not self.policy.claim(delivery_text, item.title + ": " + item.summary):
                     continue
+                if self._is_wechat_photo() and matched_post is not None and not getattr(item, "media_urls", None):
+                    item.media_urls = photo_link_urls(matched_post.media_urls)
                 try:
-                    send_ok = self._send_digest_item_card(
-                        item, published_at=published_at, post=matched_post
-                    )
+                    send_ok = self._send_digest_item_card(item, published_at=published_at)
                 except Exception as exc:
                     logger.error(f"Delivery uncertain, do not automatically resend: {exc}")
                     send_ok = False
@@ -1085,7 +1091,22 @@ class NewsMonitorRunner:
                 "Batch digest mode: no material news (empty list / has_material_news=false); "
                 "skipping Feishu cards."
             )
-            self._mark_all_filtered(candidates, "digest_empty")
+            unset = []
+            for post in candidates:
+                existing = None
+                if hasattr(self.storage, "get_post"):
+                    try:
+                        existing = self.storage.get_post(
+                            post.channel.lower().lstrip("@").strip(),
+                            post.message_id,
+                            group_id=self._group_id,
+                        )
+                    except TypeError:
+                        existing = None
+                if existing and existing.get("is_filtered"):
+                    continue
+                unset.append(post)
+            self._mark_all_filtered(unset, "digest_empty")
             for detail in pass_summary["details"]:
                 if detail.get("posts_discovered", 0) > 0:
                     detail["posts_evaluated"] = detail.get("posts_discovered", 0)
