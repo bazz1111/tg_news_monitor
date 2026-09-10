@@ -110,12 +110,18 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.init_db:
         logger.info(f"Initializing SQLite database schema at: {config.db_path}")
         try:
-            init_db(config.db_path)
+            init_db(config.db_path, default_group_id=config.legacy_group_id)
             logger.info("Database schema initialized successfully.")
             return 0
         except Exception as exc:
             logger.error(f"Database initialization failed: {exc}")
             return 1
+
+    runtime_errors = config.runtime_validation_errors(require_webhook=True)
+    if runtime_errors:
+        for err in runtime_errors:
+            logger.error(f"Configuration Error: {err}")
+        return 1
 
     # Create and configure runner
     try:

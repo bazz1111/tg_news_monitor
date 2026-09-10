@@ -2,21 +2,25 @@
 from datetime import datetime, timedelta, timezone
 import re
 
+from tg_news_monitor.config import DEFAULT_LEGACY_GROUP_ID
 from tg_news_monitor.core.models import TelegramPost, DigestItem
 from tg_news_monitor.core.policy import urgent
 from tg_news_monitor.core import schedule
-from tg_news_monitor.storage.database import db_session
+from tg_news_monitor.storage.database import db_session, ensure_runtime_tables, get_connection, safe_group_id
 
 BEIJING = timezone(timedelta(hours=8))
 
 
 class QuietHours:
-    def __init__(self, db_path, config):
+    def __init__(self, db_path, config, group_id=DEFAULT_LEGACY_GROUP_ID):
         self.db_path, self.config = db_path, config
-        with db_session(db_path) as conn:
-            conn.execute('CREATE TABLE IF NOT EXISTS night_candidates (day TEXT, channel TEXT, message_id INTEGER, post TEXT NOT NULL, item TEXT NOT NULL, PRIMARY KEY(day, channel, message_id))')
-            conn.execute('CREATE TABLE IF NOT EXISTS morning_reports (day TEXT PRIMARY KEY, status TEXT NOT NULL)')
-            conn.execute('CREATE TABLE IF NOT EXISTS night_alerts (claimed REAL NOT NULL)')
+        self.group_id = safe_group_id(group_id)
+        conn = get_connection(db_path)
+        try:
+            ensure_runtime_tables(conn, self.group_id)
+            conn.commit()
+        finally:
+            conn.close()
 
     def is_quiet(self, now):
         local = schedule.local_now(now, self.config.timezone)
@@ -49,25 +53,49 @@ class QuietHours:
         if not end <= now < end + timedelta(hours=1):
             return False
         with db_session(self.db_path) as conn:
-            return conn.execute('SELECT 1 FROM morning_reports WHERE day=?', (self.day(now),)).fetchone() is None
+            return conn.execute(
+                'SELECT 1 FROM morning_reports WHERE group_id=? AND day=?',
+                (self.group_id, self.day(now)),
+            ).fetchone() is None
 
     def claim_morning(self, now):
         with db_session(self.db_path) as conn:
-            return conn.execute('INSERT OR IGNORE INTO morning_reports VALUES (?, ?)', (self.day(now), 'unknown')).rowcount == 1
+            return conn.execute(
+                'INSERT OR IGNORE INTO morning_reports VALUES (?, ?, ?)',
+                (self.group_id, self.day(now), 'unknown'),
+            ).rowcount == 1
 
     def complete_morning(self, now, status):
         with db_session(self.db_path) as conn:
-            conn.execute('UPDATE morning_reports SET status=? WHERE day=?', (status, self.day(now)))
+            conn.execute(
+                'UPDATE morning_reports SET status=? WHERE group_id=? AND day=?',
+                (status, self.group_id, self.day(now)),
+            )
 
     def archive(self, post, item, now):
         with db_session(self.db_path) as conn:
-            conn.execute('DELETE FROM night_candidates WHERE day < ?', ((now.astimezone(BEIJING).date() - timedelta(days=3)).isoformat(),))
-            conn.execute('INSERT OR REPLACE INTO night_candidates VALUES (?, ?, ?, ?, ?)',
-                         (self.day(now), post.channel.lower(), post.message_id, post.model_dump_json(), item.model_dump_json()))
+            conn.execute(
+                'DELETE FROM night_candidates WHERE group_id=? AND day < ?',
+                (self.group_id, (now.astimezone(BEIJING).date() - timedelta(days=3)).isoformat()),
+            )
+            conn.execute(
+                'INSERT OR REPLACE INTO night_candidates VALUES (?, ?, ?, ?, ?, ?)',
+                (
+                    self.group_id,
+                    self.day(now),
+                    post.channel.lower(),
+                    post.message_id,
+                    post.model_dump_json(),
+                    item.model_dump_json(),
+                ),
+            )
 
     def archived(self, now):
         with db_session(self.db_path) as conn:
-            rows = conn.execute('SELECT post, item FROM night_candidates WHERE day=? ORDER BY rowid', (self.day(now),)).fetchall()
+            rows = conn.execute(
+                'SELECT post, item FROM night_candidates WHERE group_id=? AND day=? ORDER BY rowid',
+                (self.group_id, self.day(now)),
+            ).fetchall()
         return [(TelegramPost.model_validate_json(r[0]), DigestItem.model_validate_json(r[1])) for r in rows]
 
     def claim_alert(self, item, post, now):
@@ -79,9 +107,12 @@ class QuietHours:
             return False
         with db_session(self.db_path) as conn:
             conn.execute('BEGIN IMMEDIATE')
-            last = conn.execute('SELECT MAX(claimed) FROM night_alerts').fetchone()[0]
+            last = conn.execute(
+                'SELECT MAX(claimed) FROM night_alerts WHERE group_id=?',
+                (self.group_id,),
+            ).fetchone()[0]
             escalation = item.is_update and bool(item.update_reason.strip())
             if last is not None and now.timestamp() - last < self.config.quiet_alert_interval_seconds and not escalation:
                 return False
-            conn.execute('INSERT INTO night_alerts VALUES (?)', (now.timestamp(),))
+            conn.execute('INSERT INTO night_alerts VALUES (?, ?)', (self.group_id, now.timestamp()))
         return True

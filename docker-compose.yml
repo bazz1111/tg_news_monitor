@@ -12,6 +12,7 @@ services:
       - .env
     volumes:
       - ./data:/app/data
+      # Optional: - ./config.yaml:/app/config.yaml:ro
     logging:
       driver: "json-file"
       options:
@@ -20,3 +21,4 @@ services:
     environment:
       - PYTHONUNBUFFERED=1
       - DB_PATH=/app/data/tg_news.db
+      # - CONFIG_PATH=/app/config.yaml

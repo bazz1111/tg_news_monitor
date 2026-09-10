@@ -21,6 +21,10 @@ class TelegramPost(BaseModel):
     media_urls: List[str] = Field(default_factory=list, description="List of extracted media URLs or background image links")
     views: Optional[str] = Field(default=None, description="View count badge string, e.g. 15.2K")
     raw_html: Optional[str] = Field(default=None, description="Raw HTML fragment for forensic or debugging use")
+    group_id: Optional[str] = Field(
+        default=None,
+        description="Peer group id that ingested this post; storage defaults to legacy when unset",
+    )
 
 
 class NewsEvaluation(BaseModel):

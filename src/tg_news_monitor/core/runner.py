@@ -24,7 +24,13 @@ try:
 except ImportError:
     logger = logging.getLogger(__name__)  # type: ignore
 
-from tg_news_monitor.config import Settings, get_config
+from tg_news_monitor.config import (
+    CardProfile,
+    DEFAULT_LEGACY_GROUP_ID,
+    Group,
+    Settings,
+    get_config,
+)
 from tg_news_monitor.core.policy import DeliveryPolicy, fingerprint, is_fresh, urgent
 from tg_news_monitor.core import schedule as alert_schedule
 from tg_news_monitor.core.quiet_hours import QuietHours, BEIJING
@@ -72,10 +78,18 @@ class NewsMonitorRunner:
     ) -> None:
         """Initializes runner with configuration and injectable dependencies."""
         self.config = config or get_config()
-        self.storage = storage or PostRepository(db_path=self.config.db_path)
+        self.storage = storage or PostRepository(
+            db_path=self.config.db_path,
+            default_group_id=getattr(self.config, "legacy_group_id", DEFAULT_LEGACY_GROUP_ID),
+        )
 
-        self.policy = DeliveryPolicy(self.storage.db_path)
-        self.quiet = QuietHours(self.storage.db_path, self.config)
+        self._policies: Dict[str, DeliveryPolicy] = {}
+        self._quiets: Dict[str, QuietHours] = {}
+        self._senders: Dict[str, Any] = {}
+        self._group_id = getattr(self.config, "legacy_group_id", DEFAULT_LEGACY_GROUP_ID)
+        self._group_config: Any = self.config
+        self._card_profile = CardProfile()
+        self._active_group: Optional[Group] = None
 
         # Scraper client
         if scraper_client is not None:
@@ -108,16 +122,7 @@ class NewsMonitorRunner:
                 f"api_base={self.config.deepseek_api_base}"
             )
 
-        # Feishu webhook sender
-        if webhook_sender is not None:
-            self.webhook_sender = webhook_sender
-        else:
-            secret = self.config.feishu_webhook_secret or self.config.feishu_secret
-            self.webhook_sender = FeishuWebhookSender(
-                webhook_url=self.config.feishu_webhook_url,
-                secret=secret,
-                max_retries=1,
-            )
+        self._init_group_runtimes(webhook_sender)
 
         self._stop_requested = False
         self.stats: Dict[str, Any] = {
@@ -128,6 +133,77 @@ class NewsMonitorRunner:
             "errors": [],
         }
 
+    def _init_group_runtimes(self, webhook_sender: Optional[FeishuWebhookSender]) -> None:
+        """Build per-group policy / quiet / webhook objects. Injected sender is shared (tests)."""
+        legacy = getattr(self.config, "legacy_group_id", DEFAULT_LEGACY_GROUP_ID)
+        enabled = list(self.config.enabled_groups()) if hasattr(self.config, "enabled_groups") else []
+        if webhook_sender is not None:
+            default_sender = webhook_sender
+        else:
+            secret = self.config.feishu_webhook_secret or self.config.feishu_secret
+            default_sender = FeishuWebhookSender(
+                webhook_url=self.config.feishu_webhook_url,
+                secret=secret,
+                max_retries=1,
+            )
+
+        if not enabled:
+            self.policy = DeliveryPolicy(self.storage.db_path, group_id=legacy)
+            self.quiet = QuietHours(self.storage.db_path, self.config, group_id=legacy)
+            self.webhook_sender = default_sender
+            self._policies[legacy] = self.policy
+            self._quiets[legacy] = self.quiet
+            self._senders[legacy] = default_sender
+            self._activate_group(None)
+            return
+
+        env_lookup = getattr(self.config, "env_lookup", None)
+        for group in enabled:
+            view = self.config.group_settings(group)
+            self._policies[group.id] = DeliveryPolicy(self.storage.db_path, group_id=group.id)
+            self._quiets[group.id] = QuietHours(self.storage.db_path, view, group_id=group.id)
+            if webhook_sender is not None:
+                self._senders[group.id] = webhook_sender
+            else:
+                self._senders[group.id] = FeishuWebhookSender(
+                    webhook_url=group.resolve_webhook_url(env_lookup),
+                    secret=group.resolve_webhook_secret(env_lookup),
+                    max_retries=1,
+                )
+        self._activate_group(enabled[0])
+
+    def _activate_group(self, group: Optional[Group]) -> None:
+        if group is None:
+            self._active_group = None
+            self._group_id = getattr(self.config, "legacy_group_id", DEFAULT_LEGACY_GROUP_ID)
+            self._group_config = self.config
+            self._card_profile = CardProfile()
+        else:
+            self._active_group = group
+            self._group_id = group.id
+            self._group_config = self.config.group_settings(group)
+            self._card_profile = group.resolved_card_profile()
+        if self._group_id in self._policies:
+            self.policy = self._policies[self._group_id]
+        if self._group_id in self._quiets:
+            self.quiet = self._quiets[self._group_id]
+        if self._group_id in self._senders:
+            self.webhook_sender = self._senders[self._group_id]
+
+    def _process_targets(self) -> List[Optional[Group]]:
+        groups = list(self.config.enabled_groups()) if hasattr(self.config, "enabled_groups") else []
+        if groups:
+            return groups
+        # groups configured but all disabled/empty: do not fall back to TELEGRAM_CHANNELS
+        if getattr(self.config, "groups", None):
+            return []
+        return [None]
+
+    def _glog(self, message: str, level: str = "info") -> None:
+        prefixed = f"group={self._group_id} {message}"
+        log_fn = getattr(logger, level, logger.info)
+        log_fn(prefixed)
+
     def _now(self):
         return datetime.now(timezone.utc)
 
@@ -136,14 +212,19 @@ class NewsMonitorRunner:
         self._stop_requested = True
         logger.info("Graceful stop requested for NewsMonitorRunner.")
 
-    def _ingest_channel(self, channel: str) -> Tuple[List[TelegramPost], Dict[str, Any]]:
+    def _ingest_channel(
+        self,
+        channel: str,
+        group_id: Optional[str] = None,
+    ) -> Tuple[List[TelegramPost], Dict[str, Any]]:
         """Scrape + dedupe + save for one channel. Does NOT evaluate or alert.
 
         Returns:
             (discovered_posts, channel_stats)
         """
+        gid = group_id or self._group_id
         clean_channel = channel.lower().lstrip("@").strip()
-        logger.info(f"Checking Telegram channel: @{clean_channel}")
+        logger.info(f"group={gid} Checking Telegram channel: @{clean_channel}")
 
         result: Dict[str, Any] = {
             "channel": clean_channel,
@@ -163,6 +244,7 @@ class NewsMonitorRunner:
                 channel=clean_channel,
                 success=False,
                 error=str(exc),
+                group_id=gid,
             )
             result["success"] = False
             result["error"] = str(exc)
@@ -178,6 +260,7 @@ class NewsMonitorRunner:
                 channel=clean_channel,
                 success=False,
                 error=err_msg,
+                group_id=gid,
             )
             result["success"] = False
             result["error"] = err_msg
@@ -193,6 +276,7 @@ class NewsMonitorRunner:
                 channel=clean_channel,
                 success=False,
                 error=f"Parsing error: {exc}",
+                group_id=gid,
             )
             result["success"] = False
             result["error"] = f"Parsing error: {exc}"
@@ -205,13 +289,19 @@ class NewsMonitorRunner:
                 channel=clean_channel,
                 success=True,
                 messages_seen=0,
+                group_id=gid,
             )
             return [], result
 
         try:
-            unprocessed_posts = self.storage.filter_unprocessed(clean_channel, posts)
+            unprocessed_posts = self.storage.filter_unprocessed(
+                clean_channel, posts, group_id=gid
+            )
         except TypeError:
-            unprocessed_posts = self.storage.filter_unprocessed(posts)
+            try:
+                unprocessed_posts = self.storage.filter_unprocessed(posts, group_id=gid)
+            except TypeError:
+                unprocessed_posts = self.storage.filter_unprocessed(posts)
 
         result["posts_discovered"] = len(unprocessed_posts)
         self.stats["total_posts_discovered"] += len(unprocessed_posts)
@@ -222,35 +312,41 @@ class NewsMonitorRunner:
             last_message_id=max_message_id,
             success=True,
             messages_seen=len(posts),
+            group_id=gid,
         )
 
         if not unprocessed_posts:
             logger.debug(
-                f"@{clean_channel}: All {len(posts)} messages already processed. Nothing new."
+                f"group={gid} @{clean_channel}: All {len(posts)} messages already processed. Nothing new."
             )
             return [], result
 
         logger.info(
-            f"@{clean_channel}: Discovered {len(unprocessed_posts)} new unprocessed posts."
+            f"group={gid} @{clean_channel}: Discovered {len(unprocessed_posts)} new unprocessed posts."
         )
 
         try:
+            self.storage.save_posts(unprocessed_posts, group_id=gid)
+        except TypeError:
             self.storage.save_posts(unprocessed_posts)
         except Exception as exc:
             logger.warning(
-                f"Batch save_posts encountered exception: {exc}. Falling back to individual saves."
+                f"group={gid} Batch save_posts encountered exception: {exc}. Falling back to individual saves."
             )
             for post in unprocessed_posts:
-                self.storage.save_post(post)
+                try:
+                    self.storage.save_post(post, group_id=gid)
+                except TypeError:
+                    self.storage.save_post(post)
 
         return list(unprocessed_posts), result
 
-    def poll_channel(self, channel: str) -> Dict[str, Any]:
+    def poll_channel(self, channel: str, group_id: Optional[str] = None) -> Dict[str, Any]:
         """Ingest-only channel pass (scrape+dedupe+save). No per-post evaluate/alert.
 
         Kept for backward-compatible call sites; returns ingest stats only.
         """
-        _posts, result = self._ingest_channel(channel)
+        _posts, result = self._ingest_channel(channel, group_id=group_id)
         return result
 
     def _selected_keys(self, digest: DigestBrief) -> set:
@@ -299,6 +395,7 @@ class NewsMonitorRunner:
                         item.impact_cn,
                         item.impact_commodities,
                     ],
+                    group_id=self._group_id,
                 )
             else:
                 note = digest.filtered_note or "filtered"
@@ -311,6 +408,7 @@ class NewsMonitorRunner:
                     is_filtered=True,
                     filter_reason="digest_filtered",
                     key_takeaways=[],
+                    group_id=self._group_id,
                 )
 
     def _mark_all_filtered(self, posts: List[TelegramPost], reason: str) -> None:
@@ -325,6 +423,7 @@ class NewsMonitorRunner:
                 is_filtered=True,
                 filter_reason=reason,
                 key_takeaways=[],
+                group_id=self._group_id,
             )
 
     def _send_digest_card(self, digest: DigestBrief) -> bool:
@@ -343,10 +442,12 @@ class NewsMonitorRunner:
         published_at: Optional[datetime] = None,
     ) -> bool:
         """Send one Feishu card for a single DigestItem."""
+        profile = self._card_profile
         payload = FeishuCardBuilder.build_digest_item_card(
             item,
             published_at=published_at,
-            subtitle="投资情报快报",
+            subtitle=profile.subtitle or "投资情报快报",
+            include_investment_impact=profile.include_investment_impact,
         )
         if hasattr(self.webhook_sender, "send"):
             return bool(self.webhook_sender.send(payload))
@@ -379,6 +480,7 @@ class NewsMonitorRunner:
             return max(1, min(10, 11 - int(item.rank)))
 
     def _morning_report(self, pending_pairs, summary, now, live_clock=True):
+        cfg = self._group_config
         overnight = [p for p, _ in pending_pairs if self.quiet.in_window(p.published_at, now)]
         ranked = {(p.channel.lower(), p.message_id): (p, i.score or 7) for p, i in self.quiet.archived(now)}
         for post in overnight:
@@ -388,15 +490,24 @@ class NewsMonitorRunner:
         unique = {}
         for post in posts:
             unique.setdefault(fingerprint(post.text), post)
-        candidates = list(unique.values())[:self.config.digest_max_batch_size]
+        candidates = list(unique.values())[:cfg.digest_max_batch_size]
         if not candidates:
             if self.quiet.claim_morning(now):
                 self.quiet.complete_morning(now, 'empty')
             return summary
-        if not self.policy.reserve_call(self.config.digest_min_interval_seconds, self.config.digest_max_calls_per_day, now):
+        group_limit = int(getattr(cfg, "digest_max_calls_per_day", self.config.digest_max_calls_per_day))
+        if not self.policy.reserve_call(
+            cfg.digest_min_interval_seconds,
+            group_limit,
+            now,
+            global_limit=self.config.digest_max_calls_per_day,
+        ):
             return summary
         start, end = self.quiet.window(now)
         self.evaluator.recent_history = ''
+        profile = self._card_profile
+        self.evaluator.prompt_overlay = profile.prompt_overlay or ""
+        self.evaluator.prompt_variant = profile.prompt_variant
         self.evaluator.digest_context = f"生成北京时间夜间摘要，范围 {start.isoformat()} 至 {end.isoformat()}，不是实时快讯。允许复盘已提醒的重大新闻。仅按输入判断最新进展，合并同事件；更正覆盖旧说法，剔除撤回信息，不得声称已核实输入以外的最新状态。精选最多5个事件，不凑数，保留event_at与来源ID。"
         try:
             digest = self.evaluator.evaluate_digest(candidates)
@@ -414,7 +525,7 @@ class NewsMonitorRunner:
             key = (item.channel.lower().lstrip('@'), item.message_id)
             if key not in allowed or key in keys or not self.quiet.in_window(item.event_at, now):
                 continue
-            if _text_looks_crypto(item.model_dump_json()) or (item.score or 11 - item.rank) < self.config.morning_flush_hotness_threshold:
+            if _text_looks_crypto(item.model_dump_json()) or (item.score or 11 - item.rank) < cfg.morning_flush_hotness_threshold:
                 continue
             keys.add(key)
             items.append(item)
@@ -437,7 +548,10 @@ class NewsMonitorRunner:
                 'tag': 'markdown',
                 'content': format_morning_item_md(index, item, event_time),
             })
-        payload = {'msg_type': 'interactive', 'card': {'schema': '2.0', 'header': {'title': {'tag': 'plain_text', 'content': f'{end:%m月%d日} 夜间摘要'}, 'template': 'blue'}, 'body': {'elements': elements}}}
+        label = ""
+        if self._active_group is not None:
+            label = f"{self._active_group.display_name()} · "
+        payload = {'msg_type': 'interactive', 'card': {'schema': '2.0', 'header': {'title': {'tag': 'plain_text', 'content': f'{label}{end:%m月%d日} 夜间摘要'}, 'template': 'blue'}, 'body': {'elements': elements}}}
         try:
             sender = getattr(self.webhook_sender, 'send', None) or self.webhook_sender.send_alert
             sent = bool(sender(payload))
@@ -454,11 +568,21 @@ class NewsMonitorRunner:
         return summary
 
     def run_once(self, ingest_only=False) -> Dict[str, Any]:
-        """Single pass: ingest all channels, pending+coarse filter, threshold gate, multi cards."""
-        channels = self.config.telegram_channels
-        if not channels:
+        """Single pass: ingest all groups' channels, then per-group pending+digest."""
+        targets = [g for g in self._process_targets() if g is None or (g.enabled and g.channels)]
+        channel_jobs: List[Tuple[Optional[Group], str]] = []
+        for group in targets:
+            if group is None:
+                for channel in self.config.telegram_channels:
+                    channel_jobs.append((None, channel))
+            else:
+                for channel in group.channels:
+                    channel_jobs.append((group, channel))
+
+        if not channel_jobs:
             logger.warning(
-                "No Telegram channels configured. Set TELEGRAM_CHANNELS in .env or config.yaml."
+                "No enabled groups with channels. Configure groups in config.yaml "
+                "or TELEGRAM_CHANNELS + FEISHU_WEBHOOK_URL for legacy synthesis."
             )
             return {
                 "channels_polled": 0,
@@ -470,23 +594,24 @@ class NewsMonitorRunner:
 
         self.stats["total_passes"] += 1
         pass_summary: Dict[str, Any] = {
-            "channels_polled": len(channels),
+            "channels_polled": len(channel_jobs),
             "posts_discovered": 0,
             "posts_evaluated": 0,
             "alerts_sent": 0,
             "details": [],
         }
 
-        # 1. Ingest all channels (scrape + dedupe + save)
-        for idx, channel in enumerate(channels):
+        for idx, (group, channel) in enumerate(channel_jobs):
             if self._stop_requested:
                 break
-
-            _posts, channel_stat = self._ingest_channel(channel)
+            self._activate_group(group)
+            gid = group.id if group is not None else self._group_id
+            _posts, channel_stat = self._ingest_channel(channel, group_id=gid)
+            channel_stat["group"] = gid
             pass_summary["details"].append(channel_stat)
             pass_summary["posts_discovered"] += channel_stat["posts_discovered"]
 
-            if idx < len(channels) - 1 and not self._stop_requested:
+            if idx < len(channel_jobs) - 1 and not self._stop_requested:
                 pause = self.config.inter_channel_delay_seconds
                 time.sleep(max(0.1, pause))
 
@@ -499,29 +624,51 @@ class NewsMonitorRunner:
         clock = now or self._now()
         if clock.tzinfo is None:
             clock = clock.replace(tzinfo=timezone.utc)
-        tz_name = getattr(self.config, "timezone", "Asia/Shanghai") or "Asia/Shanghai"
-        local = alert_schedule.local_now(clock, tz_name)
-        quiet_hours = getattr(self.config, "quiet_hours", "") or ""
-        shoulder_hours = getattr(self.config, "shoulder_hours", "") or ""
-        mode = alert_schedule.classify_alert_mode(local, quiet_hours, shoulder_hours)
-        knobs = alert_schedule.knobs_for(self.config, mode, now_local=local)
-        self.policy.sync_quiet_window(mode, knobs.quiet_window_id)
-        logger.info(
-            f"Alert window: mode={knobs.mode} tz={tz_name} local={local.isoformat()} "
-            f"flush={knobs.is_morning_flush} hotness>={knobs.hotness_threshold} "
-            f"min_interval={knobs.min_interval_seconds}s"
-        )
+        live_clock = now is None
+        totals_eval = 0
+        totals_alert = 0
+        details = pass_summary.get("details") or []
 
-        try:
-            return self._process_pending_with_knobs(pass_summary, clock, knobs, live_clock=now is None)
-        finally:
-            self.policy.note_mode(mode, clock)
+        for group in self._process_targets():
+            self._activate_group(group)
+            cfg = self._group_config
+            tz_name = getattr(cfg, "timezone", "Asia/Shanghai") or "Asia/Shanghai"
+            local = alert_schedule.local_now(clock, tz_name)
+            quiet_hours = getattr(cfg, "quiet_hours", "") or ""
+            shoulder_hours = getattr(cfg, "shoulder_hours", "") or ""
+            mode = alert_schedule.classify_alert_mode(local, quiet_hours, shoulder_hours)
+            knobs = alert_schedule.knobs_for(cfg, mode, now_local=local)
+            self.policy.sync_quiet_window(mode, knobs.quiet_window_id)
+            logger.info(
+                f"group={self._group_id} Alert window: mode={knobs.mode} tz={tz_name} "
+                f"local={local.isoformat()} flush={knobs.is_morning_flush} "
+                f"hotness>={knobs.hotness_threshold} min_interval={knobs.min_interval_seconds}s"
+            )
+            part = {
+                "posts_evaluated": 0,
+                "alerts_sent": 0,
+                "details": details,
+            }
+            try:
+                part = self._process_pending_with_knobs(part, clock, knobs, live_clock=live_clock)
+            finally:
+                self.policy.note_mode(mode, clock)
+            totals_eval += int(part.get("posts_evaluated") or 0)
+            totals_alert += int(part.get("alerts_sent") or 0)
+
+        pass_summary["posts_evaluated"] = totals_eval
+        pass_summary["alerts_sent"] = totals_alert
+        return pass_summary
 
     def _process_pending_with_knobs(self, pass_summary, clock, knobs, live_clock=True):
         quiet = knobs.mode == "quiet"
-        # 2. Load ALL pending posts (this pass new + previously buffered)
+        cfg = self._group_config
+        # 2. Load this group's pending posts (never mix groups in one LLM call)
         if hasattr(self.storage, "list_pending_with_scraped_at"):
-            pending_pairs = self.storage.list_pending_with_scraped_at()
+            try:
+                pending_pairs = self.storage.list_pending_with_scraped_at(group_id=self._group_id)
+            except TypeError:
+                pending_pairs = self.storage.list_pending_with_scraped_at()
         else:
             pending_posts = (
                 self.storage.list_pending_posts()
@@ -535,8 +682,8 @@ class NewsMonitorRunner:
 
         if not pending_pairs:
             logger.info(
-                "Batch digest mode: no pending posts (evaluated_at IS NULL); "
-                "skipping LLM and Feishu cards."
+                f"group={self._group_id} Batch digest mode: no pending posts "
+                "(evaluated_at IS NULL); skipping LLM and Feishu cards."
             )
             return pass_summary
 
@@ -557,7 +704,7 @@ class NewsMonitorRunner:
         self._mark_all_filtered(duplicates, "duplicate_content")
         pending_posts = unique
         logger.info(
-            f"Pending buffer: {len(pending_posts)} unevaluated post(s) after ingest."
+            f"group={self._group_id} Pending buffer: {len(pending_posts)} unevaluated post(s) after ingest."
         )
 
         # 3. Cheap local coarse filter (zero LLM): spam + crypto ban
@@ -597,25 +744,37 @@ class NewsMonitorRunner:
 
         min_candidates, max_wait = knobs.min_candidates, knobs.max_wait_seconds
         oldest_age = self._oldest_age_seconds(candidate_pairs, now=clock)
-        has_urgent = any(urgent(p.text) and is_fresh(p.published_at, self.config.news_max_age_seconds, clock) for p in candidates)
+        has_urgent = any(urgent(p.text) and is_fresh(p.published_at, cfg.news_max_age_seconds, clock) for p in candidates)
         if quiet:
-            if not has_urgent and oldest_age < self.config.quiet_digest_min_interval_seconds:
+            if not has_urgent and oldest_age < cfg.quiet_digest_min_interval_seconds:
                 return pass_summary
         elif len(candidates) < min_candidates and oldest_age < max_wait and not has_urgent:
             return pass_summary
 
         logger.info(
-            f"Digest gate open: candidates={len(candidates)} "
+            f"group={self._group_id} Digest gate open: candidates={len(candidates)} "
             f"(min={min_candidates}), oldest_age={oldest_age:.0f}s "
             f"(max_wait={max_wait}s, flush={knobs.is_morning_flush}); calling evaluate_digest."
         )
 
-        interval = self.config.digest_min_interval_seconds if quiet and has_urgent else knobs.min_interval_seconds
-        if not self.policy.reserve_call(interval, self.config.digest_max_calls_per_day, clock):
-            logger.info("LLM cooldown/daily call budget: pending messages retained until expiry")
+        interval = cfg.digest_min_interval_seconds if quiet and has_urgent else knobs.min_interval_seconds
+        group_limit = int(getattr(cfg, "digest_max_calls_per_day", self.config.digest_max_calls_per_day))
+        if not self.policy.reserve_call(
+            interval,
+            group_limit,
+            clock,
+            global_limit=self.config.digest_max_calls_per_day,
+        ):
+            logger.info(
+                f"group={self._group_id} LLM cooldown/daily call budget: "
+                "pending messages retained until expiry"
+            )
             return pass_summary
-        candidates = sorted(candidates, key=lambda p: (urgent(p.text), p.published_at), reverse=True)[:self.config.digest_max_batch_size]
+        candidates = sorted(candidates, key=lambda p: (urgent(p.text), p.published_at), reverse=True)[:cfg.digest_max_batch_size]
         self.evaluator.recent_history = self.policy.history()
+        profile = self._card_profile
+        self.evaluator.prompt_overlay = profile.prompt_overlay or ""
+        self.evaluator.prompt_variant = profile.prompt_variant
         self.evaluator.digest_context = ""
         if quiet:
             start, end = self.quiet.window(clock)
@@ -626,10 +785,12 @@ class NewsMonitorRunner:
             try:
                 digest = self.evaluator.evaluate_digest(candidates)
             except Exception as exc:
-                logger.error(f"Digest failed; pending retained: {exc}")
+                logger.error(f"group={self._group_id} Digest failed; pending retained: {exc}")
                 return pass_summary
             finally:
                 self.policy.record_usage(getattr(self.evaluator, "last_usage", None))
+                self.evaluator.prompt_overlay = ""
+                self.evaluator.prompt_variant = None
         else:
             digest = DigestBrief(
                 headline="本轮快讯",
@@ -690,6 +851,7 @@ class NewsMonitorRunner:
                         is_filtered=True,
                         filter_reason="crypto_filter",
                         key_takeaways=[],
+                        group_id=self._group_id,
                     )
                 digest.items = kept_items
                 if not kept_items:
@@ -703,7 +865,7 @@ class NewsMonitorRunner:
         by_key = {(p.channel.lower().lstrip('@'), p.message_id): p for p in candidates}
         for item in digest.items:
             post = by_key[(item.channel.lower().lstrip('@'), item.message_id)]
-            if quiet and (item.score or 11 - item.rank) >= self.config.hotness_threshold and self.quiet.in_window(post.published_at, clock) and self.quiet.in_window(item.event_at, clock):
+            if quiet and (item.score or 11 - item.rank) >= cfg.hotness_threshold and self.quiet.in_window(post.published_at, clock) and self.quiet.in_window(item.event_at, clock):
                 self.quiet.archive(post, item, clock)
         self._apply_digest_evaluations(candidates, digest)
 
@@ -733,14 +895,14 @@ class NewsMonitorRunner:
                     else getattr(item, "published_at", None)
                 )
                 send_time = self._now() if live_clock else clock
-                send_local = alert_schedule.local_now(send_time, self.config.timezone)
-                send_mode = alert_schedule.classify_alert_mode(send_local, self.config.quiet_hours, self.config.shoulder_hours)
-                send_knobs = alert_schedule.knobs_for(self.config, send_mode, now_local=send_local)
+                send_local = alert_schedule.local_now(send_time, cfg.timezone)
+                send_mode = alert_schedule.classify_alert_mode(send_local, cfg.quiet_hours, cfg.shoulder_hours)
+                send_knobs = alert_schedule.knobs_for(cfg, send_mode, now_local=send_local)
                 if quiet and send_mode != 'quiet':
                     continue
-                if not is_fresh(published_at, self.config.news_max_age_seconds, send_time):
+                if not is_fresh(published_at, cfg.news_max_age_seconds, send_time):
                     continue
-                if not is_fresh(item.event_at, self.config.news_max_age_seconds, send_time):
+                if not is_fresh(item.event_at, cfg.news_max_age_seconds, send_time):
                     self._mark_all_filtered([matched_post], 'event_time_unknown_or_expired')
                     continue
                 score = self._digest_item_score(item)
@@ -775,19 +937,22 @@ class NewsMonitorRunner:
                         message_id=mid,
                         score=score,
                         summary=summary,
+                        group_id=self._group_id,
                     )
                     logger.info(
-                        f"✅ Digest item card sent: #{item.rank} [{item.category}] {item.title!r}"
+                        f"group={self._group_id} ✅ Digest item card sent: "
+                        f"#{item.rank} [{item.category}] {item.title!r}"
                     )
                 else:
                     logger.error(
-                        f"❌ Failed to dispatch digest item card: "
+                        f"group={self._group_id} ❌ Failed to dispatch digest item card: "
                         f"#{item.rank} {item.title!r}"
                     )
                     self.storage.mark_alert_failed(
                         channel=ch,
                         message_id=mid,
                         error_msg="Feishu item card webhook delivery failed after retries",
+                        group_id=self._group_id,
                     )
 
             pass_summary["alerts_sent"] = alerts_ok
@@ -796,8 +961,8 @@ class NewsMonitorRunner:
                 if detail.get("posts_discovered", 0) > 0:
                     detail["posts_evaluated"] = detail.get("posts_discovered", 0)
             logger.info(
-                f"Multi single-card dispatch done: sent={alerts_ok}/{len(digest.items)} "
-                f"(headline={digest.headline!r})"
+                f"group={self._group_id} Multi single-card dispatch done: "
+                f"sent={alerts_ok}/{len(digest.items)} (headline={digest.headline!r})"
             )
         else:
             logger.info(
@@ -819,9 +984,17 @@ class NewsMonitorRunner:
         min_c = int(getattr(self.config, "digest_min_candidates", 3) or 3)
         max_w = int(self.config.digest_max_wait_seconds)
         card_gap = float(getattr(self.config, "digest_card_interval_seconds", 10.0) or 0.0)
+        enabled = list(self.config.enabled_groups()) if hasattr(self.config, "enabled_groups") else []
         logger.info("=" * 60)
         logger.info("Starting Telegram News Monitor 24/7 Daemon (batch digest mode)")
-        logger.info(f"Target Channels : {self.config.telegram_channels}")
+        if enabled:
+            for group in enabled:
+                logger.info(
+                    f"Peer group       : id={group.id} name={group.display_name()!r} "
+                    f"channels={group.channels} enabled={group.enabled}"
+                )
+        else:
+            logger.info(f"Target Channels : {self.config.telegram_channels}")
         logger.info(
             f"Poll Interval   : {self.config.poll_interval_seconds}s "
             f"(max jitter: ±{self.config.max_jitter_seconds}s)"
