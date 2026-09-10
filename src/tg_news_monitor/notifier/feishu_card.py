@@ -17,6 +17,11 @@ from typing import Any, Dict, List, Optional, Union
 from datetime import timedelta
 
 from tg_news_monitor.core.models import DigestBrief, DigestItem, NewsEvaluation, TelegramPost
+from tg_news_monitor.core.wechat_photo import (
+    normalize_wechat_caption,
+    photo_link_urls,
+    strip_tg_traces,
+)
 from tg_news_monitor.notifier.card_format import (
     format_detail_lines,
     is_long_summary,
@@ -566,6 +571,46 @@ class FeishuCardBuilder:
                 "title": {"tag": "plain_text", "content": header_title},
                 "subtitle": {"tag": "plain_text", "content": subtitle or "投资情报快报"},
                 "template": color_template,
+            },
+            "body": {"elements": elements},
+        }
+        return {"msg_type": "interactive", "card": card_schema_2}
+
+    @classmethod
+    def build_wechat_photo_card(
+        cls,
+        item: DigestItem,
+        media_urls: Optional[List[str]] = None,
+        subtitle: str = "公众号图片素材",
+    ) -> Dict[str, Any]:
+        """Title + ≤100字说明 + clickable photo links. No TG traces, no investment block."""
+        title = strip_tg_traces((getattr(item, "title", None) or "").strip()) or "历史影像"
+        title = title[:50]
+        caption = normalize_wechat_caption(getattr(item, "summary", None) or "")
+        if not caption:
+            bullets = getattr(item, "summary_bullets", None) or []
+            first = bullets[0] if bullets else ""
+            caption = normalize_wechat_caption(str(first) or title)
+
+        urls = photo_link_urls(media_urls)
+        if not urls:
+            urls = photo_link_urls(getattr(item, "media_urls", None))
+
+        def _md_div(content: str) -> Dict[str, Any]:
+            return {"tag": "div", "text": {"tag": "lark_md", "content": content}}
+
+        elements: List[Dict[str, Any]] = [_md_div(caption or "（无说明）")]
+        if urls:
+            elements.append({"tag": "hr"})
+            link_lines = "\n".join(f"[{idx}]({url})" for idx, url in enumerate(urls, 1))
+            elements.append(_md_div(f"**图片**\n{link_lines}"))
+
+        card_schema_2 = {
+            "schema": "2.0",
+            "header": {
+                "title": {"tag": "plain_text", "content": title},
+                "subtitle": {"tag": "plain_text", "content": subtitle or "公众号图片素材"},
+                "template": "blue",
             },
             "body": {"elements": elements},
         }

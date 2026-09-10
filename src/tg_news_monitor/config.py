@@ -138,7 +138,7 @@ class CardProfile(BaseModel):
     )
     prompt_variant: Optional[str] = Field(
         default=None,
-        description="Digest system-prompt variant key: news | story",
+        description="Digest system-prompt variant key: news | story | wechat_photo",
     )
 
     @field_validator("prompt_variant", mode="before")
@@ -149,8 +149,8 @@ class CardProfile(BaseModel):
         text = str(value).strip().lower()
         if not text:
             return None
-        if text not in {"news", "story"}:
-            raise ValueError("card_profile.prompt_variant must be 'news' or 'story'")
+        if text not in {"news", "story", "wechat_photo"}:
+            raise ValueError("card_profile.prompt_variant must be 'news', 'story', or 'wechat_photo'")
         return text
 
 

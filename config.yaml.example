@@ -34,7 +34,33 @@ groups:
       prompt_variant: news
       # prompt_overlay: "额外评估约束（追加到 digest system prompt）"
 
-  # Example second pipeline — leave disabled/empty until channels exist.
+  # WeChat 公众号历史影像素材桌：TG 公开频道进料，飞书审稿，人工再发公众号。
+  # 低频：只在过本地安全阀 + 模型选中后推送。以下旋钮可按组改，稍后可再调。
+  - id: old_photos
+    name: 公众号历史图片素材
+    enabled: true
+    channels: []
+    webhook_url_env: FEISHU_WEBHOOK_OLD_PHOTOS
+    webhook_secret_env: FEISHU_WEBHOOK_SECRET_OLD_PHOTOS
+    # 关闭新闻静默/晨报；素材不是即时快讯
+    quiet_hours: ""
+    shoulder_hours: ""
+    morning_flush_enabled: false
+    # 频道帖可在池中等待评估（默认 30 分钟会在 1 小时冷却里过期）
+    news_max_age_seconds: 86400
+    hotness_threshold: 7
+    digest_min_candidates: 2
+    digest_max_wait_seconds: 7200          # 不足 2 条时最多等 2 小时再评估
+    digest_min_interval_seconds: 3600      # 模型最小间隔 1 小时
+    digest_max_calls_per_day: 8            # 本组每日软上限；全局 DIGEST_MAX_CALLS_PER_DAY 仍是硬顶
+    digest_max_batch_size: 8
+    digest_card_interval_seconds: 15
+    card_profile:
+      subtitle: 公众号图片素材
+      include_investment_impact: false
+      prompt_variant: wechat_photo
+
+  # Example extra pipeline — leave disabled/empty until channels exist.
   - id: xhs_hot
     name: 小红书热点（示例）
     enabled: false
