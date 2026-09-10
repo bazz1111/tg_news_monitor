@@ -7,7 +7,7 @@ Prefer dropping borderline copy over letting review-unsafe content through.
 from __future__ import annotations
 
 import re
-from typing import Iterable, List, Sequence, Tuple
+from typing import Any, Iterable, List, Optional, Sequence, Tuple
 
 from tg_news_monitor.core.filters import _COARSE_SPAM_RES, _text_looks_crypto
 from tg_news_monitor.core.models import TelegramPost
@@ -41,6 +41,27 @@ _POLITICAL_RES = [
     re.compile(r"(文化大革命|红卫兵|学习强国|入党宣誓)"),
     re.compile(r"(武统|台海开战|台海局势|武力统一)"),
     re.compile(r"(俄乌|乌克兰战争|哈马斯|加沙冲突|以色列空袭|北约东扩)"),
+]
+
+# Live news / markets / conflict — never send on the photo webhook even if
+# a digest item was built for the wrong group.
+_NEWS_LIKE_CATEGORIES = frozenset({
+    "能源",
+    "地缘政治",
+    "宏观财经",
+    "宏观监管",
+    "突发安全",
+    "突发快讯",
+    "全球新闻",
+    "宏观快讯",
+    "军事",
+    "财经",
+    "加密货币",
+})
+_NEWS_LIKE_RES = [
+    re.compile(
+        r"(原油|布伦特|美伊|油价|冲突|空袭|加息|降息|美联储|战争升级|导弹袭击|地缘政治)",
+    ),
 ]
 
 
@@ -83,11 +104,53 @@ def strip_tg_traces(text: str) -> str:
 
 
 def wechat_photo_unsafe(text: str) -> bool:
-    """True if local text looks vice-related or WeChat review-unsafe."""
+    """True if local text looks vice-related, political, or live-news."""
     t = (text or "").strip()
     if not t:
         return False
-    return any(rx.search(t) for rx in (*_VICE_RES, *_POLITICAL_RES))
+    return any(rx.search(t) for rx in (*_VICE_RES, *_POLITICAL_RES, *_NEWS_LIKE_RES))
+
+
+def wechat_looks_like_news(
+    item: Any = None,
+    *,
+    category: str = "",
+    text: str = "",
+) -> bool:
+    """True if a digest item / caption is live news, markets, or conflict."""
+    cat = str(category or getattr(item, "category", "") or "").strip()
+    if cat in _NEWS_LIKE_CATEGORIES:
+        return True
+    parts = [cat, text]
+    if item is not None:
+        parts.extend(
+            [
+                str(getattr(item, "title", "") or ""),
+                str(getattr(item, "summary", "") or ""),
+                " ".join(str(x) for x in (getattr(item, "summary_bullets", None) or [])),
+            ]
+        )
+    blob = " ".join(parts)
+    return any(rx.search(blob) for rx in _NEWS_LIKE_RES)
+
+
+def wechat_card_block_reason(item: Any) -> Optional[str]:
+    """Hard reject reason before a wechat_photo Feishu send, or None if allowed."""
+    blob = " ".join(
+        [
+            str(getattr(item, "category", "") or ""),
+            str(getattr(item, "title", "") or ""),
+            str(getattr(item, "summary", "") or ""),
+            " ".join(str(x) for x in (getattr(item, "summary_bullets", None) or [])),
+        ]
+    )
+    if wechat_photo_unsafe(blob):
+        return "wechat_unsafe"
+    if wechat_looks_like_news(item):
+        return "wechat_news_like"
+    if not photo_link_urls(getattr(item, "media_urls", None)):
+        return "no_photo_urls"
+    return None
 
 
 def photo_material_text(post: TelegramPost) -> str:
@@ -145,6 +208,9 @@ def wechat_photo_prefilter(
         if wechat_photo_unsafe(text):
             dropped.append((post, "wechat_unsafe"))
             continue
+        if wechat_looks_like_news(text=text):
+            dropped.append((post, "wechat_news_like"))
+            continue
         if any(rx.search(text) for rx in _COARSE_SPAM_RES):
             dropped.append((post, "coarse_filter"))
             continue
@@ -165,6 +231,8 @@ __all__ = [
     "photo_link_urls",
     "photo_material_text",
     "strip_tg_traces",
+    "wechat_card_block_reason",
+    "wechat_looks_like_news",
     "wechat_photo_prefilter",
     "wechat_photo_unsafe",
 ]

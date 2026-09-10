@@ -14,10 +14,13 @@ from __future__ import annotations
 
 import logging
 import signal
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 try:
     from loguru import logger
@@ -47,6 +50,8 @@ from tg_news_monitor.core.wechat_photo import (
     normalize_wechat_caption,
     photo_link_urls,
     photo_material_text,
+    wechat_card_block_reason,
+    wechat_looks_like_news,
     wechat_photo_prefilter,
     wechat_photo_unsafe,
 )
@@ -73,6 +78,19 @@ __all_filter_exports__ = (
 )
 
 
+@dataclass(frozen=True)
+class GroupRuntime:
+    """Immutable per-group send/eval context. Safe to hold across a digest pass."""
+
+    group_id: str
+    group: Optional[Group]
+    config: Any
+    card_profile: CardProfile
+    policy: Any
+    quiet: Any
+    webhook_sender: Any
+
+
 class NewsMonitorRunner:
     """Daemon runner coordinating ingestion, deduplication, batch digest, and alerts."""
 
@@ -94,10 +112,15 @@ class NewsMonitorRunner:
         self._policies: Dict[str, DeliveryPolicy] = {}
         self._quiets: Dict[str, QuietHours] = {}
         self._senders: Dict[str, Any] = {}
-        self._group_id = getattr(self.config, "legacy_group_id", DEFAULT_LEGACY_GROUP_ID)
-        self._group_config: Any = self.config
-        self._card_profile = CardProfile()
-        self._active_group: Optional[Group] = None
+        self._shared_group_id = getattr(self.config, "legacy_group_id", DEFAULT_LEGACY_GROUP_ID)
+        self._shared_group_config: Any = self.config
+        self._shared_card_profile = CardProfile()
+        self._shared_active_group: Optional[Group] = None
+        self._shared_policy: Any = None
+        self._shared_quiet: Any = None
+        self._shared_webhook_sender: Any = None
+        self._tls = threading.local()
+        self._eval_lock = threading.Lock()
 
         # Scraper client
         if scraper_client is not None:
@@ -180,23 +203,121 @@ class NewsMonitorRunner:
                 )
         self._activate_group(enabled[0])
 
-    def _activate_group(self, group: Optional[Group]) -> None:
+    def _legacy_gid(self) -> str:
+        return getattr(self.config, "legacy_group_id", DEFAULT_LEGACY_GROUP_ID)
+
+    def _runtime_for(self, group: Optional[Group]) -> GroupRuntime:
+        """Build a snapshot from per-group tables. Does not mutate runner state."""
         if group is None:
-            self._active_group = None
-            self._group_id = getattr(self.config, "legacy_group_id", DEFAULT_LEGACY_GROUP_ID)
-            self._group_config = self.config
-            self._card_profile = CardProfile()
+            gid = self._legacy_gid()
+            config = self.config
+            card = CardProfile()
+            active = None
         else:
-            self._active_group = group
-            self._group_id = group.id
-            self._group_config = self.config.group_settings(group)
-            self._card_profile = group.resolved_card_profile()
-        if self._group_id in self._policies:
-            self.policy = self._policies[self._group_id]
-        if self._group_id in self._quiets:
-            self.quiet = self._quiets[self._group_id]
-        if self._group_id in self._senders:
-            self.webhook_sender = self._senders[self._group_id]
+            gid = group.id
+            config = self.config.group_settings(group)
+            card = group.resolved_card_profile()
+            active = group
+        return GroupRuntime(
+            group_id=gid,
+            group=active,
+            config=config,
+            card_profile=card,
+            policy=self._policies.get(gid, self._shared_policy),
+            quiet=self._quiets.get(gid, self._shared_quiet),
+            webhook_sender=self._senders.get(gid, self._shared_webhook_sender),
+        )
+
+    def _bound_runtime(self) -> Optional[GroupRuntime]:
+        return getattr(self._tls, "runtime", None)
+
+    @contextmanager
+    def _bind_group(self, group: Optional[Group]) -> Iterator[GroupRuntime]:
+        """Pin this thread to a group snapshot for digest/evaluate/send."""
+        runtime = self._runtime_for(group)
+        prev = getattr(self._tls, "runtime", None)
+        self._tls.runtime = runtime
+        try:
+            yield runtime
+        finally:
+            self._tls.runtime = prev
+
+    def _activate_group(self, group: Optional[Group]) -> None:
+        """Update shared fallback only. A bound GroupRuntime on any thread is unchanged."""
+        runtime = self._runtime_for(group)
+        self._shared_active_group = runtime.group
+        self._shared_group_id = runtime.group_id
+        self._shared_group_config = runtime.config
+        self._shared_card_profile = runtime.card_profile
+        if runtime.policy is not None:
+            self._shared_policy = runtime.policy
+        if runtime.quiet is not None:
+            self._shared_quiet = runtime.quiet
+        if runtime.webhook_sender is not None:
+            self._shared_webhook_sender = runtime.webhook_sender
+
+    @property
+    def _group_id(self) -> str:
+        bound = self._bound_runtime()
+        return bound.group_id if bound is not None else self._shared_group_id
+
+    @_group_id.setter
+    def _group_id(self, value: str) -> None:
+        self._shared_group_id = value
+
+    @property
+    def _group_config(self) -> Any:
+        bound = self._bound_runtime()
+        return bound.config if bound is not None else self._shared_group_config
+
+    @_group_config.setter
+    def _group_config(self, value: Any) -> None:
+        self._shared_group_config = value
+
+    @property
+    def _card_profile(self) -> CardProfile:
+        bound = self._bound_runtime()
+        return bound.card_profile if bound is not None else self._shared_card_profile
+
+    @_card_profile.setter
+    def _card_profile(self, value: CardProfile) -> None:
+        self._shared_card_profile = value
+
+    @property
+    def _active_group(self) -> Optional[Group]:
+        bound = self._bound_runtime()
+        return bound.group if bound is not None else self._shared_active_group
+
+    @_active_group.setter
+    def _active_group(self, value: Optional[Group]) -> None:
+        self._shared_active_group = value
+
+    @property
+    def policy(self) -> Any:
+        bound = self._bound_runtime()
+        return bound.policy if bound is not None else self._shared_policy
+
+    @policy.setter
+    def policy(self, value: Any) -> None:
+        self._shared_policy = value
+
+    @property
+    def quiet(self) -> Any:
+        bound = self._bound_runtime()
+        return bound.quiet if bound is not None else self._shared_quiet
+
+    @quiet.setter
+    def quiet(self, value: Any) -> None:
+        self._shared_quiet = value
+
+    @property
+    def webhook_sender(self) -> Any:
+        bound = self._bound_runtime()
+        return bound.webhook_sender if bound is not None else self._shared_webhook_sender
+
+    @webhook_sender.setter
+    def webhook_sender(self, value: Any) -> None:
+        self._shared_webhook_sender = value
 
     def _is_wechat_photo(self) -> bool:
         return is_wechat_photo_variant(getattr(self._card_profile, "prompt_variant", None))
@@ -468,6 +589,14 @@ class NewsMonitorRunner:
         """Send one Feishu card for a single DigestItem."""
         profile = self._card_profile
         if self._is_wechat_photo():
+            block = wechat_card_block_reason(item)
+            if block:
+                logger.warning(
+                    f"group={self._group_id} Refusing wechat_photo send ({block}): "
+                    f"#{getattr(item, 'rank', '?')} [{getattr(item, 'category', '')}] "
+                    f"{getattr(item, 'title', '')!r}"
+                )
+                return False
             payload = FeishuCardBuilder.build_wechat_photo_card(
                 item,
                 media_urls=list(getattr(item, "media_urls", None) or []),
@@ -510,6 +639,8 @@ class NewsMonitorRunner:
             reason = None
             if wechat_photo_unsafe(blob):
                 reason = "wechat_unsafe"
+            elif wechat_looks_like_news(item):
+                reason = "wechat_news_like"
             else:
                 caption = normalize_wechat_caption(getattr(item, "summary", None) or "")
                 if not caption:
@@ -592,19 +723,22 @@ class NewsMonitorRunner:
         ):
             return summary
         start, end = self.quiet.window(now)
-        self.evaluator.recent_history = ''
         profile = self._card_profile
-        self.evaluator.prompt_overlay = profile.prompt_overlay or ""
-        self.evaluator.prompt_variant = profile.prompt_variant
-        self.evaluator.digest_context = f"生成北京时间夜间摘要，范围 {start.isoformat()} 至 {end.isoformat()}，不是实时快讯。允许复盘已提醒的重大新闻。仅按输入判断最新进展，合并同事件；更正覆盖旧说法，剔除撤回信息，不得声称已核实输入以外的最新状态。精选最多5个事件，不凑数，保留event_at与来源ID。"
-        try:
-            digest = self.evaluator.evaluate_digest(candidates)
-        except Exception as exc:
-            logger.error(f'Morning evaluation failed; archive retained: {exc}')
-            return summary
-        finally:
-            self.policy.record_usage(getattr(self.evaluator, 'last_usage', None))
-            self.evaluator.digest_context = ''
+        with self._eval_lock:
+            self.evaluator.recent_history = ''
+            self.evaluator.prompt_overlay = profile.prompt_overlay or ""
+            self.evaluator.prompt_variant = profile.prompt_variant
+            self.evaluator.digest_context = f"生成北京时间夜间摘要，范围 {start.isoformat()} 至 {end.isoformat()}，不是实时快讯。允许复盘已提醒的重大新闻。仅按输入判断最新进展，合并同事件；更正覆盖旧说法，剔除撤回信息，不得声称已核实输入以外的最新状态。精选最多5个事件，不凑数，保留event_at与来源ID。"
+            try:
+                digest = self.evaluator.evaluate_digest(candidates)
+            except Exception as exc:
+                logger.error(f'Morning evaluation failed; archive retained: {exc}')
+                return summary
+            finally:
+                self.policy.record_usage(getattr(self.evaluator, 'last_usage', None))
+                self.evaluator.prompt_overlay = ""
+                self.evaluator.prompt_variant = None
+                self.evaluator.digest_context = ''
         summary['posts_evaluated'] = len(candidates)
         self.stats['total_posts_evaluated'] += len(candidates)
         allowed = {(p.channel.lower().lstrip('@'), p.message_id): p for p in candidates}
@@ -692,8 +826,8 @@ class NewsMonitorRunner:
         for idx, (group, channel) in enumerate(channel_jobs):
             if self._stop_requested:
                 break
-            self._activate_group(group)
-            gid = group.id if group is not None else self._group_id
+            # Ingest is group_id-scoped in storage; do not mutate webhook/card context.
+            gid = group.id if group is not None else self._legacy_gid()
             _posts, channel_stat = self._ingest_channel(channel, group_id=gid)
             channel_stat["group"] = gid
             pass_summary["details"].append(channel_stat)
@@ -718,31 +852,31 @@ class NewsMonitorRunner:
         details = pass_summary.get("details") or []
 
         for group in self._process_targets():
-            self._activate_group(group)
-            cfg = self._group_config
-            tz_name = getattr(cfg, "timezone", "Asia/Shanghai") or "Asia/Shanghai"
-            local = alert_schedule.local_now(clock, tz_name)
-            quiet_hours = getattr(cfg, "quiet_hours", "") or ""
-            shoulder_hours = getattr(cfg, "shoulder_hours", "") or ""
-            mode = alert_schedule.classify_alert_mode(local, quiet_hours, shoulder_hours)
-            knobs = alert_schedule.knobs_for(cfg, mode, now_local=local)
-            self.policy.sync_quiet_window(mode, knobs.quiet_window_id)
-            logger.info(
-                f"group={self._group_id} Alert window: mode={knobs.mode} tz={tz_name} "
-                f"local={local.isoformat()} flush={knobs.is_morning_flush} "
-                f"hotness>={knobs.hotness_threshold} min_interval={knobs.min_interval_seconds}s"
-            )
-            part = {
-                "posts_evaluated": 0,
-                "alerts_sent": 0,
-                "details": details,
-            }
-            try:
-                part = self._process_pending_with_knobs(part, clock, knobs, live_clock=live_clock)
-            finally:
-                self.policy.note_mode(mode, clock)
-            totals_eval += int(part.get("posts_evaluated") or 0)
-            totals_alert += int(part.get("alerts_sent") or 0)
+            with self._bind_group(group):
+                cfg = self._group_config
+                tz_name = getattr(cfg, "timezone", "Asia/Shanghai") or "Asia/Shanghai"
+                local = alert_schedule.local_now(clock, tz_name)
+                quiet_hours = getattr(cfg, "quiet_hours", "") or ""
+                shoulder_hours = getattr(cfg, "shoulder_hours", "") or ""
+                mode = alert_schedule.classify_alert_mode(local, quiet_hours, shoulder_hours)
+                knobs = alert_schedule.knobs_for(cfg, mode, now_local=local)
+                self.policy.sync_quiet_window(mode, knobs.quiet_window_id)
+                logger.info(
+                    f"group={self._group_id} Alert window: mode={knobs.mode} tz={tz_name} "
+                    f"local={local.isoformat()} flush={knobs.is_morning_flush} "
+                    f"hotness>={knobs.hotness_threshold} min_interval={knobs.min_interval_seconds}s"
+                )
+                part = {
+                    "posts_evaluated": 0,
+                    "alerts_sent": 0,
+                    "details": details,
+                }
+                try:
+                    part = self._process_pending_with_knobs(part, clock, knobs, live_clock=live_clock)
+                finally:
+                    self.policy.note_mode(mode, clock)
+                totals_eval += int(part.get("posts_evaluated") or 0)
+                totals_alert += int(part.get("alerts_sent") or 0)
 
         pass_summary["posts_evaluated"] = totals_eval
         pass_summary["alerts_sent"] = totals_alert
@@ -877,26 +1011,30 @@ class NewsMonitorRunner:
             )
             return pass_summary
         candidates = sorted(candidates, key=lambda p: (urgent(p.text), p.published_at), reverse=True)[:cfg.digest_max_batch_size]
-        self.evaluator.recent_history = self.policy.history()
         profile = self._card_profile
-        self.evaluator.prompt_overlay = profile.prompt_overlay or ""
-        self.evaluator.prompt_variant = profile.prompt_variant
-        self.evaluator.digest_context = ""
+        extra_history = ""
+        digest_context = ""
         if quiet:
             start, end = self.quiet.window(clock)
-            self.evaluator.digest_context = f"北京时间夜间模式，保存 {start.isoformat()} 至 {end.isoformat()} 的重要新闻用于晨报；窗口内事件允许超过30分钟，不得作为实时快讯。night_alert仅在已确认重大事件时为true；confirmed_source填写正文明确标注的原始来源；普通言论、传闻不准打断。is_update与update_reason只能描述相对历史的实质升级。"
-            self.evaluator.recent_history += "\n夜间已收录（有新事实才再选）：\n" + "\n".join(i.title + ': ' + i.summary[:200] for _, i in self.quiet.archived(clock)[-20:])
+            digest_context = f"北京时间夜间模式，保存 {start.isoformat()} 至 {end.isoformat()} 的重要新闻用于晨报；窗口内事件允许超过30分钟，不得作为实时快讯。night_alert仅在已确认重大事件时为true；confirmed_source填写正文明确标注的原始来源；普通言论、传闻不准打断。is_update与update_reason只能描述相对历史的实质升级。"
+            extra_history = "\n夜间已收录（有新事实才再选）：\n" + "\n".join(i.title + ': ' + i.summary[:200] for _, i in self.quiet.archived(clock)[-20:])
         # 5. One LLM call for the candidate batch
         if hasattr(self.evaluator, "evaluate_digest"):
-            try:
-                digest = self.evaluator.evaluate_digest(candidates)
-            except Exception as exc:
-                logger.error(f"group={self._group_id} Digest failed; pending retained: {exc}")
-                return pass_summary
-            finally:
-                self.policy.record_usage(getattr(self.evaluator, "last_usage", None))
-                self.evaluator.prompt_overlay = ""
-                self.evaluator.prompt_variant = None
+            with self._eval_lock:
+                self.evaluator.recent_history = self.policy.history() + extra_history
+                self.evaluator.prompt_overlay = profile.prompt_overlay or ""
+                self.evaluator.prompt_variant = profile.prompt_variant
+                self.evaluator.digest_context = digest_context
+                try:
+                    digest = self.evaluator.evaluate_digest(candidates)
+                except Exception as exc:
+                    logger.error(f"group={self._group_id} Digest failed; pending retained: {exc}")
+                    return pass_summary
+                finally:
+                    self.policy.record_usage(getattr(self.evaluator, "last_usage", None))
+                    self.evaluator.prompt_overlay = ""
+                    self.evaluator.prompt_variant = None
+                    self.evaluator.digest_context = ""
         else:
             digest = DigestBrief(
                 headline="本轮快讯",
@@ -1038,11 +1176,30 @@ class NewsMonitorRunner:
                     if self.quiet.in_window(published_at, send_time) and self.quiet.in_window(item.event_at, send_time):
                         self.quiet.archive(matched_post, item, send_time)
                     continue
+                if self._is_wechat_photo():
+                    if matched_post is not None and not getattr(item, "media_urls", None):
+                        item.media_urls = photo_link_urls(matched_post.media_urls)
+                    block = wechat_card_block_reason(item)
+                    if block:
+                        self.storage.update_evaluation(
+                            channel=ch,
+                            message_id=mid,
+                            score=1,
+                            summary=f"[filtered] {block}",
+                            alert_sent=False,
+                            is_filtered=True,
+                            filter_reason=block,
+                            key_takeaways=[],
+                            group_id=self._group_id,
+                        )
+                        logger.warning(
+                            f"group={self._group_id} Dropped wechat_photo item before send "
+                            f"({block}): #{item.rank} [{item.category}] {item.title!r}"
+                        )
+                        continue
                 delivery_text = self._delivery_text(matched_post)
                 if not self.policy.claim(delivery_text, item.title + ": " + item.summary):
                     continue
-                if self._is_wechat_photo() and matched_post is not None and not getattr(item, "media_urls", None):
-                    item.media_urls = photo_link_urls(matched_post.media_urls)
                 try:
                     send_ok = self._send_digest_item_card(item, published_at=published_at)
                 except Exception as exc:

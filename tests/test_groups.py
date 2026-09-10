@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from threading import Event, Thread
 
 import pytest
 from pydantic import ValidationError
@@ -308,6 +309,181 @@ class TestGroupIsolation:
         assert q1.claim_morning(morning)
         assert not q1.morning_due(morning)
         assert q2.morning_due(morning)
+
+    def test_ingest_only_does_not_activate_group(self, tmp_path):
+        db = str(tmp_path / "ingest_activate.db")
+        config = Settings(
+            db_path=db,
+            inter_channel_delay_seconds=0,
+            groups=[
+                {
+                    "id": "news24",
+                    "channels": ["wire"],
+                    "webhook_url": "https://example.com/news24",
+                    "card_profile": {
+                        "subtitle": "投资情报快报",
+                        "include_investment_impact": True,
+                        "prompt_variant": "news",
+                    },
+                },
+                {
+                    "id": "old_photos",
+                    "channels": ["oldpix"],
+                    "webhook_url": "https://example.com/photos",
+                    "card_profile": {
+                        "subtitle": "历史影像",
+                        "include_investment_impact": False,
+                        "prompt_variant": "wechat_photo",
+                    },
+                },
+            ],
+        )
+        runner = NewsMonitorRunner(config, PostRepository(db), MockScraper(), MockEvaluator(), MockWebhookSender())
+        news = next(g for g in config.enabled_groups() if g.id == "news24")
+        runner._activate_group(news)
+        activated: list[str | None] = []
+        orig = runner._activate_group
+
+        def spy(group):
+            activated.append(getattr(group, "id", None))
+            return orig(group)
+
+        runner._activate_group = spy  # type: ignore[method-assign]
+        runner.run_once(ingest_only=True)
+        assert activated == []
+        assert runner._group_id == "news24"
+        assert runner._card_profile.subtitle == "投资情报快报"
+
+    def test_news24_send_keeps_snapshot_if_ingest_activates_old_photos(self, tmp_path):
+        """Ingest-thread _activate_group(old_photos) must not steal a news24 send."""
+        db = str(tmp_path / "race.db")
+        now = datetime(2026, 9, 10, 2, 0, 0, tzinfo=timezone.utc)
+        config = Settings(
+            db_path=db,
+            digest_min_candidates=1,
+            digest_max_wait_seconds=0,
+            digest_card_interval_seconds=0,
+            digest_min_interval_seconds=0,
+            inter_channel_delay_seconds=0,
+            groups=[
+                {
+                    "id": "news24",
+                    "channels": ["walterbloomberg"],
+                    "webhook_url": "https://example.com/news24",
+                    "hotness_threshold": 7,
+                    "digest_min_candidates": 1,
+                    "digest_max_wait_seconds": 0,
+                    "digest_min_interval_seconds": 0,
+                    "digest_card_interval_seconds": 0,
+                    "quiet_hours": "",
+                    "shoulder_hours": "",
+                    "morning_flush_enabled": False,
+                    "card_profile": {
+                        "subtitle": "投资情报快报",
+                        "include_investment_impact": True,
+                        "prompt_variant": "news",
+                    },
+                },
+                {
+                    "id": "old_photos",
+                    "channels": ["oldpix"],
+                    "webhook_url": "https://example.com/photos",
+                    "hotness_threshold": 7,
+                    "digest_min_candidates": 1,
+                    "digest_max_wait_seconds": 0,
+                    "digest_min_interval_seconds": 0,
+                    "digest_card_interval_seconds": 0,
+                    "quiet_hours": "",
+                    "shoulder_hours": "",
+                    "morning_flush_enabled": False,
+                    "card_profile": {
+                        "subtitle": "历史影像",
+                        "include_investment_impact": False,
+                        "prompt_variant": "wechat_photo",
+                    },
+                },
+            ],
+        )
+        repo = PostRepository(db)
+        repo.save_posts(
+            [
+                TelegramPost(
+                    channel="walterbloomberg",
+                    message_id=1,
+                    text="Brent crude jumps seven dollars as US-Iran tensions escalate overnight.",
+                    direct_url="https://t.me/walterbloomberg/1",
+                    published_at=now,
+                )
+            ],
+            group_id="news24",
+        )
+
+        def builder(posts):
+            items = [
+                DigestItem(
+                    rank=1,
+                    channel=p.channel,
+                    message_id=p.message_id,
+                    title="布伦特原油单日上涨7美元，美伊冲突升级",
+                    summary=p.text,
+                    event_at=p.published_at,
+                    score=8,
+                    category="能源",
+                    impact_overall="油价冲击风险资产",
+                    impact_us="能源股波动",
+                    impact_cn="输入性通胀关注",
+                    impact_commodities="原油大涨",
+                )
+                for p in posts
+            ]
+            return DigestBrief(
+                headline="oil",
+                overview="",
+                items=items,
+                has_material_news=True,
+            )
+
+        news_sender = MockWebhookSender()
+        photo_sender = MockWebhookSender()
+        entered, release = Event(), Event()
+
+        class GateSender:
+            def __init__(self, inner: MockWebhookSender) -> None:
+                self.inner = inner
+                self.sent_payloads = inner.sent_payloads
+
+            def send(self, payload):
+                entered.set()
+                assert release.wait(3), "timed out waiting to resume news24 send"
+                return self.inner.send(payload)
+
+        runner = NewsMonitorRunner(
+            config, repo, MockScraper(), MockEvaluator(digest_builder=builder), MockWebhookSender()
+        )
+        runner._senders["news24"] = GateSender(news_sender)
+        runner._senders["old_photos"] = photo_sender
+        photo = next(g for g in config.enabled_groups() if g.id == "old_photos")
+
+        result: dict = {}
+
+        def worker():
+            result["summary"] = runner.process_pending(now=now)
+
+        thread = Thread(target=worker)
+        thread.start()
+        assert entered.wait(3), "news24 send never started"
+        runner._activate_group(photo)
+        release.set()
+        thread.join(5)
+        assert not thread.is_alive()
+        assert result["summary"]["alerts_sent"] == 1
+        assert len(news_sender.sent_payloads) == 1
+        assert photo_sender.sent_payloads == []
+        blob = str(news_sender.sent_payloads[0])
+        assert "投资情报快报" in blob
+        assert "💹 投资影响" in blob
+        assert "历史影像" not in blob
+        assert "布伦特原油单日上涨7美元" in blob
 
 
 class TestSchemaMigration:

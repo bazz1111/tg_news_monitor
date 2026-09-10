@@ -15,6 +15,8 @@ from tg_news_monitor.core.wechat_photo import (
     is_photo_album_post,
     normalize_wechat_caption,
     photo_link_urls,
+    wechat_card_block_reason,
+    wechat_looks_like_news,
     wechat_photo_prefilter,
     wechat_photo_unsafe,
 )
@@ -100,6 +102,23 @@ class TestWechatLocalFilters:
     def test_keeps_cultural_caption(self):
         assert not wechat_photo_unsafe("苏州河边的石库门与晾衣竿，约二十世纪三十年代。")
         assert not wechat_photo_unsafe("旗袍店橱窗与有轨电车。")
+
+    def test_rejects_live_news_energy_and_conflict(self):
+        assert wechat_photo_unsafe("布伦特原油单日上涨7美元，美伊冲突升级")
+        assert wechat_looks_like_news(category="能源", text="油市波动")
+        news_item = _item(
+            title="布伦特原油单日上涨7美元，美伊冲突升级",
+            summary="美伊冲突升级推高油价。",
+        )
+        news_item.category = "能源"
+        news_item.media_urls = []
+        assert wechat_card_block_reason(news_item) in {"wechat_unsafe", "wechat_news_like", "no_photo_urls"}
+        cultural = _item()
+        cultural.media_urls = ["https://cdn.example.com/p.jpg"]
+        assert wechat_card_block_reason(cultural) is None
+        no_media = _item()
+        no_media.media_urls = []
+        assert wechat_card_block_reason(no_media) == "no_photo_urls"
 
     def test_photo_only_intake(self):
         photo = _post(1, "老街一角", media_type="photo")
@@ -452,6 +471,78 @@ class TestWechatRunnerIsolation:
         assert summary["alerts_sent"] == 0
         assert sender.sent_payloads == []
         assert repo.get_post("oldpix", 30, group_id="old_photos")["filter_reason"] == "wechat_unsafe"
+
+    def test_news_like_item_without_media_not_sent_on_old_photos(self, tmp_path):
+        db = str(tmp_path / "news_like.db")
+        repo = PostRepository(db)
+        now = _now()
+        repo.save_posts([_post(40, "苏州河边的石库门。", published_at=now)], group_id="old_photos")
+
+        def news_builder(posts):
+            bad = _item(
+                message_id=40,
+                title="布伦特原油单日上涨7美元，美伊冲突升级",
+                summary="地缘冲突推升能源价格。",
+                media_urls=[],
+            )
+            bad.category = "能源"
+            return DigestBrief(
+                headline="bad-news",
+                overview="",
+                items=[bad],
+                has_material_news=True,
+            )
+
+        evaluator = MockEvaluator(digest_builder=news_builder)
+        sender = MockWebhookSender()
+        runner = NewsMonitorRunner(self._settings(db), repo, MockScraper(), evaluator, sender)
+        summary = runner.process_pending(now=now)
+        assert summary["alerts_sent"] == 0
+        assert sender.sent_payloads == []
+        reason = repo.get_post("oldpix", 40, group_id="old_photos")["filter_reason"]
+        assert reason in {"wechat_unsafe", "wechat_news_like", "no_photo_urls"}
+
+    def test_wechat_send_requires_media_urls(self, tmp_path):
+        db = str(tmp_path / "no_media.db")
+        config = self._settings(db)
+        sender = MockWebhookSender()
+        runner = NewsMonitorRunner(config, PostRepository(db), MockScraper(), MockEvaluator(), sender)
+        photo = next(g for g in config.enabled_groups() if g.id == "old_photos")
+        item = _item(media_urls=[])
+        with runner._bind_group(photo):
+            assert runner._send_digest_item_card(item) is False
+        assert sender.sent_payloads == []
+
+    def test_news_like_with_media_still_rejected_on_old_photos(self, tmp_path):
+        db = str(tmp_path / "news_media.db")
+        repo = PostRepository(db)
+        now = _now()
+        repo.save_posts([_post(43, "苏州河边的石库门。", published_at=now)], group_id="old_photos")
+
+        def news_builder(posts):
+            bad = _item(
+                message_id=43,
+                title="布伦特原油单日上涨7美元，美伊冲突升级",
+                summary="地缘冲突推升能源价格。",
+                media_urls=["https://cdn.example.com/oil.jpg"],
+            )
+            bad.category = "能源"
+            return DigestBrief(
+                headline="bad-news",
+                overview="",
+                items=[bad],
+                has_material_news=True,
+            )
+
+        sender = MockWebhookSender()
+        runner = NewsMonitorRunner(
+            self._settings(db), repo, MockScraper(), MockEvaluator(digest_builder=news_builder), sender
+        )
+        summary = runner.process_pending(now=now)
+        assert summary["alerts_sent"] == 0
+        assert sender.sent_payloads == []
+        reason = repo.get_post("oldpix", 43, group_id="old_photos")["filter_reason"]
+        assert reason in {"wechat_unsafe", "wechat_news_like"}
 
 
 def test_photo_link_urls_dedupes_and_drops_tme():
