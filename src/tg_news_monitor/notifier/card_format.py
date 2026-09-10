@@ -101,13 +101,13 @@ def format_morning_item_md(
         body = f"**{index}. {title}**\n{short}"
         if detail_block:
             body += f"\n📌 事件详情\n{detail_block}"
-        body += f"\n{focus_line}\n事件时间：{event_time_hm}（北京时间）"
+        body += f"\n{focus_line}\n北京时间：{event_time_hm}"
         return body
 
-    body = f"**{index}. {title}**\n{summary}\n{focus_line}\n事件时间：{event_time_hm}（北京时间）"
+    body = f"**{index}. {title}**\n{summary}\n{focus_line}\n北京时间：{event_time_hm}"
     return body
 
 
-def format_event_time_footer(event_at_iso_or_text: str) -> str:
-    """Single-card footer without outbound links."""
-    return f"事件时间：{event_at_iso_or_text} · 模型解读需核实"
+def format_model_disclaimer() -> str:
+    """Optional single-card footer: no event time, no outbound links."""
+    return "模型解读需核实"

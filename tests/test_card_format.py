@@ -24,7 +24,7 @@ def test_morning_long_gets_details_without_links():
     assert "事件详情" in md
     assert "原文" not in md
     assert "t.me" not in md
-    assert "事件时间：08:00（北京时间）" in md
+    assert "北京时间：08:00" in md
 
 
 def test_morning_short_stays_compact():
@@ -38,3 +38,5 @@ def test_morning_short_stays_compact():
     md = format_morning_item_md(2, item, "07:10")
     assert "事件详情" not in md
     assert "原文" not in md
+    assert "北京时间：07:10" in md
+    assert "事件时间" not in md

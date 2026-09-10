@@ -38,7 +38,7 @@ from tg_news_monitor.core.filters import (
 from tg_news_monitor.core.models import DigestBrief, DigestItem, NewsEvaluation, TelegramPost
 from tg_news_monitor.evaluator.grok_client import GrokClient
 from tg_news_monitor.notifier.feishu_card import FeishuCardBuilder
-from tg_news_monitor.notifier.card_format import format_event_time_footer, format_morning_item_md
+from tg_news_monitor.notifier.card_format import format_morning_item_md
 from tg_news_monitor.notifier.webhook_sender import FeishuWebhookSender
 from tg_news_monitor.scraper.client import TelegramScraperClient
 from tg_news_monitor.scraper.parser import TelegramWebParser
@@ -348,13 +348,6 @@ class NewsMonitorRunner:
             published_at=published_at,
             subtitle="投资情报快报",
         )
-        event_label = (
-            item.event_at.isoformat() if item.event_at else "未确认"
-        )
-        payload["card"]["body"]["elements"].append({
-            "tag": "markdown",
-            "content": format_event_time_footer(event_label),
-        })
         if hasattr(self.webhook_sender, "send"):
             return bool(self.webhook_sender.send(payload))
         if hasattr(self.webhook_sender, "send_alert"):
