@@ -107,6 +107,10 @@ class DigestItem(BaseModel):
         default=None,
         description="UTC publication time; prefer runner post.published_at when building card",
     )
+    media_urls: List[str] = Field(
+        default_factory=list,
+        description="Photo URLs copied from the source post for wechat_photo cards",
+    )
 
 
 class DigestBrief(BaseModel):

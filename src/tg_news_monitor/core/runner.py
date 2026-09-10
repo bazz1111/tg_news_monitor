@@ -42,6 +42,14 @@ from tg_news_monitor.core.filters import (
     coarse_filter_posts,
 )
 from tg_news_monitor.core.models import DigestBrief, DigestItem, NewsEvaluation, TelegramPost
+from tg_news_monitor.core.wechat_photo import (
+    is_wechat_photo_variant,
+    normalize_wechat_caption,
+    photo_link_urls,
+    photo_material_text,
+    wechat_photo_prefilter,
+    wechat_photo_unsafe,
+)
 from tg_news_monitor.evaluator.grok_client import GrokClient
 from tg_news_monitor.notifier.feishu_card import FeishuCardBuilder
 from tg_news_monitor.notifier.card_format import format_morning_item_md
@@ -189,6 +197,14 @@ class NewsMonitorRunner:
             self.quiet = self._quiets[self._group_id]
         if self._group_id in self._senders:
             self.webhook_sender = self._senders[self._group_id]
+
+    def _is_wechat_photo(self) -> bool:
+        return is_wechat_photo_variant(getattr(self._card_profile, "prompt_variant", None))
+
+    def _delivery_text(self, post: TelegramPost) -> str:
+        if self._is_wechat_photo():
+            return photo_material_text(post)
+        return post.text or ""
 
     def _process_targets(self) -> List[Optional[Group]]:
         groups = list(self.config.enabled_groups()) if hasattr(self.config, "enabled_groups") else []
@@ -440,21 +456,87 @@ class NewsMonitorRunner:
         self,
         item: DigestItem,
         published_at: Optional[datetime] = None,
+        post: Optional[TelegramPost] = None,
     ) -> bool:
         """Send one Feishu card for a single DigestItem."""
         profile = self._card_profile
-        payload = FeishuCardBuilder.build_digest_item_card(
-            item,
-            published_at=published_at,
-            subtitle=profile.subtitle or "投资情报快报",
-            include_investment_impact=profile.include_investment_impact,
-        )
+        if self._is_wechat_photo():
+            urls = list((post.media_urls if post is not None else None) or getattr(item, "media_urls", None) or [])
+            payload = FeishuCardBuilder.build_wechat_photo_card(
+                item,
+                media_urls=urls,
+                subtitle=profile.subtitle or "公众号图片素材",
+            )
+        else:
+            payload = FeishuCardBuilder.build_digest_item_card(
+                item,
+                published_at=published_at,
+                subtitle=profile.subtitle or "投资情报快报",
+                include_investment_impact=profile.include_investment_impact,
+            )
         if hasattr(self.webhook_sender, "send"):
             return bool(self.webhook_sender.send(payload))
         if hasattr(self.webhook_sender, "send_alert"):
             return bool(self.webhook_sender.send_alert(payload))
         logger.error("Webhook sender missing send/send_alert method")
         return False
+
+    def _sanitize_wechat_digest(self, digest: DigestBrief, candidates: List[TelegramPost]) -> None:
+        """Drop review-unsafe / caption-less / imageless items; clamp 说明 to ≤100 chars."""
+        by_key = {
+            (p.channel.lower().lstrip("@"), int(p.message_id)): p for p in candidates
+        }
+        kept: List[DigestItem] = []
+        for item in digest.items:
+            ch = str(item.channel).lower().lstrip("@").strip()
+            try:
+                mid = int(item.message_id)
+            except (TypeError, ValueError):
+                continue
+            post = by_key.get((ch, mid))
+            blob = " ".join(
+                [
+                    str(getattr(item, "title", "") or ""),
+                    str(getattr(item, "summary", "") or ""),
+                    " ".join(str(x) for x in (getattr(item, "summary_bullets", None) or [])),
+                ]
+            )
+            reason = None
+            if wechat_photo_unsafe(blob):
+                reason = "wechat_unsafe"
+            else:
+                caption = normalize_wechat_caption(getattr(item, "summary", None) or "")
+                if not caption:
+                    bullets = getattr(item, "summary_bullets", None) or []
+                    first = bullets[0] if bullets else ""
+                    caption = normalize_wechat_caption(str(first) or getattr(item, "title", "") or "")
+                if not caption:
+                    reason = "empty_caption"
+                else:
+                    item.summary = caption
+                    urls = photo_link_urls(post.media_urls if post is not None else getattr(item, "media_urls", None))
+                    if not urls:
+                        reason = "no_photo_urls"
+                    else:
+                        item.media_urls = urls
+            if reason:
+                self.storage.update_evaluation(
+                    channel=ch,
+                    message_id=mid,
+                    score=1,
+                    summary=f"[filtered] {reason}",
+                    alert_sent=False,
+                    is_filtered=True,
+                    filter_reason=reason,
+                    key_takeaways=[],
+                    group_id=self._group_id,
+                )
+                continue
+            kept.append(item)
+        digest.items = kept
+        if not kept:
+            digest.has_material_news = False
+            digest.filtered_note = ((digest.filtered_note or "") + "; wechat_photo_empty").strip("; ")
 
     def _oldest_age_seconds(
         self,
@@ -677,7 +759,7 @@ class NewsMonitorRunner:
             )
             pending_pairs = [(p, clock) for p in pending_posts]
 
-        if self.quiet.morning_due(clock):
+        if self.quiet.morning_due(clock) and not self._is_wechat_photo():
             return self._morning_report(pending_pairs, pass_summary, clock, live_clock)
 
         if not pending_pairs:
@@ -695,8 +777,9 @@ class NewsMonitorRunner:
         pending_posts = [p for p in pending_posts if eligible(p)]
         unique, duplicates, seen = [], [], set()
         for post in sorted(pending_posts, key=lambda p: p.published_at, reverse=True):
-            key = fingerprint(post.text)
-            if key in seen or self.policy.seen(post.text):
+            material = self._delivery_text(post)
+            key = fingerprint(material)
+            if key in seen or self.policy.seen(material):
                 duplicates.append(post)
             else:
                 seen.add(key)
@@ -707,20 +790,32 @@ class NewsMonitorRunner:
             f"group={self._group_id} Pending buffer: {len(pending_posts)} unevaluated post(s) after ingest."
         )
 
-        # 3. Cheap local coarse filter (zero LLM): spam + crypto ban
-        candidates, spam_dropped, crypto_dropped = coarse_filter_posts(pending_posts)
-        if spam_dropped:
-            logger.info(
-                f"Coarse filter dropped {len(spam_dropped)} spam/noise post(s); "
-                f"{len(candidates) + len(crypto_dropped)} remain before crypto filter."
-            )
-            self._mark_all_filtered(spam_dropped, "coarse_filter")
-        if crypto_dropped:
-            logger.info(
-                f"Crypto filter dropped {len(crypto_dropped)} post(s); "
-                f"{len(candidates)} candidate(s) remain."
-            )
-            self._mark_all_filtered(crypto_dropped, "crypto_filter")
+        # 3. Cheap local filter (zero LLM). wechat_photo: photo-only + safety keywords.
+        if self._is_wechat_photo():
+            candidates, wechat_dropped = wechat_photo_prefilter(pending_posts)
+            if wechat_dropped:
+                reasons: Dict[str, int] = {}
+                for post, reason in wechat_dropped:
+                    reasons[reason] = reasons.get(reason, 0) + 1
+                    self._mark_all_filtered([post], reason)
+                logger.info(
+                    f"group={self._group_id} WeChat photo prefilter dropped "
+                    f"{len(wechat_dropped)} post(s) {reasons}; {len(candidates)} remain."
+                )
+        else:
+            candidates, spam_dropped, crypto_dropped = coarse_filter_posts(pending_posts)
+            if spam_dropped:
+                logger.info(
+                    f"Coarse filter dropped {len(spam_dropped)} spam/noise post(s); "
+                    f"{len(candidates) + len(crypto_dropped)} remain before crypto filter."
+                )
+                self._mark_all_filtered(spam_dropped, "coarse_filter")
+            if crypto_dropped:
+                logger.info(
+                    f"Crypto filter dropped {len(crypto_dropped)} post(s); "
+                    f"{len(candidates)} candidate(s) remain."
+                )
+                self._mark_all_filtered(crypto_dropped, "crypto_filter")
 
         if not candidates:
             logger.info("No candidates after coarse/crypto filter; skipping LLM and Feishu cards.")
@@ -744,7 +839,12 @@ class NewsMonitorRunner:
 
         min_candidates, max_wait = knobs.min_candidates, knobs.max_wait_seconds
         oldest_age = self._oldest_age_seconds(candidate_pairs, now=clock)
-        has_urgent = any(urgent(p.text) and is_fresh(p.published_at, cfg.news_max_age_seconds, clock) for p in candidates)
+        has_urgent = False
+        if not self._is_wechat_photo():
+            has_urgent = any(
+                urgent(p.text) and is_fresh(p.published_at, cfg.news_max_age_seconds, clock)
+                for p in candidates
+            )
         if quiet:
             if not has_urgent and oldest_age < cfg.quiet_digest_min_interval_seconds:
                 return pass_summary
@@ -860,12 +960,21 @@ class NewsMonitorRunner:
                         (digest.filtered_note or "") + "; crypto_ban_all"
                     ).strip("; ")
 
+        if self._is_wechat_photo() and digest.items:
+            self._sanitize_wechat_digest(digest, candidates)
+
         # 6. Persist short evaluation summaries
         # Archive before marking evaluated, so an interrupted pass retains the morning material.
         by_key = {(p.channel.lower().lstrip('@'), p.message_id): p for p in candidates}
         for item in digest.items:
             post = by_key[(item.channel.lower().lstrip('@'), item.message_id)]
-            if quiet and (item.score or 11 - item.rank) >= cfg.hotness_threshold and self.quiet.in_window(post.published_at, clock) and self.quiet.in_window(item.event_at, clock):
+            if (
+                not self._is_wechat_photo()
+                and quiet
+                and (item.score or 11 - item.rank) >= cfg.hotness_threshold
+                and self.quiet.in_window(post.published_at, clock)
+                and self.quiet.in_window(item.event_at, clock)
+            ):
                 self.quiet.archive(post, item, clock)
         self._apply_digest_evaluations(candidates, digest)
 
@@ -902,7 +1011,7 @@ class NewsMonitorRunner:
                     continue
                 if not is_fresh(published_at, cfg.news_max_age_seconds, send_time):
                     continue
-                if not is_fresh(item.event_at, cfg.news_max_age_seconds, send_time):
+                if not self._is_wechat_photo() and not is_fresh(item.event_at, cfg.news_max_age_seconds, send_time):
                     self._mark_all_filtered([matched_post], 'event_time_unknown_or_expired')
                     continue
                 score = self._digest_item_score(item)
@@ -915,18 +1024,25 @@ class NewsMonitorRunner:
                             f"({send_knobs.quiet_card_cap}/{send_knobs.quiet_window_id}); skipping remaining cards."
                         )
                         break
-                if send_mode == 'quiet' and not self.quiet.claim_alert(item, matched_post, send_time):
+                if (
+                    not self._is_wechat_photo()
+                    and send_mode == 'quiet'
+                    and not self.quiet.claim_alert(item, matched_post, send_time)
+                ):
                     if self.quiet.in_window(published_at, send_time) and self.quiet.in_window(item.event_at, send_time):
                         self.quiet.archive(matched_post, item, send_time)
                     continue
-                if not self.policy.claim(matched_post.text, item.title + ": " + item.summary):
+                delivery_text = self._delivery_text(matched_post)
+                if not self.policy.claim(delivery_text, item.title + ": " + item.summary):
                     continue
                 try:
-                    send_ok = self._send_digest_item_card(item, published_at=published_at)
+                    send_ok = self._send_digest_item_card(
+                        item, published_at=published_at, post=matched_post
+                    )
                 except Exception as exc:
                     logger.error(f"Delivery uncertain, do not automatically resend: {exc}")
                     send_ok = False
-                self.policy.complete(matched_post.text, send_ok)
+                self.policy.complete(delivery_text, send_ok)
                 if send_ok:
                     alerts_ok += 1
                     if send_knobs.quiet_card_cap is not None and send_knobs.quiet_window_id:

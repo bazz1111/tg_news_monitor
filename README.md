@@ -15,6 +15,7 @@
 - **不明投递避免重发**：主流程默认只尝试一次Webhook，提前记录投递认领；结果不明记为 `unknown`，不自动重试。
 - **加密内容过滤**：模型调用前后过滤加密货币及区块链内容；规则仍可能误伤或漏网。
 - **北京时间弹性静默**：按 `Asia/Shanghai` 窗口调整评估门槛与飞书推送；采集仍全天运行。跨午夜窗口（如 `23:00-01:00`）按半开区间 `[start, end)` 解析。
+- **微信公众号图片素材（`old_photos`）**：与 `news24` 对等隔离。只收照片/相册，本地安全阀拒绝黄赌毒暴与时政敏感，`wechat_photo` 提示词宁缺毋滥；飞书卡只有标题、≤100 字说明和图片链接，无投资影响、无 Telegram/`t.me` 痕迹。默认低频（约 1 小时冷却、每日 8 次软顶）。
 
 语义去重和时间提取依赖模型，不能保证百分之百准确。严格时效可能漏掉时间不明的消息；进程崩溃或投递不明也可能漏推。当前没有完整持久化发件箱、PDF/OCR或独立研报摘要通道。夜间识别仍可能漏报或误报。
 
@@ -130,8 +131,24 @@ groups:
     card_profile:
       subtitle: 投资情报快报
       include_investment_impact: true
-      prompt_variant: news          # news | story
+      prompt_variant: news          # news | story | wechat_photo
       # prompt_overlay: "额外系统提示"
+  - id: old_photos
+    name: 公众号历史图片素材
+    channels: []                    # 填入历史影像向公开频道后才会采集
+    webhook_url_env: FEISHU_WEBHOOK_OLD_PHOTOS
+    quiet_hours: ""
+    shoulder_hours: ""
+    morning_flush_enabled: false
+    news_max_age_seconds: 86400
+    digest_min_candidates: 2
+    digest_max_wait_seconds: 7200
+    digest_min_interval_seconds: 3600
+    digest_max_calls_per_day: 8
+    card_profile:
+      subtitle: 公众号图片素材
+      include_investment_impact: false
+      prompt_variant: wechat_photo
   - id: xhs_hot
     name: 小红书热点（示例，先空着）
     enabled: false
@@ -148,13 +165,29 @@ groups:
 ```dotenv
 FEISHU_WEBHOOK_NEWS24=https://open.feishu.cn/open-apis/bot/v2/hook/...
 FEISHU_WEBHOOK_SECRET_NEWS24=
+# FEISHU_WEBHOOK_OLD_PHOTOS=
 # FEISHU_WEBHOOK_XHS=
 DEEPSEEK_API_KEY=...
 ```
 
+#### `old_photos`：微信公众号历史影像素材
+
+这是材料台，不是新闻快讯：公开 TG 频道只作进料，飞书是审稿箱，人工再发公众号。与 `news24` 分组隔离（独立 pending、模型批次、webhook、去重），互不影响。
+
+| 步骤 | 行为 |
+|---|---|
+| 进料 | 仅 `has_media` 且 `media_type` 为 `photo`/`album`、且 `media_urls` 非空。纯文字、纯视频丢掉。短说明不因字数不够被当成垃圾。 |
+| 本地硬过滤 | 黄赌毒、血腥暴力、领导人/党宣、当代地缘鼓动等关键词直接拒绝，宁错杀。过不了的不进模型。 |
+| 模型 | `prompt_variant: wechat_photo`，比 `story` 更严：只要适合大陆公众号的历史/文化静帧；无把握不选。 |
+| 说明 | 模型写中文完整句，≤100 字，不以省略号收尾，无时政评论；发送前再截断一次。 |
+| 飞书卡 | 标题 + 说明 + 可点击图片链接（相册尽量带上已刮到的地址）。**无**投资影响、**无**频道名/`t.me`/原文。暂不要求上传飞书图片。 |
+| 节奏 | 非实时。默认 `digest_min_interval_seconds=3600`、`digest_max_calls_per_day=8`、`digest_min_candidates=2`、`digest_max_wait_seconds=7200`。`news_max_age_seconds` 须明显长于冷却（默认 86400），否则帖子会在等待中过期。关闭 `quiet_hours` / 晨报。频率可以后再调组级旋钮。 |
+
+历史事件本身很旧，因此该组**不**用 `event_at` 做 30 分钟时效拦截（`news24` 仍拦截）。图片像素不做识别，只能靠说明文字与模型。
+
 **从 `TELEGRAM_CHANNELS` 迁移：** 若配置里**没有** `groups` 字段，但存在旧的 `TELEGRAM_CHANNELS` + `FEISHU_WEBHOOK_URL`，启动时会合成一个对等 Group（默认 `id: legacy`，可用 `legacy_group_id` 改名）。这不是运行时特权默认组，只是兼容现有部署。一旦 YAML/配置里出现 `groups`，就不再把旧的单一频道列表当主数据源。升级后已有 SQLite 行会标上该 legacy id；若希望旧 pending/认领接到 `news24`，把该组 `id` 设为 `legacy`，或设 `legacy_group_id: news24` 后再迁库。
 
-可选 per-group 覆盖（现在就生效，不是后期）：`quiet_hours` / `shoulder_hours`、各档 `hotness_threshold`、digest 门槛/间隔/卡片间隔、`quiet_card_cap`、晨报开关与门槛、`digest_max_calls_per_day`（软）、`card_profile`、`enabled`。空频道或 `enabled: false` 的组会被跳过。
+可选 per-group 覆盖（现在就生效，不是后期）：`quiet_hours` / `shoulder_hours`、各档 `hotness_threshold`、digest 门槛/间隔/卡片间隔、`quiet_card_cap`、晨报开关与门槛、`digest_max_calls_per_day`（软）、`news_max_age_seconds`、`card_profile`（`prompt_variant`：`news` / `story` / `wechat_photo`）、`enabled`。空频道或 `enabled: false` 的组会被跳过。
 
 存储与去重按 `group_id` 隔离：帖子唯一键为 `(group_id, channel, message_id)`，投递指纹与晨报/静默认领也按组分开。同一正文可以分别推到两个组的 webhook。日志带 `group=<id>`。
 
