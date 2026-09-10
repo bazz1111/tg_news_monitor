@@ -223,9 +223,10 @@ class TestNewsMonitorRunner:
             card_payload = webhook.sent_payloads[0]
             assert card_payload["msg_type"] == "interactive"
             assert "重磅监管获批公告" in str(card_payload)
-            # Item cards must not include Telegram original-link buttons
+            # Item cards must not include Telegram original-link buttons or t.me footers
             assert "查看 Telegram" not in str(card_payload)
-            assert "https://t.me/whale_wire/101" in str(card_payload)
+            assert "t.me" not in str(card_payload)
+            assert "发布时间" in str(card_payload)
 
             # Verify SQLite database state (batch digest: selected item score from rank)
             post_101 = storage.get_post(channel, 101)

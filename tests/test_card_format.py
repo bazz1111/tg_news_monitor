@@ -15,7 +15,7 @@ def test_is_long_by_chars_and_lines():
 def test_morning_long_gets_details_without_links():
     item = SimpleNamespace(
         title="复杂事件",
-        summary="这是一条超过八十个汉字的摘要内容用于触发长讯详情展示逻辑，后面还会补充更多事实说明。" + "补充。",
+        summary="这是一条超过八十个汉字的摘要内容用于触发长讯详情展示逻辑。" + ("后续事实。" * 12),
         impact_overall="风险偏好承压",
         actionable_insight="",
         summary_bullets=["事实一", "事实二", "事实三"],

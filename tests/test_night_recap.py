@@ -66,7 +66,8 @@ def test_night_retention_one_morning_card_and_restart(tmp_path):
     assert len(sender.sent_payloads) == 1
     assert '夜间摘要' in str(sender.sent_payloads[0])
     assert '非即时快讯' in str(sender.sent_payloads[0])
-    assert 'https://t.me/wire/1' in str(sender.sent_payloads[0])
+    assert 't.me' not in str(sender.sent_payloads[0])
+    assert '北京时间' in str(sender.sent_payloads[0])
     assert restarted.process_pending()['alerts_sent'] == 0
     assert len(evaluator.digest_batches) == 2  # no duplicate morning LLM call
 

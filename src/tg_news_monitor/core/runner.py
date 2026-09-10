@@ -549,7 +549,8 @@ class NewsMonitorRunner:
                 'content': format_morning_item_md(index, item, event_time),
             })
         label = ""
-        if self._active_group is not None:
+        enabled = list(self.config.enabled_groups()) if hasattr(self.config, "enabled_groups") else []
+        if self._active_group is not None and len(enabled) > 1:
             label = f"{self._active_group.display_name()} · "
         payload = {'msg_type': 'interactive', 'card': {'schema': '2.0', 'header': {'title': {'tag': 'plain_text', 'content': f'{label}{end:%m月%d日} 夜间摘要'}, 'template': 'blue'}, 'body': {'elements': elements}}}
         try:
