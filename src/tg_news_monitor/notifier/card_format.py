@@ -8,7 +8,7 @@ LONG_SUMMARY_CHARS = 80
 LONG_SUMMARY_LINES = 2  # more than 2 lines => long
 SUMMARY_SOFT_CAP = 80
 DETAIL_MAX_ITEMS = 3
-DETAIL_ITEM_CHARS = 40
+DETAIL_ITEM_CHARS = 72
 
 
 def _line_count(text: str) -> int:
@@ -51,29 +51,56 @@ def _split_detail_from_summary(summary: str) -> List[str]:
     return [c for c in chunks if c]
 
 
+def polish_overview_bullet(text: str) -> str:
+    """Make overview lines complete: strip trailing ellipsis, close the sentence."""
+    s = (text or "").strip().lstrip("•-* ")
+    if not s:
+        return ""
+    # strip trailing truncation markers
+    while s and s[-1] in ".…⋯．":
+        # keep a normal Chinese period if we already closed the thought
+        if s.endswith("。") or s.endswith("！") or s.endswith("？"):
+            break
+        s = s[:-1].rstrip()
+    s = s.rstrip(".…⋯． ").strip()
+    if not s:
+        return ""
+    if s[-1] not in "。！？；":
+        s = s + "。"
+    return s
+
+
 def shorten_summary(summary: str, cap: int = SUMMARY_SOFT_CAP) -> str:
-    t = (summary or "").strip()
-    # Prefer first line / first sentence under cap
+    """Prefer a complete sentence under cap; never end with bare ellipsis."""
+    t = polish_overview_bullet(summary)
+    if not t:
+        return ""
     first = t.split("\n", 1)[0].strip()
-    for sep in ["。", "！", "？", ".", "!", "?"]:
+    for sep in ["。", "！", "？"]:
         if sep in first:
             head = first.split(sep, 1)[0].strip()
             if head:
-                first = head + ("。" if sep == "。" else sep)
+                first = head + sep
                 break
     if len(first) <= cap:
-        return first
-    return first[: cap - 1].rstrip() + "…"
+        return polish_overview_bullet(first)
+    # cut at last clause mark within cap
+    window = first[:cap]
+    for sep in ["，", "、", "；", " "]:
+        idx = window.rfind(sep)
+        if idx >= max(20, cap // 3):
+            return polish_overview_bullet(window[:idx])
+    return polish_overview_bullet(window)
 
 
 def format_detail_lines(details: Sequence[str]) -> str:
     lines = []
     for d in details[:DETAIL_MAX_ITEMS]:
-        s = str(d).strip().lstrip("•-* ")
+        s = polish_overview_bullet(str(d))
         if not s:
             continue
         if len(s) > DETAIL_ITEM_CHARS:
-            s = s[: DETAIL_ITEM_CHARS - 1].rstrip() + "…"
+            s = shorten_summary(s, DETAIL_ITEM_CHARS)
         lines.append(f"- {s}")
     return "\n".join(lines)
 
@@ -91,6 +118,7 @@ def format_morning_item_md(
 
     if is_long_summary(summary):
         short = shorten_summary(summary)
+        short = polish_overview_bullet(short)
         bullets = _bullets_from_item(item)
         details = bullets if bullets else _split_detail_from_summary(summary)
         # Drop detail that duplicates the short summary

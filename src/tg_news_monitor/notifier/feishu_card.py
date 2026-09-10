@@ -20,6 +20,7 @@ from tg_news_monitor.core.models import DigestBrief, DigestItem, NewsEvaluation,
 from tg_news_monitor.notifier.card_format import (
     format_detail_lines,
     is_long_summary,
+    polish_overview_bullet,
     shorten_summary,
 )
 
@@ -446,7 +447,7 @@ class FeishuCardBuilder:
 
         flames = "🔥" * min(5, max(1, (score + 1) // 2))
         time_md = (
-            f"🕒 **频道发布时间** {time_str}（北京时间）\n"
+            f"🕒 **发布时间** {time_str}（北京时间）\n"
             f"🎚️ **紧急** **{urgency_label}** {flames}"
         )
 
@@ -456,25 +457,30 @@ class FeishuCardBuilder:
             bullets_list = [bullets]
         else:
             bullets_list = [str(b).strip() for b in bullets if str(b).strip()]
-        bullets_list = [b.lstrip("•-* ") for b in bullets_list if b]
+        bullets_list = [
+            polish_overview_bullet(b.lstrip("•-* "))
+            for b in bullets_list
+            if b
+        ]
+        bullets_list = [b for b in bullets_list if b]
 
-        # Long summary (>80 chars or >2 lines): short core + 事件详情 from bullets.
-        if is_long_summary(summary):
-            short = shorten_summary(summary)
-            details = bullets_list[:3] if bullets_list else [short]
-            detail_block = format_detail_lines(details)
-            overview_md = f"**📌 核心速览**\n{short}"
-            if detail_block:
-                overview_md += f"\n📌 事件详情\n{detail_block}"
+        # Prefer complete bullets as 核心速览. Long summaries may add 事件详情
+        # only for extra points beyond the first three bullets.
+        if not bullets_list:
+            core = polish_overview_bullet(summary) or "暂无详细摘要要点"
+            overview_md = f"**📌 核心速览**\n{core}"
         else:
-            if not bullets_list:
-                bullets_list = [summary] if summary else ["暂无详细摘要要点"]
-            bullets_list = bullets_list[:4]
-            bullet_icons = ["1️⃣", "2️⃣", "3️⃣", "4️⃣"]
+            show = bullets_list[:3]
+            bullet_icons = ["1️⃣", "2️⃣", "3️⃣"]
             bullets_md = "\n".join(
-                f"{bullet_icons[i]} {b}" for i, b in enumerate(bullets_list)
+                f"{bullet_icons[i]} {b}" for i, b in enumerate(show)
             )
             overview_md = f"**📌 核心速览**\n{bullets_md}"
+            extra = bullets_list[3:6]
+            if is_long_summary(summary) and extra:
+                detail_block = format_detail_lines(extra)
+                if detail_block:
+                    overview_md += f"\n📌 事件详情\n{detail_block}"
 
         allowed_bias = {"利多", "利空", "中性", "不确定"}
         bias_emoji = {

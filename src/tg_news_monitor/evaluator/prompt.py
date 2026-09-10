@@ -164,14 +164,14 @@ DIGEST_SYSTEM_PROMPT = """你是全球新闻编辑，覆盖美股、A股、宏�
 同一事件的相同事实合并，跨语言也合并；对比近期历史，没有新增关键事实不得重复。不同事件不可仅因同主题合并。
 event_at必须是正文所述事件或本次新增事实的时间（带时区ISO8601）；无法确定则null，不得用转发时间伪造事件时间。旧事件的新进展仅描述新事实。
 channel和message_id必须来自输入，不输出来源链接。score为1–10的重要性评分；军事/AI新闻不必有直接股市影响。
-summary用一句话，summary_bullets最多3条事实；影响分析与事实分开。不编造金额、时间或具体买卖指令。
+summary用一句完整话（有主体、动作与结果/现状，勿用省略号结尾）。summary_bullets最多3条，每条须把一件事讲清楚（主体+动作+关键结果或现状），简练但有始有终，禁止以……或...收尾，禁止半截句。影响分析与事实分开。不编造金额、时间或具体买卖指令。
 【四维方向标签】bias_overall / bias_us / bias_cn / bias_commodities 只能是：利多、利空、中性、不确定。
 规则：impact 句子写“支撑/偏多/利好”等→对应 bias 用利多；写“承压/偏空/利空/风险上升”等→用利空；明确无传导→bias 用中性且 impact 写“无直接影响”；方向互相打架或证据不足→才用不确定。禁止把有明确方向的说明标成中性/不确定；四个维度应独立判断，不要默认全中性。
 严格按以下结构输出，items可为空：
 {"headline":"本轮快讯","overview":"","has_material_news":true,"filtered_note":"",
  "items":[{"rank":1,"channel":"wire","message_id":123,"title":"标题","summary":"事实摘要",
  "category":"宏观财经","score":8,"event_at":null,"is_update":false,
- "summary_bullets":["事实"],"actionable_insight":"待观察事项",
+ "summary_bullets":["中国人民银行公布人民币对美元中间价，升至2023年2月以来最强水平。"],"actionable_insight":"待观察事项",
  "bias_overall":"利多","bias_us":"中性","bias_cn":"利多","bias_commodities":"不确定",
  "impact_overall":"总体偏多说明","impact_us":"无直接影响","impact_cn":"对上证情绪构成支撑","impact_commodities":"传导尚不明确"}]}
 items为空时has_material_news必须为false。
@@ -187,7 +187,7 @@ def build_digest_user_prompt(posts: List[TelegramPost], max_text_chars: int = 80
     """Formats a batch of posts into a single user prompt for digest evaluation."""
     lines: List[str] = [
         f"【本轮待汇总 Telegram 快讯】共 {len(posts)} 条，请去噪、精选 0–5 条；"
-        "每条输出 summary_bullets(最多3条)、score、actionable_insight；bias_* 必须为利多/利空/中性/不确定且与 impact_* 方向一致。",
+        "每条输出 summary_bullets(最多3条完整句、禁止省略号结尾)、score、actionable_insight；bias_* 必须为利多/利空/中性/不确定且与 impact_* 方向一致。",
         "",
     ]
     for idx, post in enumerate(posts, start=1):
