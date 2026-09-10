@@ -14,7 +14,7 @@ import json
 import os
 import re
 from pathlib import Path
-from typing import Annotated, Any, Dict, List, Optional, Union
+from typing import Annotated, Any, Dict, List, Mapping, Optional, Union
 
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
 
@@ -44,6 +44,250 @@ except ImportError:
 
 # pydantic-settings JSON-decodes list env vars; keep comma-separated TELEGRAM_CHANNELS as text.
 _ChannelList = Annotated[List[str], NoDecode] if NoDecode is not None else List[str]
+
+DEFAULT_LEGACY_GROUP_ID = "legacy"
+_GROUP_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+
+# Per-group knobs that overlay global Settings when not None.
+GROUP_OVERRIDE_FIELDS = (
+    "quiet_hours",
+    "shoulder_hours",
+    "hotness_threshold",
+    "news_max_age_seconds",
+    "digest_min_candidates",
+    "digest_max_wait_seconds",
+    "digest_min_interval_seconds",
+    "digest_card_interval_seconds",
+    "digest_max_batch_size",
+    "digest_max_calls_per_day",
+    "shoulder_hotness_threshold",
+    "shoulder_digest_min_interval_seconds",
+    "shoulder_digest_min_candidates",
+    "shoulder_digest_card_interval_seconds",
+    "quiet_hotness_threshold",
+    "quiet_digest_min_interval_seconds",
+    "quiet_digest_min_candidates",
+    "quiet_digest_card_interval_seconds",
+    "quiet_alert_interval_seconds",
+    "quiet_card_cap",
+    "morning_flush_enabled",
+    "morning_flush_max_age_seconds",
+    "morning_flush_hotness_threshold",
+    "morning_flush_card_interval_seconds",
+)
+
+
+def normalize_channel_list(value: Any) -> List[str]:
+    """Parses comma-separated channel strings or list of handles, normalizing format."""
+    if value is None:
+        return []
+
+    if isinstance(value, str):
+        value = value.strip()
+        if not value:
+            return []
+        if value.startswith("[") and value.endswith("]"):
+            try:
+                parsed_list = json.loads(value)
+                if isinstance(parsed_list, list):
+                    return [str(ch).lower().lstrip("@").strip() for ch in parsed_list if str(ch).strip()]
+            except Exception:
+                pass
+        parts = [p.strip() for p in value.split(",") if p.strip()]
+        return [p.lower().lstrip("@") for p in parts if p]
+
+    if isinstance(value, (list, tuple, set)):
+        result: List[str] = []
+        for ch in value:
+            if ch:
+                clean = str(ch).lower().lstrip("@").strip()
+                if clean:
+                    result.append(clean)
+        return result
+
+    return [str(value).lower().lstrip("@").strip()]
+
+
+def lookup_env(name: str, env_lookup: Optional[Mapping[str, Any]] = None) -> str:
+    """Resolve an env var by original or lower-case name from a lookup map or os.environ."""
+    key = (name or "").strip()
+    if not key:
+        return ""
+    if env_lookup:
+        if key in env_lookup and env_lookup[key] is not None:
+            return str(env_lookup[key]).strip()
+        low = key.lower()
+        if low in env_lookup and env_lookup[low] is not None:
+            return str(env_lookup[low]).strip()
+    return (os.environ.get(key) or os.environ.get(key.upper()) or "").strip()
+
+
+class CardProfile(BaseModel):
+    """Feishu card + digest prompt flavor for one peer group."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    subtitle: str = Field(default="投资情报快报", description="Card header subtitle")
+    include_investment_impact: bool = Field(
+        default=True,
+        description="Whether to render the four-dimension investment-impact block",
+    )
+    prompt_overlay: Optional[str] = Field(
+        default=None,
+        description="Extra text appended to the digest system prompt",
+    )
+    prompt_variant: Optional[str] = Field(
+        default=None,
+        description="Digest system-prompt variant key: news | story",
+    )
+
+    @field_validator("prompt_variant", mode="before")
+    @classmethod
+    def normalize_prompt_variant(cls, value: Any) -> Optional[str]:
+        if value is None:
+            return None
+        text = str(value).strip().lower()
+        if not text:
+            return None
+        if text not in {"news", "story"}:
+            raise ValueError("card_profile.prompt_variant must be 'news' or 'story'")
+        return text
+
+
+class Group(BaseModel):
+    """Peer-equal Telegram → Feishu pipeline. No group is privileged at runtime."""
+
+    model_config = ConfigDict(extra="ignore", populate_by_name=True)
+
+    id: str = Field(..., description="Stable group id used in logs and SQLite keys")
+    name: str = Field(default="", description="Human-readable label")
+    channels: List[str] = Field(default_factory=list)
+    enabled: bool = Field(default=True)
+
+    webhook_url: Optional[str] = Field(default=None, description="Direct webhook URL (tests / explicit)")
+    webhook_secret: Optional[str] = Field(default=None)
+    webhook_url_env: Optional[str] = Field(default=None, description="Env var name holding the webhook URL")
+    webhook_secret_env: Optional[str] = Field(default=None)
+
+    quiet_hours: Optional[str] = None
+    shoulder_hours: Optional[str] = None
+    hotness_threshold: Optional[int] = Field(default=None, ge=1, le=10)
+    news_max_age_seconds: Optional[int] = Field(default=None, ge=60)
+    digest_min_candidates: Optional[int] = Field(default=None, ge=1)
+    digest_max_wait_seconds: Optional[int] = Field(default=None, ge=0)
+    digest_min_interval_seconds: Optional[int] = Field(default=None, ge=0)
+    digest_card_interval_seconds: Optional[float] = Field(default=None, ge=0)
+    digest_max_batch_size: Optional[int] = Field(default=None, ge=1, le=50)
+    digest_max_calls_per_day: Optional[int] = Field(
+        default=None,
+        ge=1,
+        description="Soft per-group LLM call cap; global DIGEST_MAX_CALLS_PER_DAY is the hard ceiling",
+    )
+    shoulder_hotness_threshold: Optional[int] = Field(default=None, ge=1, le=10)
+    shoulder_digest_min_interval_seconds: Optional[int] = Field(default=None, ge=0)
+    shoulder_digest_min_candidates: Optional[int] = Field(default=None, ge=1)
+    shoulder_digest_card_interval_seconds: Optional[float] = Field(default=None, ge=0)
+    quiet_hotness_threshold: Optional[int] = Field(default=None, ge=1, le=10)
+    quiet_digest_min_interval_seconds: Optional[int] = Field(default=None, ge=0)
+    quiet_digest_min_candidates: Optional[int] = Field(default=None, ge=1)
+    quiet_digest_card_interval_seconds: Optional[float] = Field(default=None, ge=0)
+    quiet_alert_interval_seconds: Optional[int] = Field(default=None, ge=60)
+    quiet_card_cap: Optional[int] = Field(default=None, ge=0)
+    morning_flush_enabled: Optional[bool] = None
+    morning_flush_max_age_seconds: Optional[int] = Field(default=None, ge=60)
+    morning_flush_hotness_threshold: Optional[int] = Field(default=None, ge=1, le=10)
+    morning_flush_card_interval_seconds: Optional[float] = Field(default=None, ge=0)
+    card_profile: Optional[CardProfile] = None
+
+    @field_validator("id")
+    @classmethod
+    def validate_group_id(cls, value: Any) -> str:
+        text = str(value or "").strip()
+        if not _GROUP_ID_RE.match(text):
+            raise ValueError("group id must be 1-64 chars of [A-Za-z0-9_-], starting with alphanumeric")
+        return text
+
+    @field_validator("name", mode="before")
+    @classmethod
+    def normalize_name(cls, value: Any) -> str:
+        return str(value or "").strip()
+
+    @field_validator("channels", mode="before")
+    @classmethod
+    def parse_channels(cls, value: Any) -> List[str]:
+        return normalize_channel_list(value)
+
+    @field_validator("quiet_hours", "shoulder_hours")
+    @classmethod
+    def validate_hour_window(cls, value: Any) -> Optional[str]:
+        if value is None:
+            return None
+        text = str(value).strip()
+        if not text:
+            return None
+        from tg_news_monitor.core.schedule import parse_hour_window
+
+        parse_hour_window(text)
+        return text
+
+    @field_validator("webhook_url", "webhook_secret", "webhook_url_env", "webhook_secret_env", mode="before")
+    @classmethod
+    def empty_str_to_none(cls, value: Any) -> Optional[str]:
+        if value is None:
+            return None
+        text = str(value).strip()
+        return text or None
+
+    def display_name(self) -> str:
+        return self.name or self.id
+
+    def resolved_card_profile(self) -> CardProfile:
+        return self.card_profile or CardProfile()
+
+    def resolve_webhook_url(self, env_lookup: Optional[Mapping[str, Any]] = None) -> str:
+        if self.webhook_url:
+            return self.webhook_url.strip()
+        return lookup_env(self.webhook_url_env or "", env_lookup)
+
+    def resolve_webhook_secret(self, env_lookup: Optional[Mapping[str, Any]] = None) -> Optional[str]:
+        if self.webhook_secret:
+            return self.webhook_secret
+        secret = lookup_env(self.webhook_secret_env or "", env_lookup)
+        return secret or None
+
+    def has_resolvable_webhook(self, env_lookup: Optional[Mapping[str, Any]] = None) -> bool:
+        return bool(self.resolve_webhook_url(env_lookup))
+
+
+class GroupSettingsView:
+    """Settings duck-type with per-group overlays. Used by knobs_for / QuietHours / runner."""
+
+    def __init__(self, settings: "Settings", group: Group) -> None:
+        self._settings = settings
+        self.group = group
+
+    @property
+    def telegram_channels(self) -> List[str]:
+        return list(self.group.channels)
+
+    @property
+    def feishu_webhook_url(self) -> str:
+        return self.group.resolve_webhook_url(getattr(self._settings, "env_lookup", None))
+
+    @property
+    def feishu_webhook_secret(self) -> Optional[str]:
+        return self.group.resolve_webhook_secret(getattr(self._settings, "env_lookup", None))
+
+    @property
+    def feishu_secret(self) -> Optional[str]:
+        return self.feishu_webhook_secret
+
+    def __getattr__(self, name: str) -> Any:
+        if name in GROUP_OVERRIDE_FIELDS:
+            value = getattr(self.group, name, None)
+            if value is not None:
+                return value
+        return getattr(self._settings, name)
 
 
 # ==============================================================================
@@ -219,10 +463,26 @@ class Settings(_BaseClass):
         case_sensitive=False,
     )
 
-    # Monitored Telegram channels
+    # Monitored Telegram channels (legacy single-list; ignored as primary once groups is set)
     telegram_channels: _ChannelList = Field(
         default_factory=list,
         description="Target Telegram channel handles to monitor without @ prefix",
+    )
+
+    # Peer-equal groups. None = not configured (may synthesize a legacy group).
+    # An explicit empty list means "no groups" and does not fall back to TELEGRAM_CHANNELS.
+    groups: Optional[List[Group]] = Field(
+        default=None,
+        description="Peer-equal TG→Feishu pipelines; when set, TELEGRAM_CHANNELS is not primary",
+    )
+    legacy_group_id: str = Field(
+        default=DEFAULT_LEGACY_GROUP_ID,
+        description="Id used when synthesizing a group from TELEGRAM_CHANNELS + FEISHU_WEBHOOK_URL",
+    )
+    env_lookup: Dict[str, str] = Field(
+        default_factory=dict,
+        description="Case-preserving env snapshot for webhook_url_env resolution",
+        exclude=True,
     )
 
     # Polling frequency & jitter
@@ -358,35 +618,43 @@ class Settings(_BaseClass):
     @classmethod
     def parse_telegram_channels(cls, value: Any) -> List[str]:
         """Parses comma-separated channel strings or list of handles, normalizing format."""
+        return normalize_channel_list(value)
+
+    @field_validator("legacy_group_id")
+    @classmethod
+    def validate_legacy_group_id(cls, value: Any) -> str:
+        text = str(value or "").strip() or DEFAULT_LEGACY_GROUP_ID
+        if not _GROUP_ID_RE.match(text):
+            raise ValueError("legacy_group_id must be 1-64 chars of [A-Za-z0-9_-], starting with alphanumeric")
+        return text
+
+    @field_validator("groups", mode="before")
+    @classmethod
+    def parse_groups(cls, value: Any) -> Optional[List[Any]]:
         if value is None:
-            return []
-
+            return None
         if isinstance(value, str):
-            value = value.strip()
-            if not value:
-                return []
-            # Check for JSON-style list string
-            if value.startswith("[") and value.endswith("]"):
-                try:
-                    parsed_list = json.loads(value)
-                    if isinstance(parsed_list, list):
-                        return [str(ch).lower().lstrip("@").strip() for ch in parsed_list if str(ch).strip()]
-                except Exception:
-                    pass
-            # Split comma-separated string
-            parts = [p.strip() for p in value.split(",") if p.strip()]
-            return [p.lower().lstrip("@") for p in parts if p]
+            text = value.strip()
+            if not text:
+                return None
+            try:
+                value = json.loads(text)
+            except Exception as exc:
+                raise ValueError(f"groups must be a YAML/JSON list: {exc}") from exc
+        if isinstance(value, dict):
+            value = [value]
+        if not isinstance(value, list):
+            raise ValueError("groups must be a list of group objects")
+        return value
 
-        if isinstance(value, (list, tuple, set)):
-            result: List[str] = []
-            for ch in value:
-                if ch:
-                    clean = str(ch).lower().lstrip("@").strip()
-                    if clean:
-                        result.append(clean)
-            return result
-
-        return [str(value).lower().lstrip("@").strip()]
+    @field_validator("env_lookup", mode="before")
+    @classmethod
+    def parse_env_lookup(cls, value: Any) -> Dict[str, str]:
+        if not value:
+            return {}
+        if isinstance(value, dict):
+            return {str(k): str(v) for k, v in value.items() if v is not None}
+        return {}
 
     @field_validator("poll_interval_seconds")
     @classmethod
@@ -458,6 +726,70 @@ class Settings(_BaseClass):
             self.feishu_secret = secret
         return self
 
+    @model_validator(mode="after")
+    def finalize_peer_groups(self) -> Settings:
+        """Synthesize a legacy group when groups is unset; validate peer-group invariants."""
+        if self.groups is None:
+            if self.telegram_channels:
+                self.groups = [
+                    Group(
+                        id=self.legacy_group_id,
+                        name=self.legacy_group_id,
+                        channels=list(self.telegram_channels),
+                        webhook_url=self.feishu_webhook_url or None,
+                        webhook_secret=self.feishu_webhook_secret or self.feishu_secret,
+                    )
+                ]
+            else:
+                self.groups = []
+        self._validate_peer_groups()
+        return self
+
+    def _validate_peer_groups(self) -> None:
+        seen_ids: set[str] = set()
+        seen_channels: dict[str, str] = {}
+        for group in self.groups or []:
+            if group.id in seen_ids:
+                raise ValueError(f"duplicate group id: {group.id!r}")
+            seen_ids.add(group.id)
+            for channel in group.channels:
+                owner = seen_channels.get(channel)
+                if owner is not None:
+                    raise ValueError(
+                        f"channel @{channel} is assigned to both group {owner!r} and {group.id!r}; "
+                        "channel membership must be mutually exclusive"
+                    )
+                seen_channels[channel] = group.id
+
+    def enabled_groups(self) -> List[Group]:
+        """Enabled groups that have at least one channel (empty/disabled are skipped)."""
+        return [g for g in (self.groups or []) if g.enabled and g.channels]
+
+    def group_by_id(self, group_id: str) -> Optional[Group]:
+        for group in self.groups or []:
+            if group.id == group_id:
+                return group
+        return None
+
+    def group_settings(self, group: Union[str, Group]) -> GroupSettingsView:
+        if isinstance(group, str):
+            found = self.group_by_id(group)
+            if found is None:
+                raise KeyError(f"unknown group id: {group!r}")
+            group = found
+        return GroupSettingsView(self, group)
+
+    def runtime_validation_errors(self, *, require_webhook: bool = True) -> List[str]:
+        """Startup checks for enabled groups. Tests may skip webhook via require_webhook=False."""
+        errors: List[str] = []
+        for group in self.enabled_groups():
+            if require_webhook and not group.has_resolvable_webhook(self.env_lookup):
+                errors.append(
+                    f"group {group.id!r} has channels but no resolvable webhook "
+                    f"(set webhook_url or webhook_url_env)"
+                )
+        return errors
+
     # --------------------------------------------------------------------------
     # DeepSeek LLM Accessors & Backward Compatibility Aliases
     # --------------------------------------------------------------------------
@@ -516,6 +848,14 @@ class Settings(_BaseClass):
         5. Model defaults
         """
         merged_values: Dict[str, Any] = {}
+        env_lookup: Dict[str, str] = {}
+
+        def _remember_env(key: str, value: Any) -> None:
+            if value is None:
+                return
+            text = str(value)
+            env_lookup[key] = text
+            env_lookup[key.lower()] = text
 
         # 1. Load from YAML / JSON config file if present
         target_config = config_path or os.environ.get("CONFIG_PATH") or os.environ.get("CONFIG_FILE")
@@ -537,15 +877,20 @@ class Settings(_BaseClass):
             env_file_vals = parse_dotenv_file(target_env)
             for k, v in env_file_vals.items():
                 merged_values[k.lower()] = v
+                _remember_env(k, v)
 
         # 3. Load from OS environment variables (case-insensitive)
         for env_k, env_v in os.environ.items():
             merged_values[env_k.lower()] = env_v
+            _remember_env(env_k, env_v)
 
         # 4. Apply explicit constructor / function arguments (highest precedence)
         for arg_k, arg_v in override_kwargs.items():
             if arg_v is not None:
                 merged_values[arg_k.lower()] = arg_v
+
+        if "env_lookup" not in override_kwargs:
+            merged_values["env_lookup"] = env_lookup
 
         return cls(**merged_values)
 

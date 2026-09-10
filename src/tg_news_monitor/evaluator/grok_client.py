@@ -350,7 +350,10 @@ class GrokClient:
             # DeepSeek non-thinking mode (ignored by providers that do not support it)
             "thinking": {"type": "disabled"},
             "messages": [
-                {"role": "system", "content": build_digest_system_prompt() + "\n" + getattr(self, "digest_context", "")},
+                {"role": "system", "content": build_digest_system_prompt(
+                    variant=getattr(self, "prompt_variant", None),
+                    overlay=getattr(self, "prompt_overlay", None),
+                ) + "\n" + getattr(self, "digest_context", "")},
                 {"role": "user", "content": build_digest_user_prompt(posts) + "\n当前UTC时间：" + datetime.now(timezone.utc).isoformat() + "\n过去24小时最近已推送或投递状态待核实的事件（无新事实则勿重复）：\n" + getattr(self, "recent_history", "")},
             ],
         }

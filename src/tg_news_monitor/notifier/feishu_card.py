@@ -404,6 +404,7 @@ class FeishuCardBuilder:
         item: DigestItem,
         published_at: Optional[datetime] = None,
         subtitle: str = "投资情报快报",
+        include_investment_impact: bool = True,
     ) -> Dict[str, Any]:
         """Build Schema 2.0 single-item card. No Telegram/links/buttons/italics.
 
@@ -544,15 +545,20 @@ class FeishuCardBuilder:
             {"tag": "hr"},
             _md_div(overview_md),
             {"tag": "hr"},
-            _md_div("**💹 投资影响**"),
-            # Match reference card: emoji + 两字标签 | 圆点方向 | 说明（上证替换 A股）
-            _impact_row("🌐 整体", "bias_overall", "impact_overall"),
-            _impact_row("📈 美股", "bias_us", "impact_us"),
-            _impact_row("📊 上证", "bias_cn", "impact_cn"),
-            _impact_row("🛢️ 大宗", "bias_commodities", "impact_commodities"),
-            {"tag": "hr"},
-            _md_div(insight_md),
         ]
+        if include_investment_impact:
+            elements.extend(
+                [
+                    _md_div("**💹 投资影响**"),
+                    # Match reference card: emoji + 两字标签 | 圆点方向 | 说明（上证替换 A股）
+                    _impact_row("🌐 整体", "bias_overall", "impact_overall"),
+                    _impact_row("📈 美股", "bias_us", "impact_us"),
+                    _impact_row("📊 上证", "bias_cn", "impact_cn"),
+                    _impact_row("🛢️ 大宗", "bias_commodities", "impact_commodities"),
+                    {"tag": "hr"},
+                ]
+            )
+        elements.append(_md_div(insight_md))
 
         card_schema_2 = {
             "schema": "2.0",

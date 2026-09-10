@@ -108,6 +108,58 @@ python -m tg_news_monitor.main
 
 优先级：显式程序参数 → OS/容器环境变量 → `.env` → YAML/JSON → 代码默认值。更新代码不会覆盖旧环境变量或自动采用推荐参数。
 
+### 对等 Group（多组）
+
+多个 Group **彼此对等**，没有运行时特权「默认组」。每个 Group 是独立的公开频道采集 → 评估 → 飞书投递管道，有自己的频道列表和飞书 webhook。单进程 / 单容器按 tick 依次处理各组，**一次 LLM 调用不会混入其他组的帖子**。
+
+频道在各组之间互斥：同一频道不能出现在两个 Group（含 disabled）。启动时校验：Group `id` 唯一、启用且非空的 Group 必须能解析 webhook、全局频道不重复。
+
+推荐把组写在 `config.yaml`（见 [config.yaml.example](config.yaml.example)），webhook 用环境变量名引用，避免把密钥写进 YAML：
+
+```yaml
+groups:
+  - id: news24
+    name: 7x24 新闻
+    channels: [zaobaosg, cnalatest, solidot]
+    webhook_url_env: FEISHU_WEBHOOK_NEWS24
+    webhook_secret_env: FEISHU_WEBHOOK_SECRET_NEWS24
+    # 可选覆盖（未写则沿用全局 DIGEST_* / QUIET_* / HOTNESS_*）
+    hotness_threshold: 7
+    digest_min_candidates: 12
+    digest_max_calls_per_day: 120   # 本组软上限；全局 DIGEST_MAX_CALLS_PER_DAY 仍是硬顶
+    card_profile:
+      subtitle: 投资情报快报
+      include_investment_impact: true
+      prompt_variant: news          # news | story
+      # prompt_overlay: "额外系统提示"
+  - id: xhs_hot
+    name: 小红书热点（示例，先空着）
+    enabled: false
+    channels: []
+    webhook_url_env: FEISHU_WEBHOOK_XHS
+    card_profile:
+      subtitle: 故事速览
+      include_investment_impact: false
+      prompt_variant: story
+```
+
+`.env` 里只放密钥和全局 DeepSeek 设置：
+
+```dotenv
+FEISHU_WEBHOOK_NEWS24=https://open.feishu.cn/open-apis/bot/v2/hook/...
+FEISHU_WEBHOOK_SECRET_NEWS24=
+# FEISHU_WEBHOOK_XHS=
+DEEPSEEK_API_KEY=...
+```
+
+**从 `TELEGRAM_CHANNELS` 迁移：** 若配置里**没有** `groups` 字段，但存在旧的 `TELEGRAM_CHANNELS` + `FEISHU_WEBHOOK_URL`，启动时会合成一个对等 Group（默认 `id: legacy`，可用 `legacy_group_id` 改名）。这不是运行时特权默认组，只是兼容现有部署。一旦 YAML/配置里出现 `groups`，就不再把旧的单一频道列表当主数据源。升级后已有 SQLite 行会标上该 legacy id；若希望旧 pending/认领接到 `news24`，把该组 `id` 设为 `legacy`，或设 `legacy_group_id: news24` 后再迁库。
+
+可选 per-group 覆盖（现在就生效，不是后期）：`quiet_hours` / `shoulder_hours`、各档 `hotness_threshold`、digest 门槛/间隔/卡片间隔、`quiet_card_cap`、晨报开关与门槛、`digest_max_calls_per_day`（软）、`card_profile`、`enabled`。空频道或 `enabled: false` 的组会被跳过。
+
+存储与去重按 `group_id` 隔离：帖子唯一键为 `(group_id, channel, message_id)`，投递指纹与晨报/静默认领也按组分开。同一正文可以分别推到两个组的 webhook。日志带 `group=<id>`。
+
+Docker 若使用 `config.yaml`，把它挂进容器并设置 `CONFIG_PATH`，例如 `./config.yaml:/app/config.yaml:ro`。
+
 | 变量 | 代码默认 | 均衡建议 | 说明 |
 |---|---:|---:|---|
 | `POLL_INTERVAL_SECONDS` | 60 | 60 | 采集周期，秒，不等于模型周期 |
@@ -161,7 +213,7 @@ docker compose down
 
 Compose挂载 `./data:/app/data`，数据库为 `/app/data/tg_news.db`。现有配置使用 `network_mode: host`，请根据部署平台和网络调整，不是所有环境都需要主机网络。
 
-升级前停止旧实例并一致性备份数据库及配置，再更新代码、合并参数、重建镜像。新增 `digest_calls`、`delivery_claims` 、`alert_schedule_state`、`night_candidates`、`morning_reports` 和 `night_alerts` 表在runner启动时自动创建。不要删库重置预算、去重和夜间卡片计数。
+升级前停止旧实例并一致性备份数据库及配置，再更新代码、合并参数、重建镜像。新增 `digest_calls`、`delivery_claims` 、`alert_schedule_state`、`night_candidates`、`morning_reports` 和 `night_alerts` 表在runner启动时自动创建。多组升级会给上述表和 `posts` 补上 `group_id`（旧行标为 `legacy` 或 `legacy_group_id`）。不要删库重置预算、去重和夜间卡片计数。
 
 新投递历史从升级后记录，不自动迁移旧版已发送摘要；原消息ID去重保留。当前建议单实例运行。回滚旧代码后新保护不再生效。容器健康检查仅检查CLI能运行，不能证明采集、模型或推送正常。
 

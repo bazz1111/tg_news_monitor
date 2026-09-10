@@ -4,34 +4,45 @@ import json
 from datetime import datetime, timezone
 from typing import List, Optional, Sequence, Union, overload
 
+from tg_news_monitor.config import DEFAULT_LEGACY_GROUP_ID
 from tg_news_monitor.core.models import TelegramPost
-from tg_news_monitor.storage.database import db_session, get_connection, init_db
+from tg_news_monitor.storage.database import db_session, init_db, safe_group_id
 
 
 class PostRepository:
     """Thread-safe SQLite repository managing deduplication and post lifecycle."""
 
-    def __init__(self, db_path: str = ":memory:"):
+    def __init__(self, db_path: str = ":memory:", default_group_id: str = DEFAULT_LEGACY_GROUP_ID):
         self.db_path = db_path
-        init_db(self.db_path)
+        self.default_group_id = safe_group_id(default_group_id)
+        init_db(self.db_path, default_group_id=self.default_group_id)
 
     @staticmethod
     def _normalize_channel(channel: str) -> str:
         return channel.lower().lstrip("@")
 
-    def is_processed(self, channel: str, message_id: int) -> bool:
-        """Returns True if the (channel, message_id) post has already been recorded."""
+    def _gid(self, group_id: Optional[str] = None, post: Optional[TelegramPost] = None) -> str:
+        if group_id:
+            return safe_group_id(group_id)
+        if post is not None and getattr(post, "group_id", None):
+            return safe_group_id(post.group_id)
+        return self.default_group_id
+
+    def is_processed(self, channel: str, message_id: int, group_id: Optional[str] = None) -> bool:
+        """Returns True if the (group_id, channel, message_id) post has already been recorded."""
         channel_norm = self._normalize_channel(channel)
+        gid = self._gid(group_id)
         with db_session(self.db_path) as conn:
             cursor = conn.execute(
-                "SELECT 1 FROM posts WHERE channel = ? AND message_id = ? LIMIT 1",
-                (channel_norm, message_id),
+                "SELECT 1 FROM posts WHERE group_id = ? AND channel = ? AND message_id = ? LIMIT 1",
+                (gid, channel_norm, message_id),
             )
             return cursor.fetchone() is not None
 
-    def save_post(self, post: TelegramPost) -> bool:
+    def save_post(self, post: TelegramPost, group_id: Optional[str] = None) -> bool:
         """Saves a post to the database. Returns True if inserted, False if duplicate."""
         channel_norm = self._normalize_channel(post.channel)
+        gid = self._gid(group_id, post)
         scraped_at = datetime.now(timezone.utc).isoformat()
         media_urls_json = json.dumps(post.media_urls)
 
@@ -40,12 +51,13 @@ class PostRepository:
                 conn.execute(
                     """
                     INSERT INTO posts (
-                        channel, message_id, published_at, scraped_at, text,
+                        group_id, channel, message_id, published_at, scraped_at, text,
                         has_media, media_type, media_urls, direct_url, forward_from,
                         views, alert_sent
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
                     """,
                     (
+                        gid,
                         channel_norm,
                         post.message_id,
                         post.published_at.isoformat(),
@@ -61,12 +73,15 @@ class PostRepository:
                 )
                 return True
             except Exception as e:
-                # Catch sqlite3.IntegrityError for UNIQUE constraint violations
                 if "UNIQUE constraint failed" in str(e):
                     return False
                 raise
 
-    def save_posts(self, posts: Sequence[TelegramPost]) -> List[TelegramPost]:
+    def save_posts(
+        self,
+        posts: Sequence[TelegramPost],
+        group_id: Optional[str] = None,
+    ) -> List[TelegramPost]:
         """Batch-saves posts in a single transaction, returning the list of newly inserted posts."""
         if not posts:
             return []
@@ -77,17 +92,19 @@ class PostRepository:
         with db_session(self.db_path) as conn:
             for post in posts:
                 channel_norm = self._normalize_channel(post.channel)
+                gid = self._gid(group_id, post)
                 media_urls_json = json.dumps(post.media_urls)
                 try:
                     conn.execute(
                         """
                         INSERT INTO posts (
-                            channel, message_id, published_at, scraped_at, text,
+                            group_id, channel, message_id, published_at, scraped_at, text,
                             has_media, media_type, media_urls, direct_url, forward_from,
                             views, alert_sent
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
                         """,
                         (
+                            gid,
                             channel_norm,
                             post.message_id,
                             post.published_at.isoformat(),
@@ -121,6 +138,7 @@ class PostRepository:
         self,
         channel_or_posts: Union[str, Sequence[TelegramPost]],
         posts: Optional[Sequence[TelegramPost]] = None,
+        group_id: Optional[str] = None,
     ) -> List[TelegramPost]:
         """Filters a sequence of posts, returning only those not yet present in SQLite."""
         if isinstance(channel_or_posts, str):
@@ -131,19 +149,22 @@ class PostRepository:
         if not target_posts:
             return []
 
-        # Group by channel for efficient queries
-        by_channel: dict[str, list[TelegramPost]] = {}
+        by_key: dict[tuple[str, str], list[TelegramPost]] = {}
         for p in target_posts:
             c = self._normalize_channel(p.channel)
-            by_channel.setdefault(c, []).append(p)
+            gid = self._gid(group_id, p)
+            by_key.setdefault((gid, c), []).append(p)
 
         unprocessed: List[TelegramPost] = []
         with db_session(self.db_path) as conn:
-            for ch, p_list in by_channel.items():
+            for (gid, ch), p_list in by_key.items():
                 ids = [p.message_id for p in p_list]
                 placeholders = ",".join("?" for _ in ids)
-                query = f"SELECT message_id FROM posts WHERE channel = ? AND message_id IN ({placeholders})"
-                cursor = conn.execute(query, [ch] + ids)
+                query = (
+                    f"SELECT message_id FROM posts "
+                    f"WHERE group_id = ? AND channel = ? AND message_id IN ({placeholders})"
+                )
+                cursor = conn.execute(query, [gid, ch] + ids)
                 existing_ids = {row["message_id"] for row in cursor.fetchall()}
                 for p in p_list:
                     if p.message_id not in existing_ids:
@@ -161,9 +182,11 @@ class PostRepository:
         is_filtered: bool = False,
         filter_reason: Optional[str] = None,
         key_takeaways: Optional[List[str]] = None,
+        group_id: Optional[str] = None,
     ) -> None:
         """Updates Grok evaluation scores and summary bullets."""
         channel_norm = self._normalize_channel(channel)
+        gid = self._gid(group_id)
         now_iso = datetime.now(timezone.utc).isoformat()
         takeaways_json = json.dumps(key_takeaways or [])
 
@@ -179,7 +202,7 @@ class PostRepository:
                     key_takeaways = ?,
                     evaluated_at = ?,
                     updated_at = ?
-                WHERE channel = ? AND message_id = ?
+                WHERE group_id = ? AND channel = ? AND message_id = ?
                 """,
                 (
                     score,
@@ -190,6 +213,7 @@ class PostRepository:
                     takeaways_json,
                     now_iso,
                     now_iso,
+                    gid,
                     channel_norm,
                     message_id,
                 ),
@@ -201,9 +225,11 @@ class PostRepository:
         message_id: int,
         score: Optional[int] = None,
         summary: Optional[str] = None,
+        group_id: Optional[str] = None,
     ) -> None:
         """Marks that an interactive card alert has been dispatched to Feishu."""
         channel_norm = self._normalize_channel(channel)
+        gid = self._gid(group_id)
         now_iso = datetime.now(timezone.utc).isoformat()
 
         with db_session(self.db_path) as conn:
@@ -216,9 +242,9 @@ class PostRepository:
                         score = COALESCE(?, score),
                         summary = COALESCE(?, summary),
                         updated_at = ?
-                    WHERE channel = ? AND message_id = ?
+                    WHERE group_id = ? AND channel = ? AND message_id = ?
                     """,
-                    (now_iso, score, summary, now_iso, channel_norm, message_id),
+                    (now_iso, score, summary, now_iso, gid, channel_norm, message_id),
                 )
             else:
                 conn.execute(
@@ -227,9 +253,9 @@ class PostRepository:
                         alert_sent = 1,
                         alert_sent_at = ?,
                         updated_at = ?
-                    WHERE channel = ? AND message_id = ?
+                    WHERE group_id = ? AND channel = ? AND message_id = ?
                     """,
-                    (now_iso, now_iso, channel_norm, message_id),
+                    (now_iso, now_iso, gid, channel_norm, message_id),
                 )
 
     def mark_alert_failed(
@@ -238,9 +264,11 @@ class PostRepository:
         message_id: int,
         error_msg: str,
         permanent: bool = False,
+        group_id: Optional[str] = None,
     ) -> None:
         """Marks alert dispatch failure."""
         channel_norm = self._normalize_channel(channel)
+        gid = self._gid(group_id)
         status = -1 if permanent else 0
         now_iso = datetime.now(timezone.utc).isoformat()
 
@@ -252,29 +280,45 @@ class PostRepository:
                     alert_error = ?,
                     retry_count = retry_count + 1,
                     updated_at = ?
-                WHERE channel = ? AND message_id = ?
+                WHERE group_id = ? AND channel = ? AND message_id = ?
                 """,
-                (status, error_msg, now_iso, channel_norm, message_id),
+                (status, error_msg, now_iso, gid, channel_norm, message_id),
             )
 
-    def get_post(self, channel: str, message_id: int) -> Optional[dict]:
+    def get_post(
+        self,
+        channel: str,
+        message_id: int,
+        group_id: Optional[str] = None,
+    ) -> Optional[dict]:
         """Retrieves a single post record as a dict, or None if not found."""
         channel_norm = self._normalize_channel(channel)
+        gid = self._gid(group_id)
         with db_session(self.db_path) as conn:
             cursor = conn.execute(
-                "SELECT * FROM posts WHERE channel = ? AND message_id = ? LIMIT 1",
-                (channel_norm, message_id),
+                "SELECT * FROM posts WHERE group_id = ? AND channel = ? AND message_id = ? LIMIT 1",
+                (gid, channel_norm, message_id),
             )
             row = cursor.fetchone()
             return dict(row) if row else None
 
-    def count_posts(self, channel: Optional[str] = None) -> int:
+    def count_posts(self, channel: Optional[str] = None, group_id: Optional[str] = None) -> int:
         """Returns the total number of posts stored."""
         with db_session(self.db_path) as conn:
-            if channel:
+            if channel and group_id:
+                cursor = conn.execute(
+                    "SELECT COUNT(*) AS c FROM posts WHERE group_id = ? AND channel = ?",
+                    (self._gid(group_id), self._normalize_channel(channel)),
+                )
+            elif channel:
                 cursor = conn.execute(
                     "SELECT COUNT(*) AS c FROM posts WHERE channel = ?",
                     (self._normalize_channel(channel),),
+                )
+            elif group_id:
+                cursor = conn.execute(
+                    "SELECT COUNT(*) AS c FROM posts WHERE group_id = ?",
+                    (self._gid(group_id),),
                 )
             else:
                 cursor = conn.execute("SELECT COUNT(*) AS c FROM posts")
@@ -304,6 +348,9 @@ class PostRepository:
         published_at = self._parse_iso_dt(
             row["published_at"] if "published_at" in row.keys() else None
         )
+        group_id = None
+        if "group_id" in row.keys() and row["group_id"]:
+            group_id = str(row["group_id"])
         return TelegramPost(
             channel=str(row["channel"]),
             message_id=int(row["message_id"]),
@@ -316,18 +363,29 @@ class PostRepository:
             forward_from=row["forward_from"] if "forward_from" in row.keys() else None,
             media_urls=media_urls,
             views=row["views"] if "views" in row.keys() else None,
+            group_id=group_id,
         )
 
-    def list_pending_with_scraped_at(self) -> List[tuple]:
+    def list_pending_with_scraped_at(self, group_id: Optional[str] = None) -> List[tuple]:
         """Return unevaluated posts as (TelegramPost, scraped_at) ordered by scraped_at ASC."""
         with db_session(self.db_path) as conn:
-            cursor = conn.execute(
-                """
-                SELECT * FROM posts
-                WHERE evaluated_at IS NULL
-                ORDER BY scraped_at ASC, message_id ASC
-                """
-            )
+            if group_id:
+                cursor = conn.execute(
+                    """
+                    SELECT * FROM posts
+                    WHERE evaluated_at IS NULL AND group_id = ?
+                    ORDER BY scraped_at ASC, message_id ASC
+                    """,
+                    (self._gid(group_id),),
+                )
+            else:
+                cursor = conn.execute(
+                    """
+                    SELECT * FROM posts
+                    WHERE evaluated_at IS NULL
+                    ORDER BY scraped_at ASC, message_id ASC
+                    """
+                )
             rows = cursor.fetchall()
 
         result: List[tuple] = []
@@ -339,10 +397,9 @@ class PostRepository:
             result.append((post, scraped_at))
         return result
 
-    def list_pending_posts(self) -> List[TelegramPost]:
+    def list_pending_posts(self, group_id: Optional[str] = None) -> List[TelegramPost]:
         """Return all posts with evaluated_at IS NULL as TelegramPost models."""
-        return [post for post, _ in self.list_pending_with_scraped_at()]
-
+        return [post for post, _ in self.list_pending_with_scraped_at(group_id=group_id)]
 
     def update_channel_state(
         self,
@@ -351,19 +408,21 @@ class PostRepository:
         success: bool = True,
         error: Optional[str] = None,
         messages_seen: int = 0,
+        group_id: Optional[str] = None,
     ) -> None:
         """Updates channel polling status and metrics."""
         channel_norm = self._normalize_channel(channel)
+        gid = self._gid(group_id)
         now_iso = datetime.now(timezone.utc).isoformat()
 
         with db_session(self.db_path) as conn:
             conn.execute(
                 """
                 INSERT INTO channel_state (
-                    channel, last_message_id, last_polled_at, last_success_at,
+                    group_id, channel, last_message_id, last_polled_at, last_success_at,
                     consecutive_errors, last_error, total_messages_seen, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(channel) DO UPDATE SET
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(group_id, channel) DO UPDATE SET
                     last_message_id = CASE WHEN ? > last_message_id THEN ? ELSE last_message_id END,
                     last_polled_at = ?,
                     last_success_at = CASE WHEN ? THEN ? ELSE last_success_at END,
@@ -373,6 +432,7 @@ class PostRepository:
                     updated_at = ?
                 """,
                 (
+                    gid,
                     channel_norm,
                     last_message_id,
                     now_iso,
@@ -381,7 +441,6 @@ class PostRepository:
                     error,
                     messages_seen,
                     now_iso,
-                    # ON CONFLICT params
                     last_message_id,
                     last_message_id,
                     now_iso,

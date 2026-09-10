@@ -1,13 +1,54 @@
 # ==============================================================================
 # Telegram News Monitor - YAML Configuration Alternative Template
 # Copy this file to config.yaml and configure your settings.
+# Do not put real webhook URLs or API keys in a committed file.
 # ==============================================================================
 
-# Target Telegram channel handles (without @ prefix)
-telegram_channels:
-  - durov
-  - telegram
-  - whale_alert
+# Peer-equal groups. Once `groups` is present it is the primary source;
+# TELEGRAM_CHANNELS is not used as the runtime channel list.
+groups:
+  - id: news24
+    name: 7x24 新闻
+    enabled: true
+    channels:
+      - zaobaosg
+      - cnalatest
+      - solidot
+    webhook_url_env: FEISHU_WEBHOOK_NEWS24
+    webhook_secret_env: FEISHU_WEBHOOK_SECRET_NEWS24
+    # Optional per-group overlays (omit to inherit global knobs below)
+    # quiet_hours: "00:00-08:00"
+    # shoulder_hours: "22:00-00:00"
+    # hotness_threshold: 7
+    # digest_min_candidates: 12
+    # digest_max_wait_seconds: 600
+    # digest_min_interval_seconds: 180
+    # digest_card_interval_seconds: 10
+    # quiet_card_cap: 5
+    # morning_flush_enabled: true
+    # morning_flush_hotness_threshold: 7
+    # digest_max_calls_per_day: 120
+    card_profile:
+      subtitle: 投资情报快报
+      include_investment_impact: true
+      prompt_variant: news
+      # prompt_overlay: "额外评估约束（追加到 digest system prompt）"
+
+  # Example second pipeline — leave disabled/empty until channels exist.
+  - id: xhs_hot
+    name: 小红书热点（示例）
+    enabled: false
+    channels: []
+    webhook_url_env: FEISHU_WEBHOOK_XHS
+    webhook_secret_env: FEISHU_WEBHOOK_SECRET_XHS
+    card_profile:
+      subtitle: 故事速览
+      include_investment_impact: false
+      prompt_variant: story
+
+# Id used when synthesizing a group from TELEGRAM_CHANNELS + FEISHU_WEBHOOK_URL
+# (only if this file has no `groups` key). Also used when migrating old SQLite rows.
+# legacy_group_id: legacy
 
 # Ingestion Polling Interval & Timing Defenses
 poll_interval_seconds: 60
@@ -15,32 +56,26 @@ max_jitter_seconds: 15
 inter_channel_delay_seconds: 2.0
 
 # DeepSeek LLM Evaluator (https://platform.deepseek.com/)
-deepseek_api_key: "sk-your-deepseek-api-key-here"
+# Prefer DEEPSEEK_* in .env over committing keys here.
 deepseek_api_base: "https://api.deepseek.com"
 deepseek_model: "deepseek-chat"
 
-# Severity / Hotness Gating Threshold (1 to 10 scale)
-# 9-10: Red tier (Disaster, extreme exploit, critical regulatory)
-# 7-8:  Orange tier (Major breaking event, institutional move)
-# 5-6:  Blue tier (Routine industry announcement)
-# 1-4:  Grey tier (Filtered chatter, noise, or promotions)
+# Global defaults (groups inherit unless they override)
 hotness_threshold: 7
-
-# Elastic quiet hours (Asia/Shanghai). Empty quiet_hours/shoulder_hours disables a window.
 timezone: Asia/Shanghai
 shoulder_hours: "22:00-00:00"
 quiet_hours: "00:00-08:00"
 quiet_alert_interval_seconds: 1800
 quiet_card_cap: 5
-
-# Feishu (Lark) Custom Bot Webhook Dispatcher
-feishu_webhook_url: "https://open.feishu.cn/open-apis/bot/v2/hook/your-bot-uuid-here"
-feishu_webhook_secret: ""
+digest_max_calls_per_day: 288
 
 # Persistent Storage & Runtime Logging
 db_path: "data/tg_news.db"
 log_level: "INFO"
 
-# Optional Proxy Configuration
-# http_proxy: "http://127.0.0.1:7890"
-# https_proxy: "http://127.0.0.1:7890"
+# --- Legacy single-list (used only when `groups` is omitted) ---
+# telegram_channels:
+#   - durov
+#   - telegram
+# feishu_webhook_url: ""
+# feishu_webhook_secret: ""
