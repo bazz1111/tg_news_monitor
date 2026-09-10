@@ -65,6 +65,7 @@ def _item(
     title: str = "弄堂石库门",
     summary: str = "上海石库门弄堂里晾着衣裳，行人从砖墙下走过。",
     score: int = 8,
+    category: str = "历史影像",
     event_at: datetime | None = None,
     media_urls: list[str] | None = None,
 ) -> DigestItem:
@@ -74,7 +75,7 @@ def _item(
         message_id=message_id,
         title=title,
         summary=summary,
-        category="历史影像",
+        category=category,
         score=score,
         event_at=event_at,
         impact_overall="无直接影响",
@@ -205,7 +206,13 @@ class TestWechatCard:
         assert "Telegram" not in blob
 
     def test_news_card_still_has_investment_and_time(self):
-        item = _item()
+        item = _item(
+            channel="wire",
+            title="央行紧急降息",
+            summary="央行宣布紧急降息以稳定经济。",
+            score=9,
+            category="宏观财经",
+        )
         news = FeishuCardBuilder.build_digest_item_card(item, include_investment_impact=True)
         blob = str(news)
         assert "💹 投资影响" in blob
@@ -317,13 +324,15 @@ class TestWechatRunnerIsolation:
                 ev = p.published_at
                 if event_at_offset is not None:
                     ev = p.published_at + event_at_offset
+                is_news = str(p.channel).lower().lstrip("@") == "wire"
                 items.append(
                     _item(
                         channel=p.channel,
                         message_id=p.message_id,
                         title=p.text[:16],
                         summary=p.text if p.text.endswith("。") else p.text + "。",
-                        score=score,
+                        score=9 if is_news else score,
+                        category="宏观财经" if is_news else "历史影像",
                         event_at=ev,
                         media_urls=list(p.media_urls or []),
                     )

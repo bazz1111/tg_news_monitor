@@ -78,6 +78,28 @@ def get_header_icon(score: int) -> str:
     return HEADER_ICON_MAP.get(template, "info_outlined")
 
 
+# 5 flames ⟺ min(5, max(1, (score + 1) // 2)) == 5 ⟺ score >= 9
+INVESTMENT_IMPACT_MIN_SCORE = 9
+INVESTMENT_IMPACT_CATEGORIES = frozenset({"军事", "地缘政治", "宏观财经"})
+
+
+def should_show_investment_impact(
+    score: Any,
+    category: Any,
+    include_flag: bool,
+) -> bool:
+    """Show「💹 投资影响」only when flag, 5-flame urgency, and whitelist category all hold."""
+    if not include_flag:
+        return False
+    try:
+        normalized = int(score)
+    except (TypeError, ValueError):
+        return False
+    if normalized < INVESTMENT_IMPACT_MIN_SCORE:
+        return False
+    return str(category or "").strip() in INVESTMENT_IMPACT_CATEGORIES
+
+
 # ==============================================================================
 # Feishu Card Builder Class & Helper Functions
 # ==============================================================================
@@ -551,7 +573,7 @@ class FeishuCardBuilder:
             _md_div(overview_md),
             {"tag": "hr"},
         ]
-        if include_investment_impact:
+        if should_show_investment_impact(score, category, include_investment_impact):
             elements.extend(
                 [
                     _md_div("**💹 投资影响**"),
