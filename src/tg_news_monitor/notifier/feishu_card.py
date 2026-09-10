@@ -17,6 +17,11 @@ from typing import Any, Dict, List, Optional, Union
 from datetime import timedelta
 
 from tg_news_monitor.core.models import DigestBrief, DigestItem, NewsEvaluation, TelegramPost
+from tg_news_monitor.notifier.card_format import (
+    format_detail_lines,
+    is_long_summary,
+    shorten_summary,
+)
 
 
 # ==============================================================================
@@ -445,20 +450,31 @@ class FeishuCardBuilder:
             f"🎚️ **紧急** **{urgency_label}** {flames}"
         )
 
+        summary = (getattr(item, "summary", None) or "").strip()
         bullets = getattr(item, "summary_bullets", None) or []
         if isinstance(bullets, str):
             bullets_list = [bullets]
         else:
             bullets_list = [str(b).strip() for b in bullets if str(b).strip()]
-        if not bullets_list:
-            summary = (getattr(item, "summary", None) or "").strip()
-            bullets_list = [summary] if summary else ["暂无详细摘要要点"]
-        bullets_list = bullets_list[:4]
-        bullet_icons = ["1️⃣", "2️⃣", "3️⃣", "4️⃣"]
-        bullets_md = "\n".join(
-            f"{bullet_icons[i]} {b.lstrip('•-* ')}" for i, b in enumerate(bullets_list)
-        )
-        overview_md = f"**📌 核心速览**\n{bullets_md}"
+        bullets_list = [b.lstrip("•-* ") for b in bullets_list if b]
+
+        # Long summary (>80 chars or >2 lines): short core + 事件详情 from bullets.
+        if is_long_summary(summary):
+            short = shorten_summary(summary)
+            details = bullets_list[:3] if bullets_list else [short]
+            detail_block = format_detail_lines(details)
+            overview_md = f"**📌 核心速览**\n{short}"
+            if detail_block:
+                overview_md += f"\n📌 事件详情\n{detail_block}"
+        else:
+            if not bullets_list:
+                bullets_list = [summary] if summary else ["暂无详细摘要要点"]
+            bullets_list = bullets_list[:4]
+            bullet_icons = ["1️⃣", "2️⃣", "3️⃣", "4️⃣"]
+            bullets_md = "\n".join(
+                f"{bullet_icons[i]} {b}" for i, b in enumerate(bullets_list)
+            )
+            overview_md = f"**📌 核心速览**\n{bullets_md}"
 
         allowed_bias = {"利多", "利空", "中性", "不确定"}
         bias_emoji = {

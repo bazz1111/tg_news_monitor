@@ -38,6 +38,7 @@ from tg_news_monitor.core.filters import (
 from tg_news_monitor.core.models import DigestBrief, DigestItem, NewsEvaluation, TelegramPost
 from tg_news_monitor.evaluator.grok_client import GrokClient
 from tg_news_monitor.notifier.feishu_card import FeishuCardBuilder
+from tg_news_monitor.notifier.card_format import format_event_time_footer, format_morning_item_md
 from tg_news_monitor.notifier.webhook_sender import FeishuWebhookSender
 from tg_news_monitor.scraper.client import TelegramScraperClient
 from tg_news_monitor.scraper.parser import TelegramWebParser
@@ -347,9 +348,12 @@ class NewsMonitorRunner:
             published_at=published_at,
             subtitle="投资情报快报",
         )
+        event_label = (
+            item.event_at.isoformat() if item.event_at else "未确认"
+        )
         payload["card"]["body"]["elements"].append({
             "tag": "markdown",
-            "content": f"[频道原文](https://t.me/{item.channel.lstrip('@')}/{item.message_id}) · 事件时间：{item.event_at.isoformat() if item.event_at else '未确认'} · 模型解读需核实",
+            "content": format_event_time_footer(event_label),
         })
         if hasattr(self.webhook_sender, "send"):
             return bool(self.webhook_sender.send(payload))
@@ -436,7 +440,10 @@ class NewsMonitorRunner:
         for index, item in enumerate(items[:5], 1):
             post = allowed[(item.channel.lower().lstrip('@'), item.message_id)]
             event_time = item.event_at.astimezone(BEIJING).strftime('%H:%M')
-            elements.append({'tag': 'markdown', 'content': f'**{index}. {item.title}**\n{item.summary}\n关注：{item.impact_overall}\n事件时间：{event_time}（北京时间） · [原文](https://t.me/{post.channel}/{post.message_id})'})
+            elements.append({
+                'tag': 'markdown',
+                'content': format_morning_item_md(index, item, event_time),
+            })
         payload = {'msg_type': 'interactive', 'card': {'schema': '2.0', 'header': {'title': {'tag': 'plain_text', 'content': f'{end:%m月%d日} 夜间摘要'}, 'template': 'blue'}, 'body': {'elements': elements}}}
         try:
             sender = getattr(self.webhook_sender, 'send', None) or self.webhook_sender.send_alert
