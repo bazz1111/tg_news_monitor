@@ -113,6 +113,8 @@ python -m tg_news_monitor.main
 
 多个 Group **彼此对等**，没有运行时特权「默认组」。每个 Group 是独立的公开频道采集 → 评估 → 飞书投递管道，有自己的频道列表和飞书 webhook。单进程 / 单容器按 tick 依次处理各组，**一次 LLM 调用不会混入其他组的帖子**。
 
+守护进程里采集跑在主线程、评估/发送跑在后台线程：采集只按 `group_id` 写入 SQLite，**不会**切换当前组的 webhook、卡片样式或 prompt。评估与发送在该组的快照上下文中完成（webhook、card profile、policy、quiet、`prompt_variant`），并行采集即使调用 `_activate_group` 也不能把 news24 的卡片发到 `old_photos`。`old_photos` / `wechat_photo` 发送前还会硬拒绝新闻/能源/冲突类条目以及没有 `media_urls` 的卡片。
+
 频道在各组之间互斥：同一频道不能出现在两个 Group（含 disabled）。启动时校验：Group `id` 唯一、启用且非空的 Group 必须能解析 webhook、全局频道不重复。
 
 推荐把组写在 `config.yaml`（见 [config.yaml.example](config.yaml.example)），webhook 用环境变量名引用，避免把密钥写进 YAML：
@@ -177,7 +179,7 @@ DEEPSEEK_API_KEY=...
 | 步骤 | 行为 |
 |---|---|
 | 进料 | 仅 `has_media` 且 `media_type` 为 `photo`/`album`、且 `media_urls` 非空。纯文字、纯视频丢掉。短说明不因字数不够被当成垃圾。 |
-| 本地硬过滤 | 黄赌毒、血腥暴力、领导人/党宣、当代地缘鼓动等关键词直接拒绝，宁错杀。过不了的不进模型。 |
+| 本地硬过滤 | 黄赌毒、血腥暴力、领导人/党宣、当代地缘鼓动、以及新闻/能源/冲突类（如「原油」「美伊」「冲突」、分类「能源」）直接拒绝，宁错杀。过不了的不进模型；发送前再拦一次，且必须有可点击图片 URL。 |
 | 模型 | `prompt_variant: wechat_photo`，比 `story` 更严：只要适合大陆公众号的历史/文化静帧；无把握不选。 |
 | 说明 | 模型写中文完整句，≤100 字，不以省略号收尾，无时政评论；发送前再截断一次。 |
 | 飞书卡 | 标题 + 说明 + 可点击图片链接（相册尽量带上已刮到的地址）。**无**投资影响、**无**频道名/`t.me`/原文。暂不要求上传飞书图片。 |
