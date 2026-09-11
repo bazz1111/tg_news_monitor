@@ -36,9 +36,12 @@ class TestConfigDefaultsAndParsing:
         assert settings.poll_interval_seconds == 60
         assert settings.max_jitter_seconds == 15
         assert settings.inter_channel_delay_seconds == 2.0
-        assert settings.codebuddy_model == "fast-model"
+        assert settings.codebuddy_model == "deepseek-v4.1-flash"
         assert settings.codebuddy_fallback_model == "hy3"
         assert settings.codebuddy_cli == "codebuddy"
+        assert settings.codebuddy_effort == "max"
+        assert settings.codebuddy_autocompact == "auto"
+        assert settings.codebuddy_timeout == 300.0
         assert settings.hotness_threshold == 7
         assert settings.timezone == "Asia/Shanghai"
         assert settings.quiet_hours == "00:00-08:00"
@@ -145,11 +148,17 @@ class TestEnvironmentAndSecretSync:
         monkeypatch.setenv("CODEBUDDY_API_KEY", "cb-env-123")
         monkeypatch.setenv("CODEBUDDY_MODEL", "fast-model")
         monkeypatch.setenv("CODEBUDDY_FALLBACK_MODEL", "hy3")
+        monkeypatch.setenv("CODEBUDDY_EFFORT", "high")
+        monkeypatch.setenv("CODEBUDDY_AUTOCOMPACT", "aggressive")
+        monkeypatch.setenv("CODEBUDDY_TIMEOUT", "420")
 
         settings = Settings.load()
         assert settings.codebuddy_api_key == "cb-env-123"
         assert settings.codebuddy_model == "fast-model"
         assert settings.codebuddy_fallback_model == "hy3"
+        assert settings.codebuddy_effort == "high"
+        assert settings.codebuddy_autocompact == "aggressive"
+        assert settings.codebuddy_timeout == 420.0
         assert settings.active_api_key == "cb-env-123"
         assert settings.active_model == "fast-model"
         assert settings.active_fallback_model == "hy3"
@@ -303,10 +312,13 @@ class TestCodeBuddyConfig:
         assert s.active_llm_provider == "codebuddy"
         assert s.codebuddy_api_key == "cb-test-key"
         assert s.active_api_key == "cb-test-key"
-        assert s.codebuddy_model == "fast-model"
-        assert s.active_model == "fast-model"
+        assert s.codebuddy_model == "deepseek-v4.1-flash"
+        assert s.active_model == "deepseek-v4.1-flash"
         assert s.codebuddy_fallback_model == "hy3"
         assert s.active_fallback_model == "hy3"
+        assert s.codebuddy_effort == "max"
+        assert s.codebuddy_autocompact == "auto"
+        assert s.codebuddy_timeout == 300.0
 
     def test_secret_str_codebuddy_key_on_settings(self):
         s = Settings(codebuddy_api_key=SecretStr("super-secret-codebuddy-key"))

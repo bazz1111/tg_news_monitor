@@ -629,9 +629,24 @@ class TestCodeBuddyEvaluator:
         )
         assert isinstance(evaluator, CodeBuddyEvaluator)
         assert evaluator.provider == "codebuddy"
-        assert evaluator.model == "fast-model"
+        assert evaluator.model == "deepseek-v4.1-flash"
         assert evaluator.fallback_model == "hy3"
         assert evaluator.api_key == "cb-factory-test"
+        assert evaluator.effort == "max"
+        assert evaluator.autocompact == "auto"
+        assert evaluator.timeout == 300.0
+
+    def test_create_evaluator_accepts_effort_autocompact(self):
+        evaluator = create_evaluator(
+            provider="codebuddy",
+            api_key="cb-factory-test",
+            effort="high",
+            autocompact="aggressive",
+            timeout=120.0,
+        )
+        assert evaluator.effort == "high"
+        assert evaluator.autocompact == "aggressive"
+        assert evaluator.timeout == 120.0
 
     def test_create_evaluator_ignores_deepseek_provider(self):
         evaluator = create_evaluator(provider="deepseek", api_key="cb-x", http_client=object())
@@ -663,11 +678,32 @@ class TestCodeBuddyEvaluator:
         assert "-p" in cmd and "-y" in cmd
         assert cmd[cmd.index("--tools") + 1] == ""
         assert cmd[cmd.index("--output-format") + 1] == "text"
-        assert cmd[cmd.index("--model") + 1] == "fast-model"
-        assert cmd[cmd.index("--effort") + 1] == "minimal"
+        assert cmd[cmd.index("--model") + 1] == "deepseek-v4.1-flash"
+        assert cmd[cmd.index("--effort") + 1] == "max"
+        assert cmd[cmd.index("--autocompact") + 1] == "auto"
         assert captured_env.get("CODEBUDDY_API_KEY") == "cb-key"
         assert "CODEBUDDY_INTERNET_ENVIRONMENT" not in captured_env
         assert "15,000 #ETH" in cmd[-1]
+
+    def test_build_command_uses_instance_effort_and_autocompact(
+        self, sample_breaking_post: TelegramPost
+    ) -> None:
+        calls: List[List[str]] = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(list(cmd))
+            return self._cli(json.dumps(GROK_EVAL_SCORE_9, ensure_ascii=False))
+
+        ev = CodeBuddyEvaluator(
+            api_key="cb-key",
+            effort="xhigh",
+            autocompact="always",
+            run_cli=fake_run,
+        )
+        ev.evaluate_post(sample_breaking_post)
+        cmd = calls[0]
+        assert cmd[cmd.index("--effort") + 1] == "xhigh"
+        assert cmd[cmd.index("--autocompact") + 1] == "always"
 
     def test_child_env_strips_internet_flag(
         self, sample_breaking_post: TelegramPost, monkeypatch: pytest.MonkeyPatch
@@ -690,14 +726,14 @@ class TestCodeBuddyEvaluator:
         def fake_run(cmd, **kwargs):
             model = cmd[cmd.index("--model") + 1]
             models.append(model)
-            if model == "fast-model":
+            if model == "deepseek-v4.1-flash":
                 return self._cli(returncode=1, stderr="primary boom")
             return self._cli(json.dumps(GROK_EVAL_SCORE_8, ensure_ascii=False))
 
         ev = CodeBuddyEvaluator(api_key="cb-key", run_cli=fake_run)
         evaluation = ev.evaluate_post(sample_breaking_post)
 
-        assert models == ["fast-model", "hy3"]
+        assert models == ["deepseek-v4.1-flash", "hy3"]
         assert evaluation.score == 8
         assert "ETF" in evaluation.title
 
@@ -707,14 +743,14 @@ class TestCodeBuddyEvaluator:
         def fake_run(cmd, **kwargs):
             model = cmd[cmd.index("--model") + 1]
             models.append(model)
-            if model == "fast-model":
+            if model == "deepseek-v4.1-flash":
                 return self._cli("this is not json at all")
             inner = json.dumps(GROK_EVAL_SCORE_10_CRITICAL, ensure_ascii=False)
             return self._cli(f"```json\n{inner}\n```")
 
         ev = CodeBuddyEvaluator(api_key="cb-key", run_cli=fake_run)
         evaluation = ev.evaluate_post(sample_exploit_post)
-        assert models == ["fast-model", "hy3"]
+        assert models == ["deepseek-v4.1-flash", "hy3"]
         assert evaluation.score == 10
 
     def test_timeout_then_fallback(self, sample_breaking_post: TelegramPost) -> None:
@@ -723,13 +759,13 @@ class TestCodeBuddyEvaluator:
         def fake_run(cmd, **kwargs):
             model = cmd[cmd.index("--model") + 1]
             models.append(model)
-            if model == "fast-model":
-                raise subprocess.TimeoutExpired(cmd, kwargs.get("timeout") or 60)
+            if model == "deepseek-v4.1-flash":
+                raise subprocess.TimeoutExpired(cmd, kwargs.get("timeout") or 300)
             return self._cli(json.dumps(GROK_EVAL_SCORE_9, ensure_ascii=False))
 
         ev = CodeBuddyEvaluator(api_key="cb-key", run_cli=fake_run)
         evaluation = ev.evaluate_post(sample_breaking_post)
-        assert models == ["fast-model", "hy3"]
+        assert models == ["deepseek-v4.1-flash", "hy3"]
         assert evaluation.score == 9
 
     def test_both_fail_heuristic(self, sample_exploit_post: TelegramPost) -> None:
@@ -741,7 +777,7 @@ class TestCodeBuddyEvaluator:
 
         ev = CodeBuddyEvaluator(api_key="cb-key", run_cli=fake_run)
         evaluation = ev.evaluate_post(sample_exploit_post)
-        assert models == ["fast-model", "hy3"]
+        assert models == ["deepseek-v4.1-flash", "hy3"]
         assert evaluation.score == 7
         assert "[降级预警]" in evaluation.title
 
@@ -795,14 +831,22 @@ class TestCodeBuddyEvaluator:
             ],
         }
 
+        seen_timeout: List[float] = []
+
         def fake_run(cmd, **kwargs):
+            seen_timeout.append(float(kwargs.get("timeout") or 0))
             return self._cli(json.dumps(digest_json, ensure_ascii=False))
 
-        ev = CodeBuddyEvaluator(api_key="cb-key", run_cli=fake_run)
+        ev = CodeBuddyEvaluator(api_key="cb-key", timeout=60.0, run_cli=fake_run)
         brief = ev.evaluate_digest([post])
         assert brief.has_material_news is True
         assert brief.items[0].title == "经济要闻"
         assert "is_update=true" in ev._compose_digest_prompt([post])
+        assert seen_timeout == [300.0]
+
+        ev_long = CodeBuddyEvaluator(api_key="cb-key", timeout=420.0, run_cli=fake_run)
+        ev_long.evaluate_digest([post])
+        assert seen_timeout[-1] == 420.0
 
     def test_evaluate_digest_both_fail_raises(self) -> None:
         from datetime import datetime, timezone

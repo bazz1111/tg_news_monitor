@@ -85,8 +85,11 @@ inter_channel_delay_seconds: 2.0
 
 # CodeBuddy CLI evaluator. Prefer CODEBUDDY_* in .env; do not commit the API key.
 # Do not set CODEBUDDY_INTERNET_ENVIRONMENT (international site).
-# codebuddy_model: fast-model
+# codebuddy_model: deepseek-v4.1-flash
 # codebuddy_fallback_model: hy3
+# codebuddy_effort: max
+# codebuddy_autocompact: auto
+# codebuddy_timeout: 300.0
 
 # Global defaults (groups inherit unless they override)
 hotness_threshold: 7
