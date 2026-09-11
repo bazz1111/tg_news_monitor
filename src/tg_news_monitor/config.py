@@ -248,14 +248,15 @@ class Group(BaseModel):
     def parse_channels(cls, value: Any) -> List[str]:
         return normalize_channel_list(value)
 
-    @field_validator("quiet_hours", "shoulder_hours")
+    @field_validator("quiet_hours", "shoulder_hours", mode="before")
     @classmethod
     def validate_hour_window(cls, value: Any) -> Optional[str]:
+        # None = field omitted (inherit global). "" = explicitly disable this group.
         if value is None:
             return None
         text = str(value).strip()
         if not text:
-            return None
+            return ""
         from tg_news_monitor.core.schedule import parse_hour_window
 
         parse_hour_window(text)
@@ -318,6 +319,10 @@ class GroupSettingsView:
             value = getattr(self.group, name, None)
             if value is not None:
                 return value
+            # quiet/shoulder: empty YAML ("") or explicit null disables the
+            # window. Omitting the field (not in model_fields_set) inherits global.
+            if name in {"quiet_hours", "shoulder_hours"} and name in self.group.model_fields_set:
+                return ""
         return getattr(self._settings, name)
 
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from threading import Event, Thread
+from zoneinfo import ZoneInfo
 
 import pytest
 from pydantic import ValidationError
@@ -17,7 +18,7 @@ from tg_news_monitor.core.models import DigestBrief, DigestItem, TelegramPost
 from tg_news_monitor.core.policy import DeliveryPolicy
 from tg_news_monitor.core.quiet_hours import QuietHours
 from tg_news_monitor.core.runner import NewsMonitorRunner
-from tg_news_monitor.core.schedule import knobs_for
+from tg_news_monitor.core.schedule import MODE_DAY, MODE_SHOULDER, classify_alert_mode, knobs_for
 from tg_news_monitor.notifier.feishu_card import FeishuCardBuilder
 from tg_news_monitor.storage.database import db_session, get_connection, init_db
 from tg_news_monitor.storage.repository import PostRepository
@@ -177,6 +178,108 @@ groups:
         assert knobs_for(view, "day").hotness_threshold == 8
         assert s.groups[1].resolved_card_profile().include_investment_impact is False
         assert s.groups[1].resolved_card_profile().prompt_variant == "story"
+
+    @pytest.mark.real_schedule
+    def test_empty_group_windows_do_not_inherit_global(self, tmp_path):
+        """quiet_hours/shoulder_hours: '' or explicit null disable; omit inherits."""
+        yaml_path = tmp_path / "config.yaml"
+        yaml_path.write_text(
+            """
+quiet_hours: "00:00-08:00"
+shoulder_hours: "22:00-00:00"
+shoulder_digest_min_candidates: 12
+shoulder_digest_min_interval_seconds: 420
+digest_min_candidates: 3
+digest_min_interval_seconds: 180
+groups:
+  - id: old_photos
+    channels: [ussrpictures]
+    webhook_url: https://example.com/photos
+    quiet_hours: ""
+    shoulder_hours: ""
+    digest_min_candidates: 2
+    digest_min_interval_seconds: 1800
+  - id: news24
+    channels: [zaobaosg]
+    webhook_url: https://example.com/news24
+  - id: extra
+    channels: [solidot]
+    webhook_url: https://example.com/extra
+    quiet_hours: null
+    shoulder_hours: null
+    digest_min_candidates: 4
+""",
+            encoding="utf-8",
+        )
+        s = Settings.load(config_path=yaml_path)
+        photos = s.group_settings("old_photos")
+        news = s.group_settings("news24")
+        extra = s.group_settings("extra")
+
+        assert photos.quiet_hours == ""
+        assert photos.shoulder_hours == ""
+        assert extra.quiet_hours == ""
+        assert extra.shoulder_hours == ""
+        assert news.quiet_hours == "00:00-08:00"
+        assert news.shoulder_hours == "22:00-00:00"
+
+        bj_shoulder = datetime(2026, 9, 11, 23, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+        bj_quiet = datetime(2026, 9, 12, 1, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+
+        assert classify_alert_mode(bj_shoulder, photos.quiet_hours, photos.shoulder_hours) == MODE_DAY
+        photo_knobs = knobs_for(
+            photos,
+            classify_alert_mode(bj_shoulder, photos.quiet_hours, photos.shoulder_hours),
+        )
+        assert photo_knobs.mode == MODE_DAY
+        assert photo_knobs.min_candidates == 2
+        assert photo_knobs.min_interval_seconds == 1800
+
+        assert classify_alert_mode(bj_quiet, photos.quiet_hours, photos.shoulder_hours) == MODE_DAY
+
+        assert classify_alert_mode(bj_shoulder, news.quiet_hours, news.shoulder_hours) == MODE_SHOULDER
+        news_knobs = knobs_for(
+            news,
+            classify_alert_mode(bj_shoulder, news.quiet_hours, news.shoulder_hours),
+        )
+        assert news_knobs.mode == MODE_SHOULDER
+        assert news_knobs.min_candidates == 12
+        assert news_knobs.min_interval_seconds == 420
+
+        extra_knobs = knobs_for(
+            extra,
+            classify_alert_mode(bj_shoulder, extra.quiet_hours, extra.shoulder_hours),
+        )
+        assert extra_knobs.mode == MODE_DAY
+        assert extra_knobs.min_candidates == 4
+
+    def test_constructor_empty_windows_do_not_inherit(self):
+        s = Settings(
+            quiet_hours="00:00-08:00",
+            shoulder_hours="22:00-00:00",
+            groups=[
+                {
+                    "id": "old_photos",
+                    "channels": ["ussrpictures"],
+                    "webhook_url": "https://example.com/photos",
+                    "quiet_hours": "",
+                    "shoulder_hours": "",
+                    "digest_min_candidates": 2,
+                },
+                {
+                    "id": "news24",
+                    "channels": ["zaobaosg"],
+                    "webhook_url": "https://example.com/news24",
+                },
+            ],
+        )
+        photos = s.group_settings("old_photos")
+        news = s.group_settings("news24")
+        assert photos.quiet_hours == ""
+        assert photos.shoulder_hours == ""
+        assert s.groups[0].quiet_hours == ""
+        assert news.quiet_hours == "00:00-08:00"
+        assert news.shoulder_hours == "22:00-00:00"
 
 
 class TestGroupIsolation:

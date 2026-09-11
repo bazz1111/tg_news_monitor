@@ -43,7 +43,7 @@ groups:
     channels: []
     webhook_url_env: FEISHU_WEBHOOK_OLD_PHOTOS
     webhook_secret_env: FEISHU_WEBHOOK_SECRET_OLD_PHOTOS
-    # 关闭新闻静默/晨报；素材不是即时快讯
+    # 空字符串 = 本组关闭静默/过渡窗口（不继承全局）；省略字段才继承
     quiet_hours: ""
     shoulder_hours: ""
     morning_flush_enabled: false
