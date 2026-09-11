@@ -28,6 +28,7 @@ class TestConfigDefaultsAndParsing:
                 or k.startswith("QUIET_")
                 or k.startswith("SHOULDER_")
                 or k.startswith("MORNING_")
+                or k.startswith("TOPIC_FILTER")
                 or k == "TIMEZONE"
             ):
                 monkeypatch.delenv(k, raising=False)
@@ -55,6 +56,7 @@ class TestConfigDefaultsAndParsing:
         assert settings.telegram_channels == []
         assert settings.feishu_app_id == ""
         assert settings.feishu_app_secret == ""
+        assert settings.topic_filters_path is None
 
     def test_comma_separated_channel_string_parsing(self):
         s = Settings(telegram_channels="durov, @telegram, whale_alert , ")

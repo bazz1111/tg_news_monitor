@@ -1,0 +1,36 @@
+# Per-group coarse topic policy (optional local safety net).
+# Copy to topic_filters.yaml (gitignored) and mount like config.yaml.
+# Production corpora belong only in that ops file — not in git.
+#
+# Missing file, unknown group without default, or enabled: false
+# => topic filter is a no-op (spam + crypto still apply).
+# Override path with TOPIC_FILTERS_PATH or config topic_filters_path.
+
+default:
+  enabled: false
+  categories: {}
+
+groups:
+  news24:
+    enabled: true
+    categories:
+      # Leave political/military lists empty in the example.
+      # Fill the live ops file if you want a local regex net; news-path
+      # compliance is primarily the digest prompt (prefer miss over release).
+      china_politics_military: []
+      sovereignty: []
+      coups_terror_regime: []
+      antagonism: []
+      red_culture: []
+      rumor_framing: []
+      disaster_mockery: []
+      corporate_defamation: []
+      investment_solicitation:
+        - "目标价|点位预测|涨跌判断|收益率承诺|必涨|保本|跟单"
+        - "price\\s+target|guaranteed\\s+return|copy[\\s-]?trading"
+  old_photos:
+    enabled: false
+    categories:
+      china_politics_military: []
+      sovereignty: []
+      investment_solicitation: []

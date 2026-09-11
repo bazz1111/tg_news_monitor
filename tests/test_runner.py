@@ -307,6 +307,53 @@ class TestNewsMonitorRunner:
             assert record["filter_reason"] in {"spam", "coarse_filter", "crypto_filter", "digest_empty", "digest_filtered", "digest_not_selected"}
             assert record["alert_sent"] == 0
 
+    def test_topic_filter_marks_reason_and_skips_llm(self, tmp_path):
+        policy = tmp_path / "topic_filters.yaml"
+        policy.write_text(
+            "default:\n  enabled: true\n  categories:\n    demo:\n      - RESTRICTED_WIDGET_TOKEN\n",
+            encoding="utf-8",
+        )
+        from tg_news_monitor.core.filters import reset_topic_filter_cache
+
+        reset_topic_filter_cache()
+        with local_temp_db() as db_path:
+            channel = "asia_wire"
+            posts_data = [
+                {
+                    "message_id": 401,
+                    "text": "desk note mentions RESTRICTED_WIDGET_TOKEN inside a longer wire",
+                },
+            ]
+            html = make_sample_html(channel, posts_data)
+            config = Settings(
+                telegram_channels=[channel],
+                hotness_threshold=7,
+                db_path=db_path,
+                digest_min_candidates=1,
+                digest_max_wait_seconds=0,
+                topic_filters_path=str(policy),
+            )
+            storage = PostRepository(db_path=db_path)
+            scraper = MockScraper(html_map={channel: html})
+            evaluator = MockEvaluator()
+            webhook = MockWebhookSender(should_succeed=True)
+            runner = NewsMonitorRunner(
+                config=config,
+                storage=storage,
+                scraper_client=scraper,
+                evaluator=evaluator,
+                webhook_sender=webhook,
+            )
+            summary = runner.run_once()
+            assert summary["posts_evaluated"] == 0
+            assert summary["alerts_sent"] == 0
+            assert evaluator.digest_batches == []
+            record = storage.get_post(channel, 401)
+            assert record is not None
+            assert record["is_filtered"] == 1
+            assert record["filter_reason"] == "topic_filter"
+            assert record["alert_sent"] == 0
+
     def test_deduplication_across_subsequent_runs(self):
         with local_temp_db() as db_path:
             channel = "news_chan"

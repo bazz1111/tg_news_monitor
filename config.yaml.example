@@ -118,6 +118,11 @@ digest_max_calls_per_day: 288
 db_path: "data/tg_news.db"
 log_level: "INFO"
 
+# Optional per-group topic policy file (copy topic_filters.yaml.example).
+# Env TOPIC_FILTERS_PATH overrides. Missing file disables the topic net.
+# topic_filters_path: topic_filters.yaml
+
+
 # --- Legacy single-list (used only when `groups` is omitted) ---
 # telegram_channels:
 #   - durov

@@ -42,6 +42,7 @@ from tg_news_monitor.core.filters import (
     _COARSE_SPAM_RES,
     _CRYPTO_RES,
     _text_looks_crypto,
+    _text_looks_restricted_topic,
     coarse_filter_posts,
 )
 from tg_news_monitor.core.models import DigestBrief, DigestItem, NewsEvaluation, TelegramPost
@@ -75,6 +76,7 @@ __all_filter_exports__ = (
     "_COARSE_SPAM_RES",
     "_CRYPTO_RES",
     "_text_looks_crypto",
+    "_text_looks_restricted_topic",
     "coarse_filter_posts",
 )
 
@@ -750,6 +752,11 @@ class NewsMonitorRunner:
                     group_id=self._group_id,
                 )
 
+    def _topic_scope(self) -> Dict[str, Any]:
+        raw = getattr(self.config, "topic_filters_path", None)
+        path = str(raw).strip() if raw else None
+        return {"group_id": self._group_id, "path": path or None}
+
     def _mark_all_filtered(self, posts: List[TelegramPost], reason: str) -> None:
         for post in posts:
             ch = post.channel.lower().lstrip("@").strip()
@@ -901,7 +908,7 @@ class NewsMonitorRunner:
         for post in overnight:
             ranked.setdefault((post.channel.lower(), post.message_id), (post, 7))
         posts = [p for p, _ in sorted(ranked.values(), key=lambda pair: (pair[1], pair[0].published_at), reverse=True)]
-        posts, _, _ = coarse_filter_posts(posts)
+        posts, _, _, _ = coarse_filter_posts(posts, **self._topic_scope())
         unique = {}
         for post in posts:
             unique.setdefault(fingerprint(post.text), post)
@@ -943,7 +950,12 @@ class NewsMonitorRunner:
             key = (item.channel.lower().lstrip('@'), item.message_id)
             if key not in allowed or key in keys or not self.quiet.in_window(item.event_at, now):
                 continue
-            if _text_looks_crypto(item.model_dump_json()) or (item.score or 11 - item.rank) < cfg.morning_flush_hotness_threshold:
+            item_blob = item.model_dump_json()
+            if (
+                _text_looks_crypto(item_blob)
+                or _text_looks_restricted_topic(item_blob, **self._topic_scope())
+                or (item.score or 11 - item.rank) < cfg.morning_flush_hotness_threshold
+            ):
                 continue
             keys.add(key)
             items.append(item)
@@ -1141,23 +1153,45 @@ class NewsMonitorRunner:
                     f"group={self._group_id} WeChat photo prefilter dropped "
                     f"{len(wechat_dropped)} post(s) {reasons}; {len(candidates)} remain."
                 )
+            topic_extra = [
+                p
+                for p in candidates
+                if _text_looks_restricted_topic((p.text or ""), **self._topic_scope())
+            ]
+            if topic_extra:
+                extra_ids = {(p.channel, p.message_id) for p in topic_extra}
+                candidates = [p for p in candidates if (p.channel, p.message_id) not in extra_ids]
+                self._mark_all_filtered(topic_extra, "topic_filter")
+                logger.info(
+                    f"group={self._group_id} Topic filter dropped {len(topic_extra)} "
+                    f"photo post(s); {len(candidates)} remain."
+                )
         else:
-            candidates, spam_dropped, crypto_dropped = coarse_filter_posts(pending_posts)
+            candidates, spam_dropped, crypto_dropped, topic_dropped = coarse_filter_posts(
+                pending_posts, **self._topic_scope()
+            )
             if spam_dropped:
                 logger.info(
                     f"Coarse filter dropped {len(spam_dropped)} spam/noise post(s); "
-                    f"{len(candidates) + len(crypto_dropped)} remain before crypto filter."
+                    f"{len(candidates) + len(crypto_dropped) + len(topic_dropped)} "
+                    f"remain before crypto/topic filters."
                 )
                 self._mark_all_filtered(spam_dropped, "coarse_filter")
             if crypto_dropped:
                 logger.info(
                     f"Crypto filter dropped {len(crypto_dropped)} post(s); "
-                    f"{len(candidates)} candidate(s) remain."
+                    f"{len(candidates) + len(topic_dropped)} remain before topic filter."
                 )
                 self._mark_all_filtered(crypto_dropped, "crypto_filter")
+            if topic_dropped:
+                logger.info(
+                    f"Topic filter dropped {len(topic_dropped)} post(s); "
+                    f"{len(candidates)} candidate(s) remain."
+                )
+                self._mark_all_filtered(topic_dropped, "topic_filter")
 
         if not candidates:
-            logger.info("No candidates after coarse/crypto filter; skipping LLM and Feishu cards.")
+            logger.info("No candidates after coarse/crypto/topic filter; skipping LLM and Feishu cards.")
             return pass_summary
 
         # Rebuild scraped_at map for remaining candidates
@@ -1255,10 +1289,11 @@ class NewsMonitorRunner:
                 selected_once.add(key)
                 checked.append(item)
         digest.items = checked
-        # 5b. Hard-drop crypto items even if the model selected them
+        # 5b. Hard-drop crypto / topic items even if the model selected them
         if digest.items:
             kept_items = []
             crypto_items = []
+            topic_items = []
             for item in digest.items:
                 blob = " ".join(
                     [
@@ -1272,14 +1307,21 @@ class NewsMonitorRunner:
                 cat = str(getattr(item, "category", "") or "").strip()
                 if cat == "加密货币" or _text_looks_crypto(blob):
                     crypto_items.append(item)
+                elif _text_looks_restricted_topic(blob, **self._topic_scope()):
+                    topic_items.append(item)
                 else:
                     kept_items.append(item)
-            if crypto_items:
+            for label, dropped, reason, summary_tag in (
+                ("crypto", crypto_items, "crypto_filter", "crypto_ban"),
+                ("topic", topic_items, "topic_filter", "topic_ban"),
+            ):
+                if not dropped:
+                    continue
                 logger.info(
-                    f"Post-digest crypto filter removed {len(crypto_items)} item(s) "
+                    f"Post-digest {label} filter removed {len(dropped)} item(s) "
                     f"before Feishu send."
                 )
-                for item in crypto_items:
+                for item in dropped:
                     ch = str(item.channel).lower().lstrip("@").strip()
                     try:
                         mid = int(item.message_id)
@@ -1289,18 +1331,24 @@ class NewsMonitorRunner:
                         channel=ch,
                         message_id=mid,
                         score=1,
-                        summary="[filtered] crypto_ban",
+                        summary=f"[filtered] {summary_tag}",
                         alert_sent=False,
                         is_filtered=True,
-                        filter_reason="crypto_filter",
+                        filter_reason=reason,
                         key_takeaways=[],
                         group_id=self._group_id,
                     )
+            if crypto_items or topic_items:
                 digest.items = kept_items
                 if not kept_items:
                     digest.has_material_news = False
+                    note = []
+                    if crypto_items:
+                        note.append("crypto_ban_all")
+                    if topic_items:
+                        note.append("topic_ban_all")
                     digest.filtered_note = (
-                        (digest.filtered_note or "") + "; crypto_ban_all"
+                        (digest.filtered_note or "") + "; " + "; ".join(note)
                     ).strip("; ")
 
         if self._is_wechat_photo() and digest.items:
