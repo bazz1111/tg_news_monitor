@@ -28,6 +28,7 @@ from tg_news_monitor.notifier.card_format import (
     polish_overview_bullet,
     shorten_summary,
 )
+from tg_news_monitor.notifier.feishu_images import MAX_EMBEDDED_IMAGES
 
 
 # ==============================================================================
@@ -604,8 +605,13 @@ class FeishuCardBuilder:
         item: DigestItem,
         media_urls: Optional[List[str]] = None,
         subtitle: str = "公众号图片素材",
+        image_keys: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
-        """Title + ≤100字说明 + clickable photo links. No TG traces, no investment block."""
+        """Title + ≤100字说明 + in-card images (img_key) or markdown link fallback.
+
+        No TG traces, no investment block. Image bytes are uploaded elsewhere;
+        this builder only places keys or http(s) links.
+        """
         title = strip_tg_traces((getattr(item, "title", None) or "").strip()) or "历史影像"
         title = title[:50]
         caption = normalize_wechat_caption(getattr(item, "summary", None) or "")
@@ -617,12 +623,26 @@ class FeishuCardBuilder:
         urls = photo_link_urls(media_urls)
         if not urls:
             urls = photo_link_urls(getattr(item, "media_urls", None))
+        keys = [str(k).strip() for k in (image_keys or []) if str(k).strip()][:MAX_EMBEDDED_IMAGES]
 
         def _md_div(content: str) -> Dict[str, Any]:
             return {"tag": "div", "text": {"tag": "lark_md", "content": content}}
 
         elements: List[Dict[str, Any]] = [_md_div(caption or "（无说明）")]
-        if urls:
+        if keys:
+            elements.append({"tag": "hr"})
+            for key in keys:
+                elements.append(
+                    {
+                        "tag": "img",
+                        "img_key": key,
+                        "alt": {"tag": "plain_text", "content": "图片"},
+                        "mode": "fit_horizontal",
+                        "scale_type": "fit_horizontal",
+                        "preview": True,
+                    }
+                )
+        elif urls:
             elements.append({"tag": "hr"})
             link_lines = "\n".join(f"[{idx}]({url})" for idx, url in enumerate(urls, 1))
             elements.append(_md_div(f"**图片**\n{link_lines}"))

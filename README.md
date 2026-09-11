@@ -15,7 +15,7 @@
 - **不明投递避免重发**：主流程默认只尝试一次Webhook，提前记录投递认领；结果不明记为 `unknown`，不自动重试。
 - **加密内容过滤**：模型调用前后过滤加密货币及区块链内容；规则仍可能误伤或漏网。
 - **北京时间弹性静默**：按 `Asia/Shanghai` 窗口调整评估门槛与飞书推送；采集仍全天运行。跨午夜窗口（如 `23:00-01:00`）按半开区间 `[start, end)` 解析。
-- **微信公众号图片素材（`old_photos`）**：与 `news24` 对等隔离。只收照片/相册，本地安全阀拒绝黄赌毒暴与时政敏感，`wechat_photo` 提示词宁缺毋滥；飞书卡只有标题、≤100 字说明和图片链接，无投资影响、无 Telegram/`t.me` 痕迹。默认低频（约 1 小时冷却、每日 8 次软顶）。
+- **微信公众号图片素材（`old_photos`）**：与 `news24` 对等隔离。只收照片/相册，本地安全阀拒绝黄赌毒暴与时政敏感，`wechat_photo` 提示词宁缺毋滥；飞书卡只有标题、≤100 字说明和卡内嵌图（飞书应用上传 `image_key`；失败则回退为图片链接），无投资影响、无 Telegram/`t.me` 痕迹。默认低频（约 1 小时冷却、每日 8 次软顶）。图片不送入模型，DeepSeek token 不变。
 
 语义去重和时间提取依赖模型，不能保证百分之百准确。严格时效可能漏掉时间不明的消息；进程崩溃或投递不明也可能漏推。当前没有完整持久化发件箱、PDF/OCR或独立研报摘要通道。夜间识别仍可能漏报或误报。
 
@@ -136,6 +136,7 @@ groups:
       include_investment_impact: true
       prompt_variant: news          # news | story | wechat_photo
       # prompt_overlay: "额外系统提示"
+      # embed_images: true          # 预留；目前仅 wechat_photo 发送路径会上传嵌入
   - id: old_photos
     name: 公众号历史图片素材
     channels: []                    # 填入历史影像向公开频道后才会采集
@@ -152,6 +153,7 @@ groups:
       subtitle: 公众号图片素材
       include_investment_impact: false
       prompt_variant: wechat_photo
+      embed_images: true            # wechat_photo 默认 true；需 FEISHU_APP_ID/SECRET
   - id: xhs_hot
     name: 小红书热点（示例，先空着）
     enabled: false
@@ -171,6 +173,10 @@ FEISHU_WEBHOOK_SECRET_NEWS24=
 # FEISHU_WEBHOOK_OLD_PHOTOS=
 # FEISHU_WEBHOOK_XHS=
 DEEPSEEK_API_KEY=...
+# 卡内嵌图（old_photos / wechat_photo）。自定义机器人 webhook 不能按 URL 嵌图，
+# 需开放平台应用上传拿 image_key。不增加 LLM token。
+# FEISHU_APP_ID=cli_xxx
+# FEISHU_APP_SECRET=
 ```
 
 #### `old_photos`：微信公众号历史影像素材
@@ -183,14 +189,14 @@ DEEPSEEK_API_KEY=...
 | 本地硬过滤 | 黄赌毒、血腥暴力、领导人/党宣、当代地缘鼓动、以及新闻/能源/冲突类（如「原油」「美伊」「冲突」、分类「能源」）直接拒绝，宁错杀。过不了的不进模型；发送前再拦一次，且必须有可点击图片 URL。 |
 | 模型 | `prompt_variant: wechat_photo`，比 `story` 更严：只要适合大陆公众号的历史/文化静帧；无把握不选。 |
 | 说明 | 模型写中文完整句，≤100 字，不以省略号收尾，无时政评论；发送前再截断一次。 |
-| 飞书卡 | 标题 + 说明 + 可点击图片链接（相册尽量带上已刮到的地址）。**无**投资影响、**无**频道名/`t.me`/原文。暂不要求上传飞书图片。 |
+| 飞书卡 | 标题 + 说明 + **卡内嵌图**（发送前把 `media_urls` 的 http(s) 图下载并 `POST /im/v1/images` 上传，卡片用 `img` / `img_key`，最多 9 张）。部分失败则嵌入成功的；全部失败或未配置 `FEISHU_APP_ID`/`FEISHU_APP_SECRET` 时回退为可点击图片链接。**无**投资影响、**无**频道名/`t.me`/原文。图片只在发卡时上传，**不**送进 DeepSeek。 |
 | 节奏 | 非实时。默认 `digest_min_interval_seconds=3600`、`digest_max_calls_per_day=8`、`digest_min_candidates=2`、`digest_max_wait_seconds=7200`。`news_max_age_seconds` 须明显长于冷却（默认 86400），否则帖子会在等待中过期。关闭 `quiet_hours` / 晨报。频率可以后再调组级旋钮。 |
 
-历史事件本身很旧，因此该组**不**用 `event_at` 做 30 分钟时效拦截（`news24` 仍拦截）。图片像素不做识别，只能靠说明文字与模型。
+历史事件本身很旧，因此该组**不**用 `event_at` 做 30 分钟时效拦截（`news24` 仍拦截）。图片像素不做识别，只能靠说明文字与模型。启用嵌图：在 `.env` 设置 `FEISHU_APP_ID` / `FEISHU_APP_SECRET`（`wechat_photo` 的 `embed_images` 默认为 true）。关掉嵌图可在该组 `card_profile.embed_images: false`，卡片会继续用 markdown 链接。
 
 **从 `TELEGRAM_CHANNELS` 迁移：** 若配置里**没有** `groups` 字段，但存在旧的 `TELEGRAM_CHANNELS` + `FEISHU_WEBHOOK_URL`，启动时会合成一个对等 Group（默认 `id: legacy`，可用 `legacy_group_id` 改名）。这不是运行时特权默认组，只是兼容现有部署。一旦 YAML/配置里出现 `groups`，就不再把旧的单一频道列表当主数据源。升级后已有 SQLite 行会标上该 legacy id；若希望旧 pending/认领接到 `news24`，把该组 `id` 设为 `legacy`，或设 `legacy_group_id: news24` 后再迁库。
 
-可选 per-group 覆盖（现在就生效，不是后期）：`quiet_hours` / `shoulder_hours`、各档 `hotness_threshold`、digest 门槛/间隔/卡片间隔、`quiet_card_cap`、晨报开关与门槛、`digest_max_calls_per_day`（软）、`news_max_age_seconds`、`card_profile`（`prompt_variant`：`news` / `story` / `wechat_photo`）、`enabled`。空频道或 `enabled: false` 的组会被跳过。
+可选 per-group 覆盖（现在就生效，不是后期）：`quiet_hours` / `shoulder_hours`、各档 `hotness_threshold`、digest 门槛/间隔/卡片间隔、`quiet_card_cap`、晨报开关与门槛、`digest_max_calls_per_day`（软）、`news_max_age_seconds`、`card_profile`（`prompt_variant`：`news` / `story` / `wechat_photo`；`embed_images`：wechat_photo 默认 true）、`enabled`。空频道或 `enabled: false` 的组会被跳过。
 
 存储与去重按 `group_id` 隔离：帖子唯一键为 `(group_id, channel, message_id)`，投递指纹与晨报/静默认领也按组分开。同一正文可以分别推到两个组的 webhook。日志带 `group=<id>`。
 
@@ -227,7 +233,7 @@ Docker 若使用 `config.yaml`，把它挂进容器并设置 `CONFIG_PATH`，例
 
 兼容保留的 `QUIET_DIGEST_MIN_CANDIDATES`、`MORNING_FLUSH_MAX_AGE_SECONDS`、`MORNING_FLUSH_CARD_INTERVAL_SECONDS` 不再控制新夜间流程；以时间窗口和单张摘要为准。已有部署需同步更新旧窗口环境变量，再重启进程。
 
-`TELEGRAM_CHANNELS` 默认空。DeepSeek和飞书凭据自行填写，签名密钥 `FEISHU_WEBHOOK_SECRET` 可选。代理建议通过OS/容器的 `HTTP_PROXY`、`HTTPS_PROXY` 设置，不要假设仅写入YAML的代理字段会传给HTTP客户端。
+`TELEGRAM_CHANNELS` 默认空。DeepSeek和飞书凭据自行填写，签名密钥 `FEISHU_WEBHOOK_SECRET` 可选。`old_photos` 卡内嵌图还需 `FEISHU_APP_ID` 与 `FEISHU_APP_SECRET`（开放平台应用，具备上传图片权限）。代理建议通过OS/容器的 `HTTP_PROXY`、`HTTPS_PROXY` 设置，不要假设仅写入YAML的代理字段会传给HTTP客户端。
 
 ### 时效与成本
 

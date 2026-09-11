@@ -33,6 +33,7 @@ groups:
       include_investment_impact: true
       prompt_variant: news
       # prompt_overlay: "额外评估约束（追加到 digest system prompt）"
+      # embed_images: true  # 预留：同一飞书应用上传；目前仅 wechat_photo 发送路径会嵌入
 
   # WeChat 公众号历史影像素材桌：TG 公开频道进料，飞书审稿，人工再发公众号。
   # 低频：只在过本地安全阀 + 模型选中后推送。以下旋钮可按组改，稍后可再调。
@@ -59,6 +60,7 @@ groups:
       subtitle: 公众号图片素材
       include_investment_impact: false
       prompt_variant: wechat_photo
+      embed_images: true   # default for wechat_photo; needs FEISHU_APP_ID/SECRET
 
   # Example extra pipeline — leave disabled/empty until channels exist.
   - id: xhs_hot
