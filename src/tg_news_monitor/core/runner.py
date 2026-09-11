@@ -1198,14 +1198,45 @@ class NewsMonitorRunner:
                         )
                         continue
                 delivery_text = self._delivery_text(matched_post)
-                if not self.policy.claim(delivery_text, item.title + ": " + item.summary):
+                claim_summary = f"{item.title}: {item.summary}"
+                extra_event_key = not self._is_wechat_photo()
+                if extra_event_key and self.policy.is_near_duplicate(
+                    item.title,
+                    item.summary,
+                    is_update=bool(getattr(item, "is_update", False)),
+                    update_reason=getattr(item, "update_reason", "") or "",
+                ):
+                    self.storage.update_evaluation(
+                        channel=ch,
+                        message_id=mid,
+                        score=1,
+                        summary="[filtered] near_duplicate",
+                        alert_sent=False,
+                        is_filtered=True,
+                        filter_reason="near_duplicate",
+                        key_takeaways=[],
+                        group_id=self._group_id,
+                    )
+                    logger.info(
+                        f"group={self._group_id} Near-duplicate digest item skipped: "
+                        f"#{item.rank} [{item.category}] {item.title!r}"
+                    )
+                    continue
+                if not self.policy.claim(
+                    delivery_text, claim_summary, extra_event_key=extra_event_key
+                ):
                     continue
                 try:
                     send_ok = self._send_digest_item_card(item, published_at=published_at)
                 except Exception as exc:
                     logger.error(f"Delivery uncertain, do not automatically resend: {exc}")
                     send_ok = False
-                self.policy.complete(delivery_text, send_ok)
+                self.policy.complete(
+                    delivery_text,
+                    send_ok,
+                    summary=claim_summary,
+                    extra_event_key=extra_event_key,
+                )
                 if send_ok:
                     alerts_ok += 1
                     if send_knobs.quiet_card_cap is not None and send_knobs.quiet_window_id:

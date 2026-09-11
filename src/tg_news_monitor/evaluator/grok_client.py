@@ -357,7 +357,7 @@ class GrokClient:
                 {"role": "user", "content": build_digest_user_prompt(
                     posts,
                     variant=getattr(self, "prompt_variant", None),
-                ) + "\n当前UTC时间：" + datetime.now(timezone.utc).isoformat() + "\n过去24小时最近已推送或投递状态待核实的事件（无新事实则勿重复）：\n" + getattr(self, "recent_history", "")},
+                ) + "\n当前UTC时间：" + datetime.now(timezone.utc).isoformat() + "\n过去24小时最近已推送或投递状态待核实的事件（历史已覆盖的同一事件不要重复，除非 is_update=true 且 update_reason 写明新事实）：\n" + getattr(self, "recent_history", "")},
             ],
         }
 

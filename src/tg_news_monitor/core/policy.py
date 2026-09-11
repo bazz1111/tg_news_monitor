@@ -5,6 +5,12 @@ import unicodedata
 from datetime import datetime, timedelta, timezone
 
 from tg_news_monitor.config import DEFAULT_LEGACY_GROUP_ID
+from tg_news_monitor.core.near_dup import (
+    NEAR_DUP_WINDOW_SECONDS,
+    claim_blob,
+    event_key,
+    is_near_duplicate_blob,
+)
 from tg_news_monitor.storage.database import db_session, ensure_runtime_tables, get_connection, safe_group_id
 
 
@@ -72,38 +78,93 @@ class DeliveryPolicy:
         with db_session(self.db_path) as conn:
             conn.execute('UPDATE digest_calls SET tokens=? WHERE rowid=?', (tokens, self.call_id))
 
+    def _claim_cutoff(self):
+        return datetime.now(timezone.utc).timestamp() - NEAR_DUP_WINDOW_SECONDS
+
+    def _claim_fingerprints(self, text, summary, extra_event_key=True):
+        fps = [fingerprint(text)]
+        if extra_event_key:
+            key = event_key(summary or "")
+            if key:
+                extra = fingerprint(key)
+                if extra not in fps:
+                    fps.append(extra)
+        return fps
+
     def seen(self, text):
-        cutoff = datetime.now(timezone.utc).timestamp() - 86400
+        cutoff = self._claim_cutoff()
         with db_session(self.db_path) as conn:
             return conn.execute(
                 'SELECT 1 FROM delivery_claims WHERE group_id=? AND fingerprint=? AND claimed>=?',
                 (self.group_id, fingerprint(text), cutoff),
             ).fetchone() is not None
 
-    def claim(self, text, summary):
-        now = datetime.now(timezone.utc).timestamp()
+    def recent_summaries(self, limit=20):
+        """Unique claim summaries for this group in the 24h window, newest first."""
+        cutoff = self._claim_cutoff()
+        fetch = max(int(limit) * 2, int(limit))
         with db_session(self.db_path) as conn:
-            conn.execute('DELETE FROM delivery_claims WHERE claimed < ?', (now - 86400,))
-            return conn.execute(
-                'INSERT OR IGNORE INTO delivery_claims(group_id,fingerprint,claimed,summary) VALUES(?,?,?,?)',
-                (self.group_id, fingerprint(text), now, summary[:300]),
-            ).rowcount == 1
+            rows = conn.execute(
+                'SELECT summary FROM delivery_claims WHERE group_id=? AND claimed>=? '
+                'ORDER BY claimed DESC LIMIT ?',
+                (self.group_id, cutoff, fetch),
+            ).fetchall()
+        seen = set()
+        out = []
+        for row in rows:
+            summary = (row[0] or "").strip()
+            if not summary or summary in seen:
+                continue
+            seen.add(summary)
+            out.append(summary)
+            if len(out) >= limit:
+                break
+        return out
 
-    def complete(self, text, sent):
+    def is_near_duplicate(self, title, summary, is_update=False, update_reason=""):
+        """True if title+summary is the same event as a recent claim without a material update."""
+        return is_near_duplicate_blob(
+            claim_blob(title, summary),
+            self.recent_summaries(),
+            is_update=is_update,
+            update_reason=update_reason or "",
+        )
+
+    def claim(self, text, summary, extra_event_key=True):
+        now = datetime.now(timezone.utc).timestamp()
+        snippet = (summary or "")[:300]
+        fps = self._claim_fingerprints(text, snippet, extra_event_key=extra_event_key)
+        cutoff = now - NEAR_DUP_WINDOW_SECONDS
         with db_session(self.db_path) as conn:
-            conn.execute(
-                'UPDATE delivery_claims SET status=? WHERE group_id=? AND fingerprint=?',
-                ('sent' if sent else 'unknown', self.group_id, fingerprint(text)),
-            )
+            conn.execute('BEGIN IMMEDIATE')
+            conn.execute('DELETE FROM delivery_claims WHERE claimed < ?', (cutoff,))
+            for fp in fps:
+                exists = conn.execute(
+                    'SELECT 1 FROM delivery_claims WHERE group_id=? AND fingerprint=? AND claimed>=?',
+                    (self.group_id, fp, cutoff),
+                ).fetchone()
+                if exists is not None:
+                    return False
+            for fp in fps:
+                conn.execute(
+                    'INSERT OR IGNORE INTO delivery_claims(group_id,fingerprint,claimed,summary) VALUES(?,?,?,?)',
+                    (self.group_id, fp, now, snippet),
+                )
+        return True
+
+    def complete(self, text, sent, summary=None, extra_event_key=True):
+        fps = self._claim_fingerprints(text, summary or "", extra_event_key=extra_event_key)
+        status = 'sent' if sent else 'unknown'
+        with db_session(self.db_path) as conn:
+            for fp in fps:
+                conn.execute(
+                    'UPDATE delivery_claims SET status=? WHERE group_id=? AND fingerprint=?',
+                    (status, self.group_id, fp),
+                )
 
     def history(self):
         # ponytail: bounded recent context; semantic recall declines beyond 20 events.
-        with db_session(self.db_path) as conn:
-            rows = conn.execute(
-                'SELECT summary FROM delivery_claims WHERE group_id=? AND claimed>=? ORDER BY claimed DESC LIMIT 20',
-                (self.group_id, datetime.now(timezone.utc).timestamp() - 86400),
-            ).fetchall()
-        return '\n'.join(row[0] for row in rows)
+        return '\n'.join(self.recent_summaries(limit=20))
 
     def _ensure_schedule_row(self, conn):
         conn.execute(
