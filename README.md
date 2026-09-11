@@ -16,7 +16,7 @@
 - **加密内容过滤**：模型调用前后过滤加密货币及区块链内容；规则仍可能误伤或漏网。
 - **按组主题策略**：新闻组以 digest 提示词做主合规（宁可漏报）；可选的 `topic_filters.yaml` 只是按组本地正则安全网。词表不进代码仓库，部署时按组挂载策略文件。
 - **北京时间弹性静默**：按 `Asia/Shanghai` 窗口调整评估门槛与飞书推送；采集仍全天运行。跨午夜窗口（如 `23:00-01:00`）按半开区间 `[start, end)` 解析。
-- **微信公众号图片素材**：分组 id 是 `old_photos`，digest 提示词变体是 `wechat_photo`（不是两个产品）。与 `news24` 对等隔离。只收照片/相册，按**内容匹配**而不是时效；不拦截频道发布时间或 `event_at`。可按 `scrape_history_pages` 用 `?before=` 向更早预览页回填（有页预算，整页已入库则停）。本地安全阀拒绝黄赌毒暴与时政敏感，`wechat_photo` 提示词宁缺毋滥；飞书卡只有标题、≤100 字说明和卡内嵌图（飞书应用上传 `image_key`；失败则回退为图片链接），无投资影响、无 Telegram/`t.me` 痕迹。示例节奏（约 1 小时冷却、每日 8 次软顶）写在 `config.yaml.example`，不是全局代码默认。图片不送入模型，CodeBuddy token 不变。
+- **微信公众号图片素材**：分组 id 是 `old_photos`，digest 提示词变体是 `wechat_photo`（不是两个产品）。与 `news24` 对等隔离。只收照片/相册，按**内容匹配**而不是时效；不拦截频道发布时间或 `event_at`。可按 `scrape_history_pages` 用 `?before=` 向更早预览页回填（有页预算，整页已入库则停；`scrape_history_max_new_posts` 可再限制每频道每轮新帖）。本地安全阀拒绝黄赌毒暴与时政敏感，`wechat_photo` 提示词宁缺毋滥；飞书卡只有标题、≤100 字说明和**最多 1 张**卡内嵌图（飞书应用上传 `image_key`；失败则回退为图片链接），无投资影响、无 Telegram/`t.me` 痕迹。每轮 digest 硬顶最多 2 条，多出的标 `wechat_digest_cap`。示例节奏（约 1 小时冷却、每日 8 次软顶）写在 `config.yaml.example`，不是全局代码默认。图片不送入模型，CodeBuddy token 不变。
 
 语义去重和时间提取依赖模型，不能保证百分之百准确。严格时效可能漏掉时间不明的消息；进程崩溃或投递不明也可能漏推。当前没有完整持久化发件箱、PDF/OCR或独立研报摘要通道。夜间识别仍可能漏报或误报。
 
@@ -207,9 +207,9 @@ CODEBUDDY_TIMEOUT=300
 |---|---|
 | 进料 | 仅 `has_media` 且 `media_type` 为 `photo`/`album`、且 `media_urls` 非空。纯文字、纯视频丢掉。短说明不因字数不够被当成垃圾。默认按 `scrape_history_pages`（示例 10）在最新预览页之后用 `?before=<本页最旧 message_id>` 向更早页翻；一页没有新未处理帖或空页则停，可用 `scrape_history_max_new_posts` 做每频道每轮软顶。新闻组默认仍只抓最新一页。 |
 | 本地硬过滤 | 黄赌毒、血腥暴力、领导人/党宣、当代地缘鼓动、以及新闻/能源/冲突类（如「原油」「美伊」「冲突」、分类「能源」）直接拒绝，宁错杀。过不了的不进模型；发送前再拦一次，且必须有可点击图片 URL。 |
-| 模型 | `prompt_variant: wechat_photo`，比 `story` 更严：只要适合大陆公众号的历史/文化静帧；无把握不选。 |
+| 模型 | `prompt_variant: wechat_photo`，比 `story` 更严：只要适合大陆公众号的历史/文化静帧；无把握不选；每轮最多 0–2 条，不用同主题照片凑数。 |
 | 说明 | 模型写中文完整句，≤100 字，不以省略号收尾，无时政评论；发送前再截断一次。 |
-| 飞书卡 | 标题 + 说明 + **卡内嵌图**（发送前把 `media_urls` 的 http(s) 图下载并 `POST /im/v1/images` 上传，卡片用 `img` / `img_key`，最多 9 张）。部分失败则嵌入成功的；全部失败或未配置 `FEISHU_APP_ID`/`FEISHU_APP_SECRET` 时回退为可点击图片链接。**无**投资影响、**无**频道名/`t.me`/原文。图片只在发卡时上传，**不**送进 CodeBuddy。 |
+| 飞书卡 | 标题 + 说明 + **卡内嵌图 1 张**（只取第一条可展示 URL / 第一个 `image_key`；发送前把该 http(s) 图下载并 `POST /im/v1/images` 上传）。失败或未配置 `FEISHU_APP_ID`/`FEISHU_APP_SECRET` 时回退为可点击图片链接。**无**投资影响、**无**频道名/`t.me`/原文。图片只在发卡时上传，**不**送进 CodeBuddy。每轮 sanitize 后硬顶 ≤2 条，多出的标 `wechat_digest_cap`。 |
 | 节奏 | 非实时、看内容匹配。默认 `digest_min_interval_seconds=3600`、`digest_max_calls_per_day=8`、`digest_min_candidates=2`、`digest_max_wait_seconds=7200`。`wechat_photo` **不**用频道 `published_at` 或 `event_at` 做时效拦截（`news24` 仍拦截）。`news_max_age_seconds: 0` 表示不限龄，可与显式 wechat 跳过同时用。关闭 `quiet_hours` / 晨报。频率可以后再调组级旋钮。 |
 
 历史影像本身可以很旧，因此该组按内容适合度筛选，不用发布时间卡候选或发卡（`news24` 的 30 分钟时效不变）。图片像素不做识别，只能靠说明文字与模型。启用嵌图：在 `.env` 设置 `FEISHU_APP_ID` / `FEISHU_APP_SECRET`（`wechat_photo` 的 `embed_images` 默认为 true）。关掉嵌图可在该组 `card_profile.embed_images: false`，卡片会继续用 markdown 链接。

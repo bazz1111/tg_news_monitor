@@ -223,7 +223,7 @@ class TestWechatCard:
         assert "弄堂石库门" in blob
         assert "上海石库门弄堂" in blob
         assert "https://cdn.example.com/a.jpg" in blob
-        assert "https://cdn.example.com/b.jpg" in blob
+        assert "https://cdn.example.com/b.jpg" not in blob
         assert "t.me" not in blob
         assert "投资影响" not in blob
         assert "发布时间" not in blob
@@ -245,15 +245,16 @@ class TestWechatCard:
         )
         blob = str(card)
         keys = _img_keys(card)
-        assert keys == ["img_v2_aaa", "img_v2_bbb"]
+        assert keys == ["img_v2_aaa"]
         imgs = [el for el in card["card"]["body"]["elements"] if el.get("tag") == "img"]
-        assert imgs
+        assert len(imgs) == 1
         for el in imgs:
             assert "mode" not in el
             assert el.get("scale_type") in {None, "crop_center", "crop_top", "fit_horizontal"}
             assert el.get("img_key")
             assert el.get("alt", {}).get("tag") == "plain_text"
         assert "img_v2_aaa" in blob
+        assert "img_v2_bbb" not in blob
         assert "https://cdn.example.com/a.jpg" not in blob
         assert "t.me" not in blob
         assert "投资影响" not in blob
@@ -338,6 +339,11 @@ class TestWechatPromptAndConfig:
         assert wechat == WECHAT_PHOTO_DIGEST_SYSTEM_PROMPT
         assert news == DIGEST_SYSTEM_PROMPT
         assert "宁缺毋滥" in wechat
+        assert "0–2" in wechat
+        assert "同主题" in wechat
+        assert "精选0–5条" in news
+        assert "精选0–2条" not in news
+        assert "0–2" not in news
         assert "≤100" in wechat or "100字" in wechat
         assert "四维方向标签" in news
         assert "利多" in news
@@ -348,7 +354,11 @@ class TestWechatPromptAndConfig:
         news = build_digest_user_prompt([post], variant="news")
         assert "photo_urls:" in wechat
         assert "https://cdn.example.com/clock.jpg" in wechat
+        assert "0–2" in wechat
+        assert "同主题" in wechat
         assert "photo_urls:" not in news
+        assert "0–5" in news
+        assert "0–2" not in news
 
 
 class TestWechatRunnerIsolation:
@@ -505,7 +515,7 @@ class TestWechatRunnerIsolation:
         assert "投资情报快报" in payloads
         assert "公众号图片素材" in payloads
         assert "cdn.example.com/lane.jpg" in payloads
-        assert "cdn.example.com/tram.jpg" in payloads
+        assert "cdn.example.com/tram.jpg" not in payloads
         assert "t.me" not in payloads
         assert "发布时间" in payloads  # news card only
         photo_card = next(
@@ -514,6 +524,40 @@ class TestWechatRunnerIsolation:
         assert "发布时间" not in str(photo_card)
         assert "投资影响" not in str(photo_card)
         assert "t.me" not in str(photo_card)
+
+    def test_digest_hard_caps_to_two_photos(self, tmp_path):
+        db = str(tmp_path / "cap.db")
+        repo = PostRepository(db)
+        now = _now()
+        repo.save_posts(
+            [
+                _post(41, "老城墙下一排槐树。", published_at=now),
+                _post(42, "石库门弄堂里晾着衣裳。", published_at=now),
+                _post(43, "河埠头有人在洗菜。", published_at=now),
+            ],
+            group_id="old_photos",
+        )
+        evaluator = MockEvaluator(digest_builder=self._builder())
+        sender = MockWebhookSender()
+        runner = NewsMonitorRunner(self._settings(db), repo, MockScraper(), evaluator, sender)
+        summary = runner.process_pending(now=now)
+        photo_cards = [p for p in sender.sent_payloads if "公众号图片素材" in str(p)]
+        assert len(photo_cards) == 2
+        assert summary["alerts_sent"] == 2
+        capped = [
+            mid
+            for mid in (41, 42, 43)
+            if repo.get_post("oldpix", mid, group_id="old_photos")["filter_reason"]
+            == "wechat_digest_cap"
+        ]
+        assert len(capped) == 1
+        sent = [
+            mid
+            for mid in (41, 42, 43)
+            if repo.get_post("oldpix", mid, group_id="old_photos").get("alert_sent")
+        ]
+        assert len(sent) == 2
+        assert set(capped).isdisjoint(sent)
 
     def test_send_embeds_img_when_upload_ok(self, tmp_path):
         db = str(tmp_path / "embed_ok.db")
@@ -550,6 +594,7 @@ class TestWechatRunnerIsolation:
             assert runner._send_digest_item_card(item) is True
         payload = sender.sent_payloads[0]
         assert _img_keys(payload) == ["img_v2_a"]
+        assert uploader.calls == [["https://cdn.example.com/a.jpg"]]
         blob = str(payload)
         assert "cdn.example.com/b.jpg" not in blob
         assert "t.me" not in blob
