@@ -40,5 +40,9 @@ Thumbs.db
 # Local production groups config (secrets stay in .env)
 config.yaml
 
+# Live per-group topic policy (ops file; example is committed)
+topic_filters.yaml
+
+
 # Packaging leftovers
 *.egg-info/

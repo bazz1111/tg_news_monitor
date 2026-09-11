@@ -14,6 +14,7 @@
 - **投资方向标签**：`bias_*` 仅允许利多/利空/中性/不确定，须与对应 `impact_*` 说明方向一致；有明确支撑/承压时不得默认中性或不确定。
 - **不明投递避免重发**：主流程默认只尝试一次Webhook，提前记录投递认领；结果不明记为 `unknown`，不自动重试。
 - **加密内容过滤**：模型调用前后过滤加密货币及区块链内容；规则仍可能误伤或漏网。
+- **按组主题策略**：新闻组以 digest 提示词做主合规（宁可漏报）；可选的 `topic_filters.yaml` 只是按组本地正则安全网。词表不进代码仓库，部署时按组挂载策略文件。
 - **北京时间弹性静默**：按 `Asia/Shanghai` 窗口调整评估门槛与飞书推送；采集仍全天运行。跨午夜窗口（如 `23:00-01:00`）按半开区间 `[start, end)` 解析。
 - **微信公众号图片素材（`old_photos`）**：与 `news24` 对等隔离。只收照片/相册，按**内容匹配**而不是时效；不拦截频道发布时间或 `event_at`。可按 `scrape_history_pages` 用 `?before=` 向更早预览页回填（有页预算，整页已入库则停）。本地安全阀拒绝黄赌毒暴与时政敏感，`wechat_photo` 提示词宁缺毋滥；飞书卡只有标题、≤100 字说明和卡内嵌图（飞书应用上传 `image_key`；失败则回退为图片链接），无投资影响、无 Telegram/`t.me` 痕迹。默认低频（约 1 小时冷却、每日 8 次软顶）。图片不送入模型，CodeBuddy token 不变。
 
@@ -220,6 +221,10 @@ CODEBUDDY_TIMEOUT=300
 存储与去重按 `group_id` 隔离：帖子唯一键为 `(group_id, channel, message_id)`，投递指纹与晨报/静默认领也按组分开。同一正文可以分别推到两个组的 webhook。日志带 `group=<id>`。
 
 Docker 若使用 `config.yaml`，把它挂进容器并设置 `CONFIG_PATH`，例如 `./config.yaml:/app/config.yaml:ro`。
+
+### 按组主题策略文件
+
+复制 [topic_filters.yaml.example](topic_filters.yaml.example) 为 `topic_filters.yaml`（已 gitignore）。按 `groups.<id>` 填写各组策略；缺组走 `default`；缺文件或 `enabled: false` 则主题过滤关闭（广告/加密过滤仍生效）。部署时与 `config.yaml` 一样只读挂载，并用 `TOPIC_FILTERS_PATH` 或配置项 `topic_filters_path` 指向该文件。不要把生产词表写进仓库或贴进 PR。
 
 | 变量 | 代码默认 | 均衡建议 | 说明 |
 |---|---:|---:|---|

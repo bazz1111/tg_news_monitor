@@ -702,10 +702,22 @@ class Settings(_BaseClass):
         default=None,
         description="Optional HTTPS proxy URL for web requests",
     )
+    topic_filters_path: Optional[str] = Field(
+        default=None,
+        description="Path to per-group topic-policy YAML. Env: TOPIC_FILTERS_PATH",
+    )
 
     # --------------------------------------------------------------------------
     # Field Validators
     # --------------------------------------------------------------------------
+
+    @field_validator("topic_filters_path", mode="before")
+    @classmethod
+    def parse_topic_filters_path(cls, value: Any) -> Optional[str]:
+        if value is None:
+            return None
+        text = str(value).strip()
+        return text or None
 
     @field_validator("telegram_channels", mode="before")
     @classmethod

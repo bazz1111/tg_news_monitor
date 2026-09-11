@@ -13,6 +13,8 @@ services:
     volumes:
       - ./data:/app/data
       - ./config.yaml:/app/config.yaml:ro
+      # Optional: copy topic_filters.yaml.example first; do not commit the live file.
+      # - ./topic_filters.yaml:/app/topic_filters.yaml:ro
     logging:
       driver: "json-file"
       options:
@@ -22,3 +24,4 @@ services:
       - PYTHONUNBUFFERED=1
       - DB_PATH=/app/data/tg_news.db
       - CONFIG_PATH=/app/config.yaml
+      # - TOPIC_FILTERS_PATH=/app/topic_filters.yaml
