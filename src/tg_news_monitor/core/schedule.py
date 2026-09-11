@@ -12,15 +12,27 @@ MODE_SHOULDER = "shoulder"
 MODE_QUIET = "quiet"
 
 
+# Known aliases when tzdata is missing. Typos must not silently become UTC.
+_TZ_FIXED_OFFSETS = {
+    "Asia/Shanghai": timezone(timedelta(hours=8)),
+    "Asia/Beijing": timezone(timedelta(hours=8)),
+    "PRC": timezone(timedelta(hours=8)),
+    "CST": timezone(timedelta(hours=8)),
+}
+
+
 def load_zone(name: str):
-    """Resolve an IANA zone; Asia/Shanghai falls back to UTC+8 if tzdata is missing."""
+    """Resolve an IANA zone. Known China aliases may use UTC+8 if tzdata is absent.
+
+    Invalid names raise ValueError — they must not fall back to UTC.
+    """
     key = (name or "").strip() or "Asia/Shanghai"
     try:
         return ZoneInfo(key)
-    except (ZoneInfoNotFoundError, Exception):
-        if key in {"Asia/Shanghai", "Asia/Beijing", "PRC", "CST"}:
-            return timezone(timedelta(hours=8))
-        return timezone.utc
+    except ZoneInfoNotFoundError:
+        if key in _TZ_FIXED_OFFSETS:
+            return _TZ_FIXED_OFFSETS[key]
+        raise ValueError(f"unknown timezone: {key!r}") from None
 
 
 def parse_hhmm(token: str) -> int:

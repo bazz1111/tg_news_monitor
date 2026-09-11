@@ -2,8 +2,61 @@
 
 import random
 import time
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional
 import httpx
+
+_MAX_BACKOFF_EXPONENT = 16
+
+
+def interruptible_sleep(
+    seconds: float,
+    should_stop: Optional[Callable[[], bool]] = None,
+    slice_seconds: float = 0.5,
+) -> bool:
+    """Sleep up to ``seconds`` unless ``should_stop`` becomes true. Returns True if interrupted."""
+    remaining = max(0.0, float(seconds))
+    if remaining <= 0:
+        return bool(should_stop and should_stop())
+    if should_stop is None:
+        time.sleep(remaining)
+        return False
+    end = time.time() + remaining
+    while time.time() < end:
+        if should_stop():
+            return True
+        time.sleep(min(slice_seconds, max(0.0, end - time.time())))
+    return bool(should_stop())
+
+
+def capped_backoff(factor: float, errors: int, scale: float, cap: float) -> float:
+    """``min(cap, factor ** errors * scale)`` without overflowing a huge exponent."""
+    try:
+        exp = min(max(0, int(errors)), _MAX_BACKOFF_EXPONENT)
+    except (TypeError, ValueError):
+        exp = 0
+    try:
+        delay = (float(factor) ** exp) * float(scale)
+    except OverflowError:
+        return float(cap)
+    if delay != delay:
+        return float(cap)
+    return min(float(cap), delay)
+
+
+def parse_retry_after(value: Optional[str], cap: float) -> Optional[float]:
+    """Parse Retry-After seconds and clamp to ``cap``. Non-numeric headers are ignored."""
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        seconds = float(text)
+    except (TypeError, ValueError):
+        return None
+    if seconds < 0:
+        seconds = 0.0
+    return min(float(cap), seconds)
 
 
 # Modern real-world desktop and mobile user agents for rotating headers
@@ -38,6 +91,7 @@ class TelegramScraperClient:
         timeout: float = 15.0,
         user_agents: Optional[List[str]] = None,
         http_client: Optional[httpx.Client] = None,
+        stop_check: Optional[Callable[[], bool]] = None,
     ):
         self.base_interval = base_interval
         self.jitter_ratio = jitter_ratio
@@ -47,7 +101,11 @@ class TelegramScraperClient:
         self.timeout = timeout
         self.user_agents = user_agents or DEFAULT_USER_AGENTS
         self._external_client = http_client
+        self.stop_check = stop_check
         self.consecutive_errors = 0
+
+    def _sleep(self, seconds: float) -> bool:
+        return interruptible_sleep(seconds, self.stop_check)
 
     def get_random_headers(self) -> Dict[str, str]:
         """Generates realistic modern browser headers with rotating User-Agent."""
@@ -116,28 +174,34 @@ class TelegramScraperClient:
 
                 elif response.status_code == 429:
                     self.consecutive_errors += 1
-                    retry_after_str = response.headers.get("Retry-After")
-                    if retry_after_str and retry_after_str.isdigit():
-                        sleep_seconds = float(retry_after_str) + random.uniform(0.5, 2.0)
+                    retry_after = parse_retry_after(
+                        response.headers.get("Retry-After"), self.max_backoff
+                    )
+                    if retry_after is not None:
+                        sleep_seconds = retry_after + random.uniform(0.5, 2.0)
                     else:
-                        sleep_seconds = min(
+                        sleep_seconds = capped_backoff(
+                            self.backoff_factor,
+                            self.consecutive_errors,
+                            5.0,
                             self.max_backoff,
-                            (self.backoff_factor ** self.consecutive_errors) * 5.0,
                         ) + random.uniform(0.5, 2.0)
+                    sleep_seconds = min(self.max_backoff, sleep_seconds)
 
                     if attempt < self.max_retries:
-                        time.sleep(sleep_seconds)
+                        if self._sleep(sleep_seconds):
+                            return None
                         continue
                     return None
 
                 elif 500 <= response.status_code < 600:
                     self.consecutive_errors += 1
-                    sleep_seconds = min(
-                        60.0,
-                        (self.backoff_factor ** self.consecutive_errors) * 2.0,
+                    sleep_seconds = capped_backoff(
+                        self.backoff_factor, self.consecutive_errors, 2.0, 60.0
                     ) + random.uniform(0.2, 1.0)
                     if attempt < self.max_retries:
-                        time.sleep(sleep_seconds)
+                        if self._sleep(sleep_seconds):
+                            return None
                         continue
                     return None
 
@@ -151,9 +215,12 @@ class TelegramScraperClient:
 
             except (httpx.TimeoutException, httpx.NetworkError, httpx.RequestError):
                 self.consecutive_errors += 1
-                sleep_seconds = min(30.0, (self.backoff_factor ** self.consecutive_errors) * 1.5)
+                sleep_seconds = capped_backoff(
+                    self.backoff_factor, self.consecutive_errors, 1.5, 30.0
+                )
                 if attempt < self.max_retries:
-                    time.sleep(sleep_seconds)
+                    if self._sleep(sleep_seconds):
+                        return None
                     continue
                 return None
 

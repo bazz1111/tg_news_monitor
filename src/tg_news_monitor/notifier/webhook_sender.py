@@ -28,6 +28,7 @@ except ImportError:
 
 from tg_news_monitor.core.models import NewsEvaluation, TelegramPost
 from tg_news_monitor.notifier.feishu_card import FeishuCardBuilder
+from tg_news_monitor.scraper.client import interruptible_sleep, parse_retry_after
 
 
 def generate_signature(timestamp: Union[int, str], secret: str) -> str:
@@ -62,6 +63,7 @@ class FeishuWebhookSender:
         backoff_factor: float = 2.0,
         timeout: float = 10.0,
         http_client: Optional[httpx.Client] = None,
+        stop_check: Optional[Any] = None,
     ) -> None:
         """Initializes the Feishu webhook sender.
 
@@ -83,6 +85,7 @@ class FeishuWebhookSender:
         self.backoff_factor = backoff_factor
         self.timeout = timeout
         self._external_client = http_client
+        self.stop_check = stop_check
 
     @staticmethod
     def generate_signature(timestamp: Union[int, str], secret: str) -> str:
@@ -133,10 +136,15 @@ class FeishuWebhookSender:
             attempt: 1-based attempt index (1, 2, ...).
             retry_after: Value of HTTP Retry-After header if present.
         """
-        if retry_after and retry_after.strip().isdigit():
-            return max(0.1, float(retry_after) + random.uniform(0.1, 0.5))
+        parsed = parse_retry_after(retry_after, self.max_delay)
+        if parsed is not None:
+            return max(0.1, parsed + random.uniform(0.1, 0.5))
 
-        delay = self.base_delay * (self.backoff_factor ** (attempt - 1))
+        try:
+            exp = min(max(0, int(attempt) - 1), 16)
+            delay = self.base_delay * (self.backoff_factor ** exp)
+        except (OverflowError, TypeError, ValueError):
+            delay = self.max_delay
         delay += random.uniform(0.05, 0.25)
         return max(0.05, min(self.max_delay, delay))
 
@@ -205,7 +213,8 @@ class FeishuWebhookSender:
                         )
                         if attempt < self.max_retries:
                             backoff = self.calculate_backoff(attempt)
-                            time.sleep(backoff)
+                            if interruptible_sleep(backoff, self.stop_check):
+                                return False
                             continue
                         else:
                             logger.error(f"Feishu rate limit retries exhausted on code 19001: {last_error_reason}")
@@ -227,7 +236,8 @@ class FeishuWebhookSender:
                     )
                     if attempt < self.max_retries:
                         backoff = self.calculate_backoff(attempt, retry_after=retry_after)
-                        time.sleep(backoff)
+                        if interruptible_sleep(backoff, self.stop_check):
+                            return False
                         continue
                     else:
                         logger.error(f"HTTP 429 retries exhausted: {last_error_reason}")
@@ -241,7 +251,8 @@ class FeishuWebhookSender:
                     )
                     if attempt < self.max_retries:
                         backoff = self.calculate_backoff(attempt)
-                        time.sleep(backoff)
+                        if interruptible_sleep(backoff, self.stop_check):
+                            return False
                         continue
                     else:
                         logger.error(f"Server error retries exhausted: {last_error_reason}")
@@ -262,7 +273,8 @@ class FeishuWebhookSender:
                 )
                 if attempt < self.max_retries:
                     backoff = self.calculate_backoff(attempt)
-                    time.sleep(backoff)
+                    if interruptible_sleep(backoff, self.stop_check):
+                        return False
                     continue
                 else:
                     logger.error(f"Network error retries exhausted: {exc}")

@@ -1,17 +1,12 @@
 """Feishu (Lark) Interactive Message Card Schema 2.0 Builder.
 
-Constructs rich interactive alert cards compliant with Feishu Card Schema 2.0:
-- Dynamic 4-tier color templates (red, orange, blue, grey) and standard icon badges based on Grok urgency score.
-- Structured Chinese headline with category tag and score indicator.
-- Markdown summary block displaying urgency score, source channel, and bulleted news points.
-- Divider element (hr) providing clean visual hierarchy.
-- Key takeaways block highlighting market/industry impact.
-- Note element with UTC publication timestamp, message ID, and forward attribution.
-- Primary action button linking directly to the original Telegram post (https://t.me/{channel}/{message_id}).
+Production send path uses digest / wechat cards with no Telegram outbound links.
+`build_card` is a legacy helper kept for unit tests; do not call it from the runner.
 """
 
 from __future__ import annotations
 
+import warnings
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Union
 from datetime import timedelta
@@ -123,17 +118,16 @@ class FeishuCardBuilder:
         evaluation: Union[NewsEvaluation, Dict[str, Any]],
         subtitle: str = "Telegram 实时新闻监控中心",
     ) -> Dict[str, Any]:
-        """Constructs a complete Feishu Interactive Card Schema 2.0 payload.
+        """Legacy single-post card including a Telegram link button.
 
-        Args:
-            post: Scraped TelegramPost domain model or equivalent dictionary.
-            evaluation: NewsEvaluation result or equivalent dictionary.
-            subtitle: Card header subtitle string.
-
-        Returns:
-            Dict conforming to Feishu Interactive Card Schema 2.0 structure:
-            {"msg_type": "interactive", "card": {"schema": "2.0", ...}}
+        Production uses digest/wechat builders without outbound links.
         """
+        warnings.warn(
+            "FeishuCardBuilder.build_card is a legacy Telegram-link helper; "
+            "production sends digest cards without t.me links.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         # Extract post attributes safely
         if isinstance(post, dict):
             channel = str(post.get("channel", "telegram")).lstrip("@")
@@ -675,7 +669,12 @@ def build_card(
     evaluation: Union[NewsEvaluation, Dict[str, Any]],
     subtitle: str = "Telegram 实时新闻监控中心",
 ) -> Dict[str, Any]:
-    """Module-level helper to build Feishu Interactive Card Schema 2.0."""
+    """Deprecated legacy helper. Production does not export this path."""
+    warnings.warn(
+        "build_card is deprecated; production uses digest cards without Telegram links.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     return FeishuCardBuilder.build_card(post, evaluation, subtitle)
 
 

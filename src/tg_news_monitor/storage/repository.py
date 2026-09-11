@@ -6,7 +6,13 @@ from typing import List, Optional, Sequence, Union, overload
 
 from tg_news_monitor.config import DEFAULT_LEGACY_GROUP_ID
 from tg_news_monitor.core.models import TelegramPost
-from tg_news_monitor.storage.database import db_session, init_db, safe_group_id
+from tg_news_monitor.storage.database import (
+    db_session,
+    init_db,
+    purge_retention,
+    record_heartbeat,
+    safe_group_id,
+)
 
 
 class PostRepository:
@@ -366,26 +372,37 @@ class PostRepository:
             group_id=group_id,
         )
 
-    def list_pending_with_scraped_at(self, group_id: Optional[str] = None) -> List[tuple]:
+    def list_pending_with_scraped_at(
+        self,
+        group_id: Optional[str] = None,
+        limit: Optional[int] = None,
+    ) -> List[tuple]:
         """Return unevaluated posts as (TelegramPost, scraped_at) ordered by scraped_at ASC."""
+        cap = None
+        if limit is not None:
+            try:
+                cap = int(limit)
+            except (TypeError, ValueError):
+                cap = None
+            if cap is not None and cap <= 0:
+                return []
         with db_session(self.db_path) as conn:
             if group_id:
-                cursor = conn.execute(
-                    """
-                    SELECT * FROM posts
-                    WHERE evaluated_at IS NULL AND group_id = ?
-                    ORDER BY scraped_at ASC, message_id ASC
-                    """,
-                    (self._gid(group_id),),
+                sql = (
+                    "SELECT * FROM posts WHERE evaluated_at IS NULL AND group_id = ? "
+                    "ORDER BY scraped_at ASC, message_id ASC"
                 )
+                params: tuple = (self._gid(group_id),)
             else:
-                cursor = conn.execute(
-                    """
-                    SELECT * FROM posts
-                    WHERE evaluated_at IS NULL
-                    ORDER BY scraped_at ASC, message_id ASC
-                    """
+                sql = (
+                    "SELECT * FROM posts WHERE evaluated_at IS NULL "
+                    "ORDER BY scraped_at ASC, message_id ASC"
                 )
+                params = ()
+            if cap is not None:
+                sql += " LIMIT ?"
+                params = params + (cap,)
+            cursor = conn.execute(sql, params)
             rows = cursor.fetchall()
 
         result: List[tuple] = []
@@ -397,9 +414,19 @@ class PostRepository:
             result.append((post, scraped_at))
         return result
 
-    def list_pending_posts(self, group_id: Optional[str] = None) -> List[TelegramPost]:
-        """Return all posts with evaluated_at IS NULL as TelegramPost models."""
-        return [post for post, _ in self.list_pending_with_scraped_at(group_id=group_id)]
+    def list_pending_posts(
+        self,
+        group_id: Optional[str] = None,
+        limit: Optional[int] = None,
+    ) -> List[TelegramPost]:
+        """Return posts with evaluated_at IS NULL as TelegramPost models."""
+        return [post for post, _ in self.list_pending_with_scraped_at(group_id=group_id, limit=limit)]
+
+    def purge_retention(self, now=None):
+        return purge_retention(self.db_path, now=now)
+
+    def record_heartbeat(self, name: str, now_ts=None) -> None:
+        record_heartbeat(self.db_path, name, now_ts=now_ts)
 
     def update_channel_state(
         self,
