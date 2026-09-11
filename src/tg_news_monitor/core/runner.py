@@ -334,6 +334,105 @@ class NewsMonitorRunner:
     def _is_wechat_photo(self) -> bool:
         return is_wechat_photo_variant(getattr(self._card_profile, "prompt_variant", None))
 
+    def _skip_publish_freshness(self) -> bool:
+        """wechat_photo is content-fit, not timely. news_max_age_seconds=0 is also unlimited."""
+        if self._is_wechat_photo():
+            return True
+        max_age = getattr(self._group_config, "news_max_age_seconds", None)
+        try:
+            return max_age is not None and int(max_age) <= 0
+        except (TypeError, ValueError):
+            return False
+
+    def _settings_for_group_id(self, group_id: Optional[str]):
+        """Resolve per-group overlays during ingest (run_once does not bind the group)."""
+        gid = group_id or self._group_id
+        getter = getattr(self.config, "group_by_id", None)
+        if callable(getter):
+            group = getter(gid)
+            if group is not None and hasattr(self.config, "group_settings"):
+                try:
+                    return self.config.group_settings(group)
+                except Exception:
+                    pass
+        return self.config
+
+    def _scrape_history_pages(self, cfg) -> int:
+        raw = getattr(cfg, "scrape_history_pages", 1)
+        try:
+            pages = int(raw if raw is not None else 1)
+        except (TypeError, ValueError):
+            pages = 1
+        return max(1, min(pages, 50))
+
+    def _scrape_history_max_new_posts(self, cfg) -> Optional[int]:
+        raw = getattr(cfg, "scrape_history_max_new_posts", None)
+        if raw is None:
+            return None
+        try:
+            cap = int(raw)
+        except (TypeError, ValueError):
+            return None
+        return cap if cap > 0 else None
+
+    def _history_page_delay(self) -> float:
+        """Small pause between ?before= pages. 0 when inter-channel delay is disabled."""
+        base = float(getattr(self.config, "inter_channel_delay_seconds", 2.0) or 0.0)
+        if base <= 0:
+            return 0.0
+        low = max(0.2, min(base * 0.4, 0.8))
+        high = max(low, min(base * 0.8, 1.6))
+        calc = getattr(self.scraper_client, "calculate_inter_channel_delay", None)
+        if callable(calc):
+            try:
+                return float(calc(low, high))
+            except TypeError:
+                return float(low)
+        return float(low)
+
+    def _fetch_channel_html(self, channel: str, before: Optional[int] = None) -> Optional[str]:
+        fetch = self.scraper_client.fetch_channel_html
+        try:
+            return fetch(channel, before=before)
+        except TypeError:
+            return fetch(channel)
+
+    def _parse_channel_posts(self, channel: str, html: str) -> List[TelegramPost]:
+        posts = TelegramWebParser.parse_channel_page(channel, html)
+        if not posts:
+            posts = TelegramWebParser.parse_html(html, default_channel=channel)
+        return list(posts or [])
+
+    def _filter_unprocessed_posts(
+        self,
+        channel: str,
+        posts: List[TelegramPost],
+        gid: str,
+    ) -> List[TelegramPost]:
+        try:
+            return self.storage.filter_unprocessed(channel, posts, group_id=gid)
+        except TypeError:
+            try:
+                return self.storage.filter_unprocessed(posts, group_id=gid)
+            except TypeError:
+                return self.storage.filter_unprocessed(posts)
+
+    def _save_discovered_posts(self, posts: List[TelegramPost], gid: str) -> None:
+        try:
+            self.storage.save_posts(posts, group_id=gid)
+        except TypeError:
+            self.storage.save_posts(posts)
+        except Exception as exc:
+            logger.warning(
+                f"group={gid} Batch save_posts encountered exception: {exc}. "
+                "Falling back to individual saves."
+            )
+            for post in posts:
+                try:
+                    self.storage.save_post(post, group_id=gid)
+                except TypeError:
+                    self.storage.save_post(post)
+
     def _wechat_image_keys(self, urls: List[str]) -> List[str]:
         """Upload wechat_photo media for in-card img. Empty list → markdown-link fallback."""
         profile = self._card_profile
@@ -393,6 +492,12 @@ class NewsMonitorRunner:
     ) -> Tuple[List[TelegramPost], Dict[str, Any]]:
         """Scrape + dedupe + save for one channel. Does NOT evaluate or alert.
 
+        Newest preview page first. Extra pages use ?before=<oldest id on current page>
+        up to scrape_history_pages. A fully ingested *latest* page still walks older
+        pages (so history backfill works after the first ~20). A later page with no
+        new posts means caught-up and stops. Empty page / page budget / new-post cap
+        also stop. Dedupes by existing (group_id, channel, message_id).
+
         Returns:
             (discovered_posts, channel_stats)
         """
@@ -410,110 +515,162 @@ class NewsMonitorRunner:
             "error": None,
         }
 
-        try:
-            html = self.scraper_client.fetch_channel_html(clean_channel)
-        except Exception as exc:
-            logger.error(f"Error fetching channel @{clean_channel}: {exc}")
-            self.storage.update_channel_state(
-                channel=clean_channel,
-                success=False,
-                error=str(exc),
-                group_id=gid,
-            )
-            result["success"] = False
-            result["error"] = str(exc)
-            return [], result
+        ingest_cfg = self._settings_for_group_id(gid)
+        page_budget = self._scrape_history_pages(ingest_cfg)
+        new_cap = self._scrape_history_max_new_posts(ingest_cfg)
 
-        if html is None:
-            err_msg = (
-                f"Failed to retrieve HTML for @{clean_channel} "
-                "(rate limit or network backoff exhausted)"
-            )
-            logger.warning(err_msg)
-            self.storage.update_channel_state(
-                channel=clean_channel,
-                success=False,
-                error=err_msg,
-                group_id=gid,
-            )
-            result["success"] = False
-            result["error"] = err_msg
-            return [], result
+        discovered: List[TelegramPost] = []
+        seen_ids: set[int] = set()
+        before: Optional[int] = None
+        max_message_id = 0
+        total_seen = 0
 
-        try:
-            posts = TelegramWebParser.parse_channel_page(clean_channel, html)
-            if not posts:
-                posts = TelegramWebParser.parse_html(html, default_channel=clean_channel)
-        except Exception as exc:
-            logger.error(f"Error parsing HTML for @{clean_channel}: {exc}")
-            self.storage.update_channel_state(
-                channel=clean_channel,
-                success=False,
-                error=f"Parsing error: {exc}",
-                group_id=gid,
-            )
-            result["success"] = False
-            result["error"] = f"Parsing error: {exc}"
-            return [], result
+        for page_idx in range(page_budget):
+            if page_idx > 0:
+                delay = self._history_page_delay()
+                if delay > 0:
+                    time.sleep(delay)
 
-        result["posts_seen"] = len(posts)
-        if not posts:
-            logger.debug(f"No posts extracted from @{clean_channel} HTML.")
-            self.storage.update_channel_state(
-                channel=clean_channel,
-                success=True,
-                messages_seen=0,
-                group_id=gid,
-            )
-            return [], result
-
-        try:
-            unprocessed_posts = self.storage.filter_unprocessed(
-                clean_channel, posts, group_id=gid
-            )
-        except TypeError:
             try:
-                unprocessed_posts = self.storage.filter_unprocessed(posts, group_id=gid)
-            except TypeError:
-                unprocessed_posts = self.storage.filter_unprocessed(posts)
+                html = self._fetch_channel_html(clean_channel, before=before)
+            except Exception as exc:
+                if page_idx == 0:
+                    logger.error(f"Error fetching channel @{clean_channel}: {exc}")
+                    self.storage.update_channel_state(
+                        channel=clean_channel,
+                        success=False,
+                        error=str(exc),
+                        group_id=gid,
+                    )
+                    result["success"] = False
+                    result["error"] = str(exc)
+                    return [], result
+                logger.warning(
+                    f"group={gid} @{clean_channel}: history page {page_idx + 1} "
+                    f"fetch failed ({exc}); keeping {len(discovered)} new post(s)."
+                )
+                break
 
-        result["posts_discovered"] = len(unprocessed_posts)
-        self.stats["total_posts_discovered"] += len(unprocessed_posts)
+            if html is None:
+                if page_idx == 0:
+                    err_msg = (
+                        f"Failed to retrieve HTML for @{clean_channel} "
+                        "(rate limit or network backoff exhausted)"
+                    )
+                    logger.warning(err_msg)
+                    self.storage.update_channel_state(
+                        channel=clean_channel,
+                        success=False,
+                        error=err_msg,
+                        group_id=gid,
+                    )
+                    result["success"] = False
+                    result["error"] = err_msg
+                    return [], result
+                logger.warning(
+                    f"group={gid} @{clean_channel}: history page {page_idx + 1} "
+                    "empty/failed; stopping pagination."
+                )
+                break
 
-        max_message_id = max((p.message_id for p in posts), default=0)
+            try:
+                posts = self._parse_channel_posts(clean_channel, html)
+            except Exception as exc:
+                if page_idx == 0:
+                    logger.error(f"Error parsing HTML for @{clean_channel}: {exc}")
+                    self.storage.update_channel_state(
+                        channel=clean_channel,
+                        success=False,
+                        error=f"Parsing error: {exc}",
+                        group_id=gid,
+                    )
+                    result["success"] = False
+                    result["error"] = f"Parsing error: {exc}"
+                    return [], result
+                logger.warning(
+                    f"group={gid} @{clean_channel}: history page {page_idx + 1} "
+                    f"parse failed ({exc}); stopping."
+                )
+                break
+
+            if not posts:
+                if page_idx == 0:
+                    logger.debug(f"No posts extracted from @{clean_channel} HTML.")
+                    self.storage.update_channel_state(
+                        channel=clean_channel,
+                        success=True,
+                        messages_seen=0,
+                        group_id=gid,
+                    )
+                    return [], result
+                break
+
+            page_posts = [p for p in posts if int(p.message_id) not in seen_ids]
+            for post in page_posts:
+                seen_ids.add(int(post.message_id))
+            total_seen += len(page_posts)
+            page_max = max((p.message_id for p in posts), default=0)
+            if page_max > max_message_id:
+                max_message_id = page_max
+
+            unprocessed = self._filter_unprocessed_posts(clean_channel, page_posts, gid)
+            if not unprocessed:
+                # Latest page already known: still walk older pages (history backfill).
+                # A later page with nothing new means we caught up with ingested history.
+                if page_idx == 0 and page_budget > 1:
+                    oldest = min(p.message_id for p in posts)
+                    if before is not None and oldest >= before:
+                        break
+                    before = oldest
+                    logger.info(
+                        f"group={gid} @{clean_channel}: latest page already ingested; "
+                        f"paging older history (budget={page_budget})."
+                    )
+                    continue
+                logger.debug(
+                    f"group={gid} @{clean_channel}: page {page_idx + 1} already processed. Caught up."
+                )
+                break
+
+            unprocessed = sorted(unprocessed, key=lambda p: int(p.message_id), reverse=True)
+            if new_cap is not None:
+                room = new_cap - len(discovered)
+                if room <= 0:
+                    break
+                if len(unprocessed) > room:
+                    unprocessed = unprocessed[:room]
+
+            self._save_discovered_posts(unprocessed, gid)
+            discovered.extend(unprocessed)
+            self.stats["total_posts_discovered"] += len(unprocessed)
+
+            if new_cap is not None and len(discovered) >= new_cap:
+                logger.info(
+                    f"group={gid} @{clean_channel}: scrape_history_max_new_posts="
+                    f"{new_cap} reached; stopping."
+                )
+                break
+
+            oldest = min(p.message_id for p in posts)
+            if before is not None and oldest >= before:
+                break
+            before = oldest
+
+        result["posts_seen"] = total_seen
+        result["posts_discovered"] = len(discovered)
         self.storage.update_channel_state(
             channel=clean_channel,
             last_message_id=max_message_id,
             success=True,
-            messages_seen=len(posts),
+            messages_seen=total_seen,
             group_id=gid,
         )
-
-        if not unprocessed_posts:
-            logger.debug(
-                f"group={gid} @{clean_channel}: All {len(posts)} messages already processed. Nothing new."
+        if discovered:
+            logger.info(
+                f"group={gid} @{clean_channel}: Discovered {len(discovered)} new unprocessed "
+                f"posts across history pages (budget={page_budget})."
             )
-            return [], result
-
-        logger.info(
-            f"group={gid} @{clean_channel}: Discovered {len(unprocessed_posts)} new unprocessed posts."
-        )
-
-        try:
-            self.storage.save_posts(unprocessed_posts, group_id=gid)
-        except TypeError:
-            self.storage.save_posts(unprocessed_posts)
-        except Exception as exc:
-            logger.warning(
-                f"group={gid} Batch save_posts encountered exception: {exc}. Falling back to individual saves."
-            )
-            for post in unprocessed_posts:
-                try:
-                    self.storage.save_post(post, group_id=gid)
-                except TypeError:
-                    self.storage.save_post(post)
-
-        return list(unprocessed_posts), result
+        return discovered, result
 
     def poll_channel(self, channel: str, group_id: Optional[str] = None) -> Dict[str, Any]:
         """Ingest-only channel pass (scrape+dedupe+save). No per-post evaluate/alert.
@@ -949,7 +1106,10 @@ class NewsMonitorRunner:
             return pass_summary
 
         pending_posts = [p for p, _ in pending_pairs]
+        skip_age = self._skip_publish_freshness()
         def eligible(post):
+            if skip_age:
+                return True
             return (quiet and self.quiet.in_window(post.published_at, clock)) or is_fresh(post.published_at, knobs.max_age_seconds, clock)
         expired = [p for p in pending_posts if not eligible(p)]
         self._mark_all_filtered(expired, "expired_or_invalid_time")
@@ -1192,7 +1352,7 @@ class NewsMonitorRunner:
                 send_knobs = alert_schedule.knobs_for(cfg, send_mode, now_local=send_local)
                 if quiet and send_mode != 'quiet':
                     continue
-                if not is_fresh(published_at, cfg.news_max_age_seconds, send_time):
+                if not self._skip_publish_freshness() and not is_fresh(published_at, cfg.news_max_age_seconds, send_time):
                     continue
                 if not self._is_wechat_photo() and not is_fresh(item.event_at, cfg.news_max_age_seconds, send_time):
                     self._mark_all_filtered([matched_post], 'event_time_unknown_or_expired')

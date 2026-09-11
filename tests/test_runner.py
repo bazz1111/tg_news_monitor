@@ -5,7 +5,7 @@ from __future__ import annotations
 import shutil
 import uuid
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from unittest.mock import MagicMock
@@ -55,12 +55,24 @@ def make_sample_html(channel: str, posts_data: List[Dict[str, Any]]) -> str:
 
 
 class MockScraper:
-    def __init__(self, html_map: Optional[Dict[str, Optional[str]]] = None):
+    def __init__(
+        self,
+        html_map: Optional[Dict[str, Optional[str]]] = None,
+        page_map: Optional[Dict[tuple, Optional[str]]] = None,
+    ):
         self.html_map = html_map or {}
+        self.page_map = page_map or {}
         self.fetch_calls: List[str] = []
+        self.fetch_args: List[tuple] = []
 
     def fetch_channel_html(self, channel: str, before: Optional[int] = None) -> Optional[str]:
         self.fetch_calls.append(channel)
+        self.fetch_args.append((channel, before))
+        key = (channel.lower().lstrip("@"), before)
+        if key in self.page_map:
+            return self.page_map[key]
+        if before is not None:
+            return None
         return self.html_map.get(channel)
 
     def calculate_jittered_delay(self, interval: Optional[float] = None) -> float:
@@ -559,4 +571,58 @@ class TestNewsMonitorRunner:
             assert "单卡测试#1" in joined
             assert "单卡测试#2" in joined
             assert "查看 Telegram" not in joined
+
+    def test_news_max_age_zero_sends_stale_published_at(self):
+        with local_temp_db() as db_path:
+            now = datetime.now(timezone.utc)
+            stale = now - timedelta(days=10)
+            channel = "wire"
+            repo = PostRepository(db_path=db_path)
+            repo.save_posts(
+                [
+                    TelegramPost(
+                        channel=channel,
+                        message_id=77,
+                        text="Federal Reserve hints at unexpected policy shift this quarter.",
+                        direct_url="https://t.me/wire/77",
+                        published_at=stale,
+                    )
+                ]
+            )
+            config = Settings(
+                telegram_channels=[channel],
+                db_path=db_path,
+                news_max_age_seconds=0,
+                digest_min_candidates=1,
+                digest_max_wait_seconds=0,
+                digest_min_interval_seconds=0,
+                digest_card_interval_seconds=0,
+            )
+            evaluator = MockEvaluator(
+                eval_map={
+                    77: NewsEvaluation(
+                        score=9,
+                        is_news=True,
+                        is_spam=False,
+                        title="政策转向",
+                        summary_bullets=["联储释放政策转向信号"],
+                        key_takeaways=["关注后续声明"],
+                        category="宏观快讯",
+                    )
+                }
+            )
+            webhook = MockWebhookSender()
+            runner = NewsMonitorRunner(
+                config=config,
+                storage=repo,
+                scraper_client=MockScraper(),
+                evaluator=evaluator,
+                webhook_sender=webhook,
+            )
+            summary = runner.process_pending(now=now)
+            assert summary["alerts_sent"] == 1
+            assert len(webhook.sent_payloads) == 1
+            record = repo.get_post(channel, 77)
+            assert record["alert_sent"] == 1
+            assert record.get("filter_reason") in {None, ""}
 

@@ -12,6 +12,11 @@ def test_freshness_budget_and_persistent_duplicate_claim(tmp_path):
     assert not is_fresh(now + timedelta(minutes=5), 1800)
     assert not is_fresh(now.replace(tzinfo=None), 1800)
     assert not is_fresh(PostRepository._parse_iso_dt(now.replace(tzinfo=None).isoformat()), 1800)
+    # 0 = unlimited age; still reject naive and far-future timestamps
+    assert is_fresh(now - timedelta(days=400), 0)
+    assert not is_fresh(now + timedelta(minutes=5), 0)
+    assert not is_fresh(now.replace(tzinfo=None), 0)
+    assert not is_fresh(None, 0)
     assert urgent('Central bank announces emergency rate cut')
     assert not urgent('Daily equity market commentary')
     db = str(tmp_path / 'policy.db')

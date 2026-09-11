@@ -54,6 +54,8 @@ GROUP_OVERRIDE_FIELDS = (
     "shoulder_hours",
     "hotness_threshold",
     "news_max_age_seconds",
+    "scrape_history_pages",
+    "scrape_history_max_new_posts",
     "digest_min_candidates",
     "digest_max_wait_seconds",
     "digest_min_interval_seconds",
@@ -203,7 +205,22 @@ class Group(BaseModel):
     quiet_hours: Optional[str] = None
     shoulder_hours: Optional[str] = None
     hotness_threshold: Optional[int] = Field(default=None, ge=1, le=10)
-    news_max_age_seconds: Optional[int] = Field(default=None, ge=60)
+    news_max_age_seconds: Optional[int] = Field(
+        default=None,
+        ge=0,
+        description="Publish-age gate in seconds. 0 = unlimited. wechat_photo also skips this gate.",
+    )
+    scrape_history_pages: Optional[int] = Field(
+        default=None,
+        ge=1,
+        le=50,
+        description="t.me/s preview pages to walk backward per channel per pass. 1 = latest page only.",
+    )
+    scrape_history_max_new_posts: Optional[int] = Field(
+        default=None,
+        ge=1,
+        description="Soft cap on newly ingested posts per channel per pass. None = no extra cap.",
+    )
     digest_min_candidates: Optional[int] = Field(default=None, ge=1)
     digest_max_wait_seconds: Optional[int] = Field(default=None, ge=0)
     digest_min_interval_seconds: Optional[int] = Field(default=None, ge=0)
@@ -577,7 +594,22 @@ class Settings(_BaseClass):
         description="Urgency score threshold (1-10) to trigger interactive Feishu alerts",
     )
 
-    news_max_age_seconds: int = Field(default=1800, ge=60)
+    news_max_age_seconds: int = Field(
+        default=1800,
+        ge=0,
+        description="Publish-age gate in seconds. 0 = unlimited (wechat_photo also skips the gate).",
+    )
+    scrape_history_pages: int = Field(
+        default=1,
+        ge=1,
+        le=50,
+        description="Default preview pages per channel per pass. 1 = latest page only (news).",
+    )
+    scrape_history_max_new_posts: Optional[int] = Field(
+        default=None,
+        ge=1,
+        description="Optional soft cap on new posts per channel per ingest pass.",
+    )
     digest_min_interval_seconds: int = Field(default=180, ge=0)
     digest_max_batch_size: int = Field(default=20, ge=1, le=50)
     digest_max_calls_per_day: int = Field(default=288, ge=1)
