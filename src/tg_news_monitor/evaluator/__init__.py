@@ -1,5 +1,10 @@
-"""Grok hot news evaluator, summarizer, and multi-stage fallback engine."""
+"""News evaluator: CodeBuddy CLI production path plus leftover HTTP client tests."""
 
+from tg_news_monitor.evaluator.codebuddy_client import (
+    CodeBuddyError,
+    CodeBuddyEvaluator,
+    create_evaluator,
+)
 from tg_news_monitor.evaluator.fallback import (
     BREAKING_KEYWORDS,
     MultiStageFallbackHandler,
@@ -8,6 +13,7 @@ from tg_news_monitor.evaluator.fallback import (
     heuristic_keyword_fallback,
     normalize_and_validate_evaluation,
     parse_and_repair_evaluation,
+    parse_digest_brief,
     repair_json_string,
     strip_markdown_code_fences,
 )
@@ -19,7 +25,6 @@ from tg_news_monitor.evaluator.grok_client import (
     GrokRateLimitError,
     GrokServerError,
     LLMEvaluatorClient,
-    create_evaluator,
 )
 from tg_news_monitor.evaluator.prompt import (
     DIGEST_SYSTEM_PROMPT,
@@ -34,6 +39,8 @@ from tg_news_monitor.evaluator.prompt import (
 )
 
 __all__ = [
+    "CodeBuddyEvaluator",
+    "CodeBuddyError",
     "GrokClient",
     "DeepSeekClient",
     "LLMEvaluatorClient",
@@ -42,6 +49,7 @@ __all__ = [
     "GrokRateLimitError",
     "GrokServerError",
     "GrokNetworkError",
+    "parse_digest_brief",
     "DIGEST_SYSTEM_PROMPT",
     "SYSTEM_PROMPT",
     "USER_PROMPT_TEMPLATE",

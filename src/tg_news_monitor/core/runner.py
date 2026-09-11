@@ -4,7 +4,7 @@ Coordinates:
 1. Public Telegram web preview scraping (TelegramScraperClient & TelegramWebParser).
 2. Local persistent deduplication store (PostRepository / SQLite).
 3. Pending buffer + cheap coarse filter + digest threshold gate.
-4. Batch digest evaluation via DeepSeek (one LLM call when gate opens).
+4. Batch digest evaluation via CodeBuddy CLI (one LLM call when gate opens).
 5. ONE Feishu card PER DigestItem (multi single cards; no Telegram links).
 6. Lifecycle status update in SQLite (evaluation, alert_sent, filtered).
 7. Execution modes: single-pass (`run_once`) and continuous monitoring daemon (`run_forever`).
@@ -55,7 +55,7 @@ from tg_news_monitor.core.wechat_photo import (
     wechat_photo_prefilter,
     wechat_photo_unsafe,
 )
-from tg_news_monitor.evaluator.grok_client import GrokClient
+from tg_news_monitor.evaluator.codebuddy_client import CodeBuddyEvaluator, create_evaluator
 from tg_news_monitor.notifier.feishu_card import FeishuCardBuilder
 from tg_news_monitor.notifier.feishu_images import FeishuImageUploader
 from tg_news_monitor.notifier.card_format import format_morning_item_md
@@ -66,7 +66,7 @@ from tg_news_monitor.storage.repository import PostRepository
 
 # Contract aliases
 MessageRepository = PostRepository
-GrokEvaluator = GrokClient
+GrokEvaluator = CodeBuddyEvaluator
 
 # Re-export filter helpers for backward-compatible test/import sites
 # (canonical home: tg_news_monitor.core.filters)
@@ -100,7 +100,7 @@ class NewsMonitorRunner:
         config: Optional[Settings] = None,
         storage: Optional[PostRepository] = None,
         scraper_client: Optional[TelegramScraperClient] = None,
-        evaluator: Optional[GrokClient] = None,
+        evaluator: Optional[Any] = None,
         webhook_sender: Optional[FeishuWebhookSender] = None,
         image_uploader: Any = None,
     ) -> None:
@@ -138,21 +138,20 @@ class NewsMonitorRunner:
                 jitter_ratio=jitter_ratio,
             )
 
-        # DeepSeek LLM Evaluator
+        # CodeBuddy CLI evaluator (primary → fallback model, then local heuristic)
         if evaluator is not None:
             self.evaluator = evaluator
         else:
-            self.evaluator = GrokClient(
-                api_key=self.config.deepseek_api_key,
-                api_base=self.config.deepseek_api_base,
-                model=self.config.deepseek_model,
-                provider="deepseek",
+            self.evaluator = create_evaluator(
+                api_key=self.config.codebuddy_api_key,
+                model=self.config.codebuddy_model,
+                fallback_model=self.config.codebuddy_fallback_model,
                 timeout=60.0,
-                max_retries=1,
+                cli_bin=getattr(self.config, "codebuddy_cli", "codebuddy"),
             )
             logger.info(
-                f"DeepSeek Evaluator initialized: model={self.config.deepseek_model}, "
-                f"api_base={self.config.deepseek_api_base}"
+                f"CodeBuddy Evaluator initialized: model={self.config.codebuddy_model}, "
+                f"fallback={self.config.codebuddy_fallback_model}"
             )
 
         self._init_group_runtimes(webhook_sender)
@@ -1369,7 +1368,8 @@ class NewsMonitorRunner:
             f"shoulder={getattr(self.config, 'shoulder_hours', '')!r}"
         )
         logger.info(
-            f"DeepSeek Model  : {self.config.deepseek_model} ({self.config.deepseek_api_base})"
+            f"CodeBuddy Model : {self.config.codebuddy_model} "
+            f"(fallback={self.config.codebuddy_fallback_model})"
         )
         logger.info(f"Database Path   : {self.config.db_path}")
         logger.info("=" * 60)

@@ -1,13 +1,13 @@
 # Telegram News Monitor
 
-从 Telegram 公开频道预览页采集新闻，经本地过滤与 DeepSeek 批量评估，将重要消息发送到飞书。无需 Telegram 账号或 Bot Token；公开页面仍可能限流、不可访问或改变结构。
+从 Telegram 公开频道预览页采集新闻，经本地过滤与 CodeBuddy CLI 批量评估，将重要消息发送到飞书。无需 Telegram 账号或 Bot Token；公开页面仍可能限流、不可访问或改变结构。
 
 适合个人或小团队的全球突发、宏观、军事和 AI 文字快讯筛选。完整分析见 [中文评估报告](REVIEW_REPORT.zh-CN.md)，推荐参数见 [均衡配置](monitor-tuning.env.example)。
 
 ## 更新内容
 
 - **采集与模型解耦**：守护进程继续采集，一个后台线程负责评估与推送，最多运行一个评估任务。
-- **调用成本限制**：持久化最小调用间隔和每日次数；默认每批20条、每条800字符，输出最多3000 tokens。模型失败保留候选，冷却后再试。
+- **调用成本限制**：持久化最小调用间隔和每日次数；默认每批20条、每条800字符。CodeBuddy CLI 文本输出不提供 `usage.total_tokens`，失败后保留候选，冷却后再试。
 - **分层去重**：频道/消息ID、规范化正文指纹、24小时投递记录，以及最近20条投递摘要供模型比较新增事实。新闻卡片在飞书发送前再做一次**确定性近重复校验**（同组 24h 内 `title+summary` 与已投递摘要的实体/数字重合；`$6.06` 与 `$6` 视为同一量级）。同事件且未带实质更新（`is_update` + `update_reason` 中的新数字或新实体）则跳过发送、标 `near_duplicate`、不记为已投递。不额外调用模型。`wechat_photo` 不走此守卫。
 - **旧闻拦截**：模型调用前和逐条推送前检查时间；默认频道发布时间和模型提取的事件时间均不得超过30分钟。缺失、无时区或明显未来时间不能作为新快讯。
 - **飞书卡片可读性**：单卡只展示「发布时间（北京时间）」；不展示页脚「事件时间」、不附带 `t.me` / 原文外链。摘要超过80字或超过2行时，在核心速览后追加「📌 事件详情」（优先模型要点，约3条）。晨报条目时间标为「北京时间：HH:MM」。
@@ -15,7 +15,7 @@
 - **不明投递避免重发**：主流程默认只尝试一次Webhook，提前记录投递认领；结果不明记为 `unknown`，不自动重试。
 - **加密内容过滤**：模型调用前后过滤加密货币及区块链内容；规则仍可能误伤或漏网。
 - **北京时间弹性静默**：按 `Asia/Shanghai` 窗口调整评估门槛与飞书推送；采集仍全天运行。跨午夜窗口（如 `23:00-01:00`）按半开区间 `[start, end)` 解析。
-- **微信公众号图片素材（`old_photos`）**：与 `news24` 对等隔离。只收照片/相册，本地安全阀拒绝黄赌毒暴与时政敏感，`wechat_photo` 提示词宁缺毋滥；飞书卡只有标题、≤100 字说明和卡内嵌图（飞书应用上传 `image_key`；失败则回退为图片链接），无投资影响、无 Telegram/`t.me` 痕迹。默认低频（约 1 小时冷却、每日 8 次软顶）。图片不送入模型，DeepSeek token 不变。
+- **微信公众号图片素材（`old_photos`）**：与 `news24` 对等隔离。只收照片/相册，本地安全阀拒绝黄赌毒暴与时政敏感，`wechat_photo` 提示词宁缺毋滥；飞书卡只有标题、≤100 字说明和卡内嵌图（飞书应用上传 `image_key`；失败则回退为图片链接），无投资影响、无 Telegram/`t.me` 痕迹。默认低频（约 1 小时冷却、每日 8 次软顶）。图片不送入模型，CodeBuddy token 不变。
 
 语义去重和时间提取依赖模型，不能保证百分之百准确。严格时效可能漏掉时间不明的消息；进程崩溃或投递不明也可能漏推。当前没有完整持久化发件箱、PDF/OCR或独立研报摘要通道。夜间识别仍可能漏报或误报。
 
@@ -71,7 +71,7 @@ flowchart LR
 
 ## 快速开始
 
-需要 Python 3.10+，网络能访问 Telegram 公开页面、DeepSeek 和飞书。
+需要 Python 3.10+，网络能访问 Telegram 公开页面、CodeBuddy（国内站）和飞书。本地非 Docker 运行还需 Node.js，并安装 `@tencent-ai/codebuddy-code@2.149.0`（`codebuddy` 在 PATH 上）。Docker 镜像已内置该 CLI。
 
 ```bash
 git clone https://github.com/bazz1111/tg_news_monitor.git
@@ -88,15 +88,15 @@ Windows PowerShell 使用 `.venv/Scripts/Activate.ps1` 激活环境，使用 `Co
 
 ```dotenv
 TELEGRAM_CHANNELS=zaobaosg,cnalatest,solidot
-DEEPSEEK_API_KEY=your-api-key
-DEEPSEEK_API_BASE=https://api.deepseek.com
-DEEPSEEK_MODEL=deepseek-chat
+CODEBUDDY_API_KEY=your-api-key
+CODEBUDDY_MODEL=fast-model
+CODEBUDDY_FALLBACK_MODEL=hy3
 FEISHU_WEBHOOK_URL=https://open.feishu.cn/open-apis/bot/v2/hook/your-bot-id
 FEISHU_WEBHOOK_SECRET=
 DB_PATH=data/tg_news.db
 ```
 
-模型名按账户可用模型配置。`deepseek-chat` 是代码默认值，原配置模板可能使用其他名称。不要提交真实凭据。将 [均衡配置片段](monitor-tuning.env.example) 合并进现有 `.env`，保留频道、凭据和数据库路径。
+`CODEBUDDY_API_KEY` 是 CodeBuddy CLI 凭据。主模型默认 `fast-model`，失败后重试 `hy3`（套餐标注 credits x0.00），两次都失败再走本地启发式。不要设置 `CODEBUDDY_INTERNET_ENVIRONMENT`（会切到国际站）。不要提交真实凭据。将 [均衡配置片段](monitor-tuning.env.example) 合并进现有 `.env`，保留频道、凭据和数据库路径。
 
 ```bash
 python -m tg_news_monitor.main --init-db
@@ -165,14 +165,16 @@ groups:
       prompt_variant: story
 ```
 
-`.env` 里只放密钥和全局 DeepSeek 设置：
+`.env` 里只放密钥和全局 CodeBuddy 设置：
 
 ```dotenv
 FEISHU_WEBHOOK_NEWS24=https://open.feishu.cn/open-apis/bot/v2/hook/...
 FEISHU_WEBHOOK_SECRET_NEWS24=
 # FEISHU_WEBHOOK_OLD_PHOTOS=
 # FEISHU_WEBHOOK_XHS=
-DEEPSEEK_API_KEY=...
+CODEBUDDY_API_KEY=...
+CODEBUDDY_MODEL=fast-model
+CODEBUDDY_FALLBACK_MODEL=hy3
 # 卡内嵌图（old_photos / wechat_photo）。自定义机器人 webhook 不能按 URL 嵌图，
 # 需开放平台应用上传拿 image_key。不增加 LLM token。
 # FEISHU_APP_ID=cli_xxx
@@ -189,7 +191,7 @@ DEEPSEEK_API_KEY=...
 | 本地硬过滤 | 黄赌毒、血腥暴力、领导人/党宣、当代地缘鼓动、以及新闻/能源/冲突类（如「原油」「美伊」「冲突」、分类「能源」）直接拒绝，宁错杀。过不了的不进模型；发送前再拦一次，且必须有可点击图片 URL。 |
 | 模型 | `prompt_variant: wechat_photo`，比 `story` 更严：只要适合大陆公众号的历史/文化静帧；无把握不选。 |
 | 说明 | 模型写中文完整句，≤100 字，不以省略号收尾，无时政评论；发送前再截断一次。 |
-| 飞书卡 | 标题 + 说明 + **卡内嵌图**（发送前把 `media_urls` 的 http(s) 图下载并 `POST /im/v1/images` 上传，卡片用 `img` / `img_key`，最多 9 张）。部分失败则嵌入成功的；全部失败或未配置 `FEISHU_APP_ID`/`FEISHU_APP_SECRET` 时回退为可点击图片链接。**无**投资影响、**无**频道名/`t.me`/原文。图片只在发卡时上传，**不**送进 DeepSeek。 |
+| 飞书卡 | 标题 + 说明 + **卡内嵌图**（发送前把 `media_urls` 的 http(s) 图下载并 `POST /im/v1/images` 上传，卡片用 `img` / `img_key`，最多 9 张）。部分失败则嵌入成功的；全部失败或未配置 `FEISHU_APP_ID`/`FEISHU_APP_SECRET` 时回退为可点击图片链接。**无**投资影响、**无**频道名/`t.me`/原文。图片只在发卡时上传，**不**送进 CodeBuddy。 |
 | 节奏 | 非实时。默认 `digest_min_interval_seconds=3600`、`digest_max_calls_per_day=8`、`digest_min_candidates=2`、`digest_max_wait_seconds=7200`。`news_max_age_seconds` 须明显长于冷却（默认 86400），否则帖子会在等待中过期。关闭 `quiet_hours` / 晨报。频率可以后再调组级旋钮。 |
 
 历史事件本身很旧，因此该组**不**用 `event_at` 做 30 分钟时效拦截（`news24` 仍拦截）。图片像素不做识别，只能靠说明文字与模型。启用嵌图：在 `.env` 设置 `FEISHU_APP_ID` / `FEISHU_APP_SECRET`（`wechat_photo` 的 `embed_images` 默认为 true）。关掉嵌图可在该组 `card_profile.embed_images: false`，卡片会继续用 markdown 链接。
@@ -233,7 +235,7 @@ Docker 若使用 `config.yaml`，把它挂进容器并设置 `CONFIG_PATH`，例
 
 兼容保留的 `QUIET_DIGEST_MIN_CANDIDATES`、`MORNING_FLUSH_MAX_AGE_SECONDS`、`MORNING_FLUSH_CARD_INTERVAL_SECONDS` 不再控制新夜间流程；以时间窗口和单张摘要为准。已有部署需同步更新旧窗口环境变量，再重启进程。
 
-`TELEGRAM_CHANNELS` 默认空。DeepSeek和飞书凭据自行填写，签名密钥 `FEISHU_WEBHOOK_SECRET` 可选。`old_photos` 卡内嵌图还需 `FEISHU_APP_ID` 与 `FEISHU_APP_SECRET`（开放平台应用，具备上传图片权限）。代理建议通过OS/容器的 `HTTP_PROXY`、`HTTPS_PROXY` 设置，不要假设仅写入YAML的代理字段会传给HTTP客户端。
+`TELEGRAM_CHANNELS` 默认空。CodeBuddy 和飞书凭据自行填写，签名密钥 `FEISHU_WEBHOOK_SECRET` 可选。`old_photos` 卡内嵌图还需 `FEISHU_APP_ID` 与 `FEISHU_APP_SECRET`（开放平台应用，具备上传图片权限）。代理建议通过OS/容器的 `HTTP_PROXY`、`HTTPS_PROXY` 设置，不要假设仅写入YAML的代理字段会传给HTTP客户端。容器内 `codebuddy` 装在 `/usr/local/bin`，非 root `appuser` 可直接调用；不要在镜像或 `.env` 里设置 `CODEBUDDY_INTERNET_ENVIRONMENT`。
 
 ### 时效与成本
 
@@ -241,7 +243,7 @@ Docker 若使用 `config.yaml`，把它挂进容器并设置 `CONFIG_PATH`，例
 
 持续每3分钟调用一次需要480次/天；288次预算在满负荷下约14.4小时耗尽。预算耗尽后继续采集，停止模型调用，过期消息过滤，不在次日补发。较低预算与全天高时效不能无条件兼得。
 
-每日限制是**调用次数，不是精确token总量**。输入有批次及字符限制，输出最多3000 tokens；实际用量记录在 `digest_calls.tokens`，未知用量不能按零费用计算，以服务商账单为准。
+每日限制是**调用次数，不是精确token总量**。输入有批次及字符限制；CodeBuddy CLI `--output-format text` 通常不回传 token 用量，`digest_calls.tokens` 多为未知，不能按零费用计算，以服务商账单为准。
 
 ## Docker 部署和升级
 
@@ -253,7 +255,7 @@ docker compose logs -f
 docker compose down
 ```
 
-Compose挂载 `./data:/app/data`，数据库为 `/app/data/tg_news.db`。现有配置使用 `network_mode: host`，请根据部署平台和网络调整，不是所有环境都需要主机网络。
+Compose挂载 `./data:/app/data`，数据库为 `/app/data/tg_news.db`。现有配置使用 `network_mode: host`，请根据部署平台和网络调整，不是所有环境都需要主机网络。镜像内以 root 安装 Node 20 与 `@tencent-ai/codebuddy-code@2.149.0`，二进制在 `/usr/local/bin/codebuddy`，`appuser` 可直接执行。
 
 升级前停止旧实例并一致性备份数据库及配置，再更新代码、合并参数、重建镜像。新增 `digest_calls`、`delivery_claims` 、`alert_schedule_state`、`night_candidates`、`morning_reports` 和 `night_alerts` 表在runner启动时自动创建。多组升级会给上述表和 `posts` 补上 `group_id`（旧行标为 `legacy` 或 `legacy_group_id`）。不要删库重置预算、去重和夜间卡片计数。
 

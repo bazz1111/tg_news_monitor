@@ -21,6 +21,7 @@ class TestConfigDefaultsAndParsing:
                 k.startswith("TELEGRAM_")
                 or k.startswith("GROK_")
                 or k.startswith("DEEPSEEK_")
+                or k.startswith("CODEBUDDY_")
                 or k.startswith("FEISHU_")
                 or k.startswith("POLL_")
                 or k.startswith("HOTNESS_")
@@ -35,8 +36,9 @@ class TestConfigDefaultsAndParsing:
         assert settings.poll_interval_seconds == 60
         assert settings.max_jitter_seconds == 15
         assert settings.inter_channel_delay_seconds == 2.0
-        assert settings.deepseek_api_base == "https://api.deepseek.com"
-        assert settings.deepseek_model == "deepseek-chat"
+        assert settings.codebuddy_model == "fast-model"
+        assert settings.codebuddy_fallback_model == "hy3"
+        assert settings.codebuddy_cli == "codebuddy"
         assert settings.hotness_threshold == 7
         assert settings.timezone == "Asia/Shanghai"
         assert settings.quiet_hours == "00:00-08:00"
@@ -67,9 +69,9 @@ class TestConfigDefaultsAndParsing:
         s = Settings(telegram_channels='["durov", "@telegram"]')
         assert s.telegram_channels == ["durov", "telegram"]
 
-    def test_secret_str_grok_key_support(self):
-        s = Settings(grok_api_key=SecretStr("super-secret-key"))
-        assert s.grok_api_key == "super-secret-key"
+    def test_secret_str_codebuddy_key_support(self):
+        s = Settings(codebuddy_api_key=SecretStr("super-secret-key"))
+        assert s.codebuddy_api_key == "super-secret-key"
 
 
 class TestConfigValidationBounds:
@@ -116,8 +118,9 @@ class TestEnvironmentAndSecretSync:
         monkeypatch.setenv("TELEGRAM_CHANNELS", "chan1, chan2")
         monkeypatch.setenv("POLL_INTERVAL_SECONDS", "45")
         monkeypatch.setenv("HOTNESS_THRESHOLD", "9")
-        monkeypatch.setenv("GROK_API_KEY", "xai-real-key-abc")
-        monkeypatch.setenv("GROK_MODEL", "grok-beta")
+        monkeypatch.setenv("CODEBUDDY_API_KEY", "cb-real-key-abc")
+        monkeypatch.setenv("CODEBUDDY_MODEL", "fast-model")
+        monkeypatch.setenv("CODEBUDDY_FALLBACK_MODEL", "hy3")
         monkeypatch.setenv("FEISHU_WEBHOOK_URL", "https://open.feishu.cn/hook/xyz")
         monkeypatch.setenv("FEISHU_SECRET", "sign-secret-123")
         monkeypatch.setenv("FEISHU_APP_ID", "cli_test_app")
@@ -128,8 +131,9 @@ class TestEnvironmentAndSecretSync:
         assert settings.telegram_channels == ["chan1", "chan2"]
         assert settings.poll_interval_seconds == 45
         assert settings.hotness_threshold == 9
-        assert settings.grok_api_key == "xai-real-key-abc"
-        assert settings.grok_model == "grok-beta"
+        assert settings.codebuddy_api_key == "cb-real-key-abc"
+        assert settings.codebuddy_model == "fast-model"
+        assert settings.codebuddy_fallback_model == "hy3"
         assert settings.feishu_webhook_url == "https://open.feishu.cn/hook/xyz"
         assert settings.feishu_webhook_secret == "sign-secret-123"
         assert settings.feishu_secret == "sign-secret-123"
@@ -137,18 +141,19 @@ class TestEnvironmentAndSecretSync:
         assert settings.feishu_app_secret == "test_app_secret"
         assert settings.db_path == "custom/storage.db"
 
-    def test_load_deepseek_from_environment_variables(self, monkeypatch: pytest.MonkeyPatch):
-        monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-deepseek-env-123")
-        monkeypatch.setenv("DEEPSEEK_API_BASE", "https://api.deepseek.com/v1")
-        monkeypatch.setenv("DEEPSEEK_MODEL", "deepseek-reasoner")
+    def test_load_codebuddy_from_environment_variables(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.setenv("CODEBUDDY_API_KEY", "cb-env-123")
+        monkeypatch.setenv("CODEBUDDY_MODEL", "fast-model")
+        monkeypatch.setenv("CODEBUDDY_FALLBACK_MODEL", "hy3")
 
         settings = Settings.load()
-        assert settings.deepseek_api_key == "sk-deepseek-env-123"
-        assert settings.deepseek_api_base == "https://api.deepseek.com/v1"
-        assert settings.deepseek_model == "deepseek-reasoner"
-        assert settings.active_api_key == "sk-deepseek-env-123"
-        assert settings.active_api_base == "https://api.deepseek.com/v1"
-        assert settings.active_model == "deepseek-reasoner"
+        assert settings.codebuddy_api_key == "cb-env-123"
+        assert settings.codebuddy_model == "fast-model"
+        assert settings.codebuddy_fallback_model == "hy3"
+        assert settings.active_api_key == "cb-env-123"
+        assert settings.active_model == "fast-model"
+        assert settings.active_fallback_model == "hy3"
+        assert settings.active_llm_provider == "codebuddy"
 
     def test_feishu_secret_sync_both_ways(self):
         s1 = Settings(feishu_secret="secret-a")
@@ -187,7 +192,7 @@ class TestFileConfigurationLoading:
                 TELEGRAM_CHANNELS="alpha_chan, beta_chan"
                 POLL_INTERVAL_SECONDS=90
                 HOTNESS_THRESHOLD=8
-                GROK_API_KEY="grok-secret-dotenv"
+                CODEBUDDY_API_KEY="cb-secret-dotenv"
                 FEISHU_WEBHOOK_URL=https://open.feishu.cn/test/hook
                 """,
                 encoding="utf-8",
@@ -203,7 +208,7 @@ class TestFileConfigurationLoading:
             assert settings.telegram_channels == ["alpha_chan", "beta_chan"]
             assert settings.poll_interval_seconds == 90
             assert settings.hotness_threshold == 8
-            assert settings.grok_api_key == "grok-secret-dotenv"
+            assert settings.codebuddy_api_key == "cb-secret-dotenv"
             assert settings.feishu_webhook_url == "https://open.feishu.cn/test/hook"
 
     def test_yaml_parser_and_loading(self):
@@ -216,7 +221,7 @@ class TestFileConfigurationLoading:
                   - telegram
                 poll_interval_seconds: 120
                 hotness_threshold: 6
-                grok_model: grok-beta
+                codebuddy_model: fast-model
                 db_path: /custom/path.db
                 """,
                 encoding="utf-8",
@@ -233,7 +238,7 @@ class TestFileConfigurationLoading:
             assert settings.telegram_channels == ["durov", "telegram"]
             assert settings.poll_interval_seconds == 120
             assert settings.hotness_threshold == 6
-            assert settings.grok_model == "grok-beta"
+            assert settings.codebuddy_model == "fast-model"
             assert settings.db_path == "/custom/path.db"
 
     def test_precedence_hierarchy(self, monkeypatch: pytest.MonkeyPatch):
@@ -290,38 +295,39 @@ class TestGetConfigFactory:
         assert s.hotness_threshold == 9
 
 
-class TestDeepSeekConfig:
-    """Verifies pure DeepSeek configuration and defaults."""
+class TestCodeBuddyConfig:
+    """Verifies CodeBuddy CLI configuration and defaults."""
 
-    def test_default_deepseek_config(self):
-        s = Settings(deepseek_api_key="sk-deepseek-test-key")
-        assert s.active_llm_provider == "deepseek"
-        assert s.deepseek_api_key == "sk-deepseek-test-key"
-        assert s.active_api_key == "sk-deepseek-test-key"
-        assert s.deepseek_api_base == "https://api.deepseek.com"
-        assert s.active_api_base == "https://api.deepseek.com"
-        assert s.deepseek_model == "deepseek-chat"
-        assert s.active_model == "deepseek-chat"
+    def test_default_codebuddy_config(self):
+        s = Settings(codebuddy_api_key="cb-test-key")
+        assert s.active_llm_provider == "codebuddy"
+        assert s.codebuddy_api_key == "cb-test-key"
+        assert s.active_api_key == "cb-test-key"
+        assert s.codebuddy_model == "fast-model"
+        assert s.active_model == "fast-model"
+        assert s.codebuddy_fallback_model == "hy3"
+        assert s.active_fallback_model == "hy3"
 
-    def test_secret_str_deepseek_key_support(self):
-        s = Settings(deepseek_api_key=SecretStr("super-secret-deepseek-key"))
-        assert s.deepseek_api_key == "super-secret-deepseek-key"
-        assert s.active_api_key == "super-secret-deepseek-key"
+    def test_secret_str_codebuddy_key_on_settings(self):
+        s = Settings(codebuddy_api_key=SecretStr("super-secret-codebuddy-key"))
+        assert s.codebuddy_api_key == "super-secret-codebuddy-key"
+        assert s.active_api_key == "super-secret-codebuddy-key"
 
-    def test_custom_deepseek_model_and_base(self):
+    def test_custom_codebuddy_models(self):
         s = Settings(
-            deepseek_api_key="sk-deepseek-reasoner-key",
-            deepseek_api_base="https://api.deepseek.com/v1",
-            deepseek_model="deepseek-reasoner",
+            codebuddy_api_key="cb-custom-key",
+            codebuddy_model="fast-model",
+            codebuddy_fallback_model="hy3",
         )
-        assert s.active_llm_provider == "deepseek"
-        assert s.active_api_key == "sk-deepseek-reasoner-key"
-        assert s.active_api_base == "https://api.deepseek.com/v1"
-        assert s.active_model == "deepseek-reasoner"
+        assert s.active_llm_provider == "codebuddy"
+        assert s.active_api_key == "cb-custom-key"
+        assert s.active_model == "fast-model"
+        assert s.active_fallback_model == "hy3"
 
-    def test_legacy_grok_key_mapping_compatibility(self):
-        s = Settings(grok_api_key="sk-legacy-key")
-        assert s.deepseek_api_key == "sk-legacy-key"
-        assert s.active_api_key == "sk-legacy-key"
+    def test_legacy_deepseek_keys_are_ignored(self):
+        s = Settings(deepseek_api_key="sk-legacy-key")
+        assert s.codebuddy_api_key == ""
+        assert s.active_api_key == ""
+        assert s.active_llm_provider == "codebuddy"
 
 

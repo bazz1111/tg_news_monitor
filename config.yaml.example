@@ -83,10 +83,10 @@ poll_interval_seconds: 60
 max_jitter_seconds: 15
 inter_channel_delay_seconds: 2.0
 
-# DeepSeek LLM Evaluator (https://platform.deepseek.com/)
-# Prefer DEEPSEEK_* in .env over committing keys here.
-deepseek_api_base: "https://api.deepseek.com"
-deepseek_model: "deepseek-chat"
+# CodeBuddy CLI evaluator. Prefer CODEBUDDY_* in .env; do not commit the API key.
+# Do not set CODEBUDDY_INTERNET_ENVIRONMENT (international site).
+# codebuddy_model: fast-model
+# codebuddy_fallback_model: hy3
 
 # Global defaults (groups inherit unless they override)
 hotness_threshold: 7

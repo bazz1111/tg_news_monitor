@@ -1,4 +1,8 @@
-"""OpenAI-compatible Grok client connecting to https://api.x.ai/v1."""
+"""Leftover OpenAI-compatible HTTP client (Grok/DeepSeek). Not a production path.
+
+Production evaluation goes through CodeBuddy CLI (`codebuddy_client`).
+This module remains for unit tests that exercise the old HTTP/retry helpers.
+"""
 
 from __future__ import annotations
 
@@ -17,13 +21,12 @@ from tg_news_monitor.evaluator.fallback import (
     calculate_backoff_delay,
     heuristic_keyword_fallback,
     parse_and_repair_evaluation,
-    strip_markdown_code_fences,
+    parse_digest_brief,
 )
 from tg_news_monitor.evaluator.prompt import (
-    build_digest_system_prompt,
-    build_digest_user_prompt,
     build_system_prompt,
     build_user_prompt,
+    compose_digest_prompts,
 )
 
 logger = logging.getLogger(__name__)
@@ -341,40 +344,31 @@ class GrokClient:
 
 
     def _build_digest_request_payload(self, posts: List[TelegramPost]) -> Dict[str, Any]:
-        """Constructs chat completion payload for batch digest evaluation."""
+        """Constructs chat completion payload for batch digest evaluation.
+
+        Leftover HTTP client helper; production evaluation uses CodeBuddy CLI.
+        """
+        system, user = compose_digest_prompts(
+            posts,
+            variant=getattr(self, "prompt_variant", None),
+            overlay=getattr(self, "prompt_overlay", None),
+            digest_context=getattr(self, "digest_context", "") or "",
+            recent_history=getattr(self, "recent_history", "") or "",
+        )
         return {
             "model": self.model,
             "temperature": self.temperature,
             "response_format": {"type": "json_object"},
             "max_tokens": 3000,
-            # DeepSeek non-thinking mode (ignored by providers that do not support it)
-            "thinking": {"type": "disabled"},
             "messages": [
-                {"role": "system", "content": build_digest_system_prompt(
-                    variant=getattr(self, "prompt_variant", None),
-                    overlay=getattr(self, "prompt_overlay", None),
-                ) + "\n" + getattr(self, "digest_context", "")},
-                {"role": "user", "content": build_digest_user_prompt(
-                    posts,
-                    variant=getattr(self, "prompt_variant", None),
-                ) + "\n当前UTC时间：" + datetime.now(timezone.utc).isoformat() + "\n过去24小时最近已推送或投递状态待核实的事件（历史已覆盖的同一事件不要重复，除非 is_update=true 且 update_reason 写明新事实）：\n" + getattr(self, "recent_history", "")},
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
             ],
         }
 
     def _parse_digest_response(self, raw_response: str) -> DigestBrief:
         """Parse LLM JSON into DigestBrief with light fence stripping."""
-        cleaned = strip_markdown_code_fences(raw_response)
-        data = json.loads(cleaned)
-        if not isinstance(data, dict):
-            raise ValueError("Digest response is not a JSON object")
-        # Clamp items length defensively
-        items = data.get("items") or []
-        if isinstance(items, list) and len(items) > 5:
-            data["items"] = items[:5]
-        brief = DigestBrief.model_validate(data)
-        if not brief.items:
-            brief.has_material_news = False
-        return brief
+        return parse_digest_brief(raw_response)
 
     def evaluate_digest(self, posts: List[TelegramPost]) -> DigestBrief:
         """Evaluate a batch of posts into one DigestBrief (single LLM call).
@@ -515,7 +509,7 @@ class GrokClient:
         return self.evaluate_post(post)
 
 
-# Compatibility aliases for multi-provider support
+# Compatibility aliases. DeepSeek/Grok HTTP is not a production path.
 LLMEvaluatorClient = GrokClient
 DeepSeekClient = GrokClient
 LLMError = GrokError
@@ -525,23 +519,22 @@ LLMNetworkError = GrokNetworkError
 
 
 def create_evaluator(
-    provider: str = "deepseek",
+    provider: str = "codebuddy",
     api_key: str = "",
     api_base: Optional[str] = None,
     model: Optional[str] = None,
+    fallback_model: Optional[str] = None,
     **kwargs: Any,
-) -> GrokClient:
-    """Factory function creating an evaluator client for DeepSeek (or OpenAI-compatible API)."""
-    normalized_provider = (provider or "deepseek").strip().lower()
-    base = api_base or "https://api.deepseek.com"
-    default_model = model or "deepseek-chat"
-    provider_name = normalized_provider if normalized_provider != "auto" else "deepseek"
+):
+    """Factory: production evaluator is CodeBuddy CLI only."""
+    from tg_news_monitor.evaluator.codebuddy_client import create_evaluator as _create_codebuddy
 
-    return GrokClient(
-        provider=provider_name,
+    return _create_codebuddy(
+        provider=provider,
         api_key=api_key,
-        api_base=base,
-        model=default_model,
+        api_base=api_base,
+        model=model,
+        fallback_model=fallback_model,
         **kwargs,
     )
 
