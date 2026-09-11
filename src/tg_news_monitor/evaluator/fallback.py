@@ -15,7 +15,7 @@ import re
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
-from tg_news_monitor.core.models import NewsEvaluation, TelegramPost
+from tg_news_monitor.core.models import DigestBrief, NewsEvaluation, TelegramPost
 
 logger = logging.getLogger(__name__)
 
@@ -263,6 +263,24 @@ def parse_and_repair_evaluation(
             logger.warning("Stage 2 JSON repair failed: %s | Raw text: %s", err, raw_text[:200])
 
     raise ValueError(f"Unable to parse or repair JSON from LLM output: {raw_text[:200]}")
+
+
+def parse_digest_brief(raw_response: str) -> DigestBrief:
+    """Parse LLM JSON into DigestBrief with light fence stripping.
+
+    Shared by the production CodeBuddy path and the leftover HTTP client.
+    """
+    cleaned = strip_markdown_code_fences(raw_response)
+    data = json.loads(cleaned)
+    if not isinstance(data, dict):
+        raise ValueError("Digest response is not a JSON object")
+    items = data.get("items") or []
+    if isinstance(items, list) and len(items) > 5:
+        data["items"] = items[:5]
+    brief = DigestBrief.model_validate(data)
+    if not brief.items:
+        brief.has_material_news = False
+    return brief
 
 
 def heuristic_keyword_fallback(post: TelegramPost) -> NewsEvaluation:

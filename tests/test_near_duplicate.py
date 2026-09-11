@@ -277,12 +277,11 @@ class TestPromptNudgeAndWechatBypass:
         needle = "仅当 is_update=true 且 update_reason 写明新增关键事实"
         assert needle in DIGEST_SYSTEM_PROMPT
         assert needle in STORY_DIGEST_SYSTEM_PROMPT
-        from tg_news_monitor.evaluator.grok_client import GrokClient
+        from tg_news_monitor.evaluator.prompt import compose_digest_prompts
 
-        client = GrokClient(api_key="unit-test")
-        user = client._build_digest_request_payload(
+        _system, user = compose_digest_prompts(
             [_post(1, "placeholder news text here", BJ_1541)]
-        )["messages"][1]["content"]
+        )
         assert "is_update=true" in user
         assert "update_reason" in user
 

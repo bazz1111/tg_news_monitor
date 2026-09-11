@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import json
-from typing import Any, Dict, List, Optional
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional, Tuple
 
 from tg_news_monitor.core.models import TelegramPost, NewsEvaluation, DigestBrief
 
@@ -309,3 +310,33 @@ def build_digest_user_prompt(
         "请仅输出匹配 DigestBrief 的 JSON（含 summary_bullets、score、actionable_insight、bias_*、impact_*）。"
     )
     return "\n".join(lines).strip()
+
+
+DIGEST_HISTORY_SUFFIX = (
+    "过去24小时最近已推送或投递状态待核实的事件（历史已覆盖的同一事件不要重复，"
+    "除非 is_update=true 且 update_reason 写明新事实）："
+)
+
+
+def compose_digest_prompts(
+    posts: List[TelegramPost],
+    *,
+    variant: Optional[str] = None,
+    overlay: Optional[str] = None,
+    digest_context: str = "",
+    recent_history: str = "",
+    now: Optional[datetime] = None,
+) -> Tuple[str, str]:
+    """Same system+user digest strings the HTTP client used to put in chat messages."""
+    system = build_digest_system_prompt(variant=variant, overlay=overlay) + "\n" + (digest_context or "")
+    clock = now or datetime.now(timezone.utc)
+    user = (
+        build_digest_user_prompt(posts, variant=variant)
+        + "\n当前UTC时间："
+        + clock.isoformat()
+        + "\n"
+        + DIGEST_HISTORY_SUFFIX
+        + "\n"
+        + (recent_history or "")
+    )
+    return system, user

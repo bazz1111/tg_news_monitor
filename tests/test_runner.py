@@ -434,16 +434,17 @@ class TestNewsMonitorRunner:
         runner.stop()
         assert runner._stop_requested is True
 
-    def test_runner_initializes_with_deepseek_config(self):
+    def test_runner_initializes_with_codebuddy_config(self):
         config = Settings(
-            deepseek_api_key="sk-deepseek-unit-test",
-            deepseek_model="deepseek-chat",
+            codebuddy_api_key="cb-unit-test",
+            codebuddy_model="fast-model",
+            codebuddy_fallback_model="hy3",
         )
         runner = NewsMonitorRunner(config=config)
-        assert runner.evaluator.provider == "deepseek"
-        assert runner.evaluator.api_key == "sk-deepseek-unit-test"
-        assert runner.evaluator.api_base == "https://api.deepseek.com"
-        assert runner.evaluator.model == "deepseek-chat"
+        assert runner.evaluator.provider == "codebuddy"
+        assert runner.evaluator.api_key == "cb-unit-test"
+        assert runner.evaluator.model == "fast-model"
+        assert runner.evaluator.fallback_model == "hy3"
 
     def test_buffering_skips_llm_when_below_min_candidates(self):
         """With default min_candidates=3, a single pending post stays unevaluated."""

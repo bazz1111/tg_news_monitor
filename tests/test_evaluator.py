@@ -16,12 +16,14 @@ import asyncio
 import json
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
+import subprocess
 from unittest.mock import MagicMock, patch
 
 import httpx
 import pytest
 
 from tg_news_monitor.core.models import NewsEvaluation, TelegramPost
+from tg_news_monitor.evaluator.codebuddy_client import CodeBuddyError, CodeBuddyEvaluator
 from tg_news_monitor.evaluator.fallback import (
     BREAKING_KEYWORDS,
     MultiStageFallbackHandler,
@@ -34,7 +36,6 @@ from tg_news_monitor.evaluator.fallback import (
     strip_markdown_code_fences,
 )
 from tg_news_monitor.evaluator.grok_client import (
-    DeepSeekClient,
     GrokClient,
     GrokError,
     GrokNetworkError,
@@ -618,44 +619,207 @@ class TestGrokClient:
         assert "[降级预警]" in evaluation.title
 
 
-class TestDeepSeekEvaluatorClient:
-    """Verifies DeepSeek API provider integration and create_evaluator factory."""
+class TestCodeBuddyEvaluator:
+    """CodeBuddy CLI path: mocked subprocess only; never call a real CLI."""
 
-    def test_create_evaluator_deepseek(self):
+    def test_create_evaluator_codebuddy(self):
         evaluator = create_evaluator(
-            provider="deepseek",
-            api_key="sk-deepseek-factory-test",
+            provider="codebuddy",
+            api_key="cb-factory-test",
         )
-        assert evaluator.provider == "deepseek"
-        assert evaluator.api_base == "https://api.deepseek.com"
-        assert evaluator.model == "deepseek-chat"
-        assert evaluator.api_key == "sk-deepseek-factory-test"
+        assert isinstance(evaluator, CodeBuddyEvaluator)
+        assert evaluator.provider == "codebuddy"
+        assert evaluator.model == "fast-model"
+        assert evaluator.fallback_model == "hy3"
+        assert evaluator.api_key == "cb-factory-test"
 
-    def test_deepseek_request_payload_and_url(self, sample_breaking_post: TelegramPost):
-        captured_requests = []
+    def test_create_evaluator_ignores_deepseek_provider(self):
+        evaluator = create_evaluator(provider="deepseek", api_key="cb-x", http_client=object())
+        assert isinstance(evaluator, CodeBuddyEvaluator)
+        assert evaluator.provider == "codebuddy"
 
-        def mock_handler(request: httpx.Request) -> httpx.Response:
-            captured_requests.append(request)
-            mock_json = make_openai_chat_completion(GROK_EVAL_SCORE_9)
-            return httpx.Response(200, json=mock_json)
-
-        transport = httpx.MockTransport(mock_handler)
-        client = httpx.Client(transport=transport)
-
-        evaluator = create_evaluator(
-            provider="deepseek",
-            api_key="sk-deepseek-auth-check",
-            http_client=client,
+    def _cli(self, stdout: str = "", returncode: int = 0, stderr: str = "") -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(
+            args=["codebuddy"], returncode=returncode, stdout=stdout, stderr=stderr
         )
 
-        evaluation = evaluator.evaluate_post(sample_breaking_post)
+    def test_evaluate_post_primary_success(self, sample_breaking_post: TelegramPost) -> None:
+        calls: List[List[str]] = []
+        captured_env: dict[str, str] = {}
 
-        assert len(captured_requests) == 1
-        req = captured_requests[0]
-        assert str(req.url) == "https://api.deepseek.com/chat/completions"
-        assert req.headers["authorization"] == "Bearer sk-deepseek-auth-check"
-        payload = json.loads(req.content.decode("utf-8"))
-        assert payload["model"] == "deepseek-chat"
+        def fake_run(cmd, **kwargs):
+            calls.append(list(cmd))
+            captured_env.update(kwargs.get("env") or {})
+            return self._cli(json.dumps(GROK_EVAL_SCORE_9, ensure_ascii=False))
+
+        ev = CodeBuddyEvaluator(api_key="cb-key", run_cli=fake_run)
+        evaluation = ev.evaluate_post(sample_breaking_post)
+
         assert evaluation.score == 9
+        assert "以太坊" in evaluation.title
+        assert len(calls) == 1
+        cmd = calls[0]
+        assert cmd[0] == "codebuddy"
+        assert "-p" in cmd and "-y" in cmd
+        assert cmd[cmd.index("--tools") + 1] == ""
+        assert cmd[cmd.index("--output-format") + 1] == "text"
+        assert cmd[cmd.index("--model") + 1] == "fast-model"
+        assert cmd[cmd.index("--effort") + 1] == "minimal"
+        assert captured_env.get("CODEBUDDY_API_KEY") == "cb-key"
+        assert "CODEBUDDY_INTERNET_ENVIRONMENT" not in captured_env
+        assert "15,000 #ETH" in cmd[-1]
+
+    def test_child_env_strips_internet_flag(
+        self, sample_breaking_post: TelegramPost, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("CODEBUDDY_INTERNET_ENVIRONMENT", "2")
+        captured_env: dict[str, str] = {}
+
+        def fake_run(cmd, **kwargs):
+            captured_env.update(kwargs.get("env") or {})
+            return self._cli(json.dumps(GROK_EVAL_SCORE_9, ensure_ascii=False))
+
+        ev = CodeBuddyEvaluator(api_key="cb-key", run_cli=fake_run)
+        ev.evaluate_post(sample_breaking_post)
+        assert captured_env.get("CODEBUDDY_API_KEY") == "cb-key"
+        assert "CODEBUDDY_INTERNET_ENVIRONMENT" not in captured_env
+
+    def test_primary_fail_fallback_success(self, sample_breaking_post: TelegramPost) -> None:
+        models: List[str] = []
+
+        def fake_run(cmd, **kwargs):
+            model = cmd[cmd.index("--model") + 1]
+            models.append(model)
+            if model == "fast-model":
+                return self._cli(returncode=1, stderr="primary boom")
+            return self._cli(json.dumps(GROK_EVAL_SCORE_8, ensure_ascii=False))
+
+        ev = CodeBuddyEvaluator(api_key="cb-key", run_cli=fake_run)
+        evaluation = ev.evaluate_post(sample_breaking_post)
+
+        assert models == ["fast-model", "hy3"]
+        assert evaluation.score == 8
+        assert "ETF" in evaluation.title
+
+    def test_unparseable_primary_then_fallback(self, sample_exploit_post: TelegramPost) -> None:
+        models: List[str] = []
+
+        def fake_run(cmd, **kwargs):
+            model = cmd[cmd.index("--model") + 1]
+            models.append(model)
+            if model == "fast-model":
+                return self._cli("this is not json at all")
+            inner = json.dumps(GROK_EVAL_SCORE_10_CRITICAL, ensure_ascii=False)
+            return self._cli(f"```json\n{inner}\n```")
+
+        ev = CodeBuddyEvaluator(api_key="cb-key", run_cli=fake_run)
+        evaluation = ev.evaluate_post(sample_exploit_post)
+        assert models == ["fast-model", "hy3"]
+        assert evaluation.score == 10
+
+    def test_timeout_then_fallback(self, sample_breaking_post: TelegramPost) -> None:
+        models: List[str] = []
+
+        def fake_run(cmd, **kwargs):
+            model = cmd[cmd.index("--model") + 1]
+            models.append(model)
+            if model == "fast-model":
+                raise subprocess.TimeoutExpired(cmd, kwargs.get("timeout") or 60)
+            return self._cli(json.dumps(GROK_EVAL_SCORE_9, ensure_ascii=False))
+
+        ev = CodeBuddyEvaluator(api_key="cb-key", run_cli=fake_run)
+        evaluation = ev.evaluate_post(sample_breaking_post)
+        assert models == ["fast-model", "hy3"]
+        assert evaluation.score == 9
+
+    def test_both_fail_heuristic(self, sample_exploit_post: TelegramPost) -> None:
+        models: List[str] = []
+
+        def fake_run(cmd, **kwargs):
+            models.append(cmd[cmd.index("--model") + 1])
+            return self._cli(returncode=1, stderr="fail")
+
+        ev = CodeBuddyEvaluator(api_key="cb-key", run_cli=fake_run)
+        evaluation = ev.evaluate_post(sample_exploit_post)
+        assert models == ["fast-model", "hy3"]
+        assert evaluation.score == 7
+        assert "[降级预警]" in evaluation.title
+
+    def test_empty_output_counts_as_failure(self, sample_exploit_post: TelegramPost) -> None:
+        def fake_run(cmd, **kwargs):
+            return self._cli(stdout="   ")
+
+        ev = CodeBuddyEvaluator(api_key="cb-key", run_cli=fake_run)
+        evaluation = ev.evaluate_post(sample_exploit_post)
+        assert evaluation.score == 7
+
+    def test_evaluate_digest_success(self) -> None:
+        from datetime import datetime, timezone
+
+        from tg_news_monitor.core.models import TelegramPost
+
+        post = TelegramPost(
+            channel="wire",
+            message_id=1,
+            text="Important current economic news.",
+            direct_url="https://t.me/wire/1",
+            published_at=datetime.now(timezone.utc),
+        )
+        digest_json = {
+            "headline": "本轮快讯",
+            "overview": "测试",
+            "has_material_news": True,
+            "filtered_note": "",
+            "items": [
+                {
+                    "rank": 1,
+                    "channel": "wire",
+                    "message_id": 1,
+                    "title": "经济要闻",
+                    "summary": "重要经济新闻落地。",
+                    "category": "宏观财经",
+                    "score": 8,
+                    "event_at": None,
+                    "is_update": False,
+                    "summary_bullets": ["重要经济新闻落地。"],
+                    "actionable_insight": "观察后续",
+                    "bias_overall": "中性",
+                    "bias_us": "中性",
+                    "bias_cn": "中性",
+                    "bias_commodities": "中性",
+                    "impact_overall": "无直接影响",
+                    "impact_us": "无直接影响",
+                    "impact_cn": "无直接影响",
+                    "impact_commodities": "无直接影响",
+                }
+            ],
+        }
+
+        def fake_run(cmd, **kwargs):
+            return self._cli(json.dumps(digest_json, ensure_ascii=False))
+
+        ev = CodeBuddyEvaluator(api_key="cb-key", run_cli=fake_run)
+        brief = ev.evaluate_digest([post])
+        assert brief.has_material_news is True
+        assert brief.items[0].title == "经济要闻"
+        assert "is_update=true" in ev._compose_digest_prompt([post])
+
+    def test_evaluate_digest_both_fail_raises(self) -> None:
+        from datetime import datetime, timezone
+
+        post = TelegramPost(
+            channel="wire",
+            message_id=1,
+            text="Important current economic news.",
+            direct_url="https://t.me/wire/1",
+            published_at=datetime.now(timezone.utc),
+        )
+
+        def fake_run(cmd, **kwargs):
+            return self._cli(stdout="bad JSON")
+
+        ev = CodeBuddyEvaluator(api_key="cb-key", run_cli=fake_run)
+        with pytest.raises(CodeBuddyError):
+            ev.evaluate_digest([post])
 
 

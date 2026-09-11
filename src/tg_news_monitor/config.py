@@ -533,18 +533,22 @@ class Settings(_BaseClass):
         description="Randomized pause between consecutive channel requests in seconds",
     )
 
-    # DeepSeek API credentials & model
-    deepseek_api_key: str = Field(
+    # CodeBuddy CLI credentials & models (Tencent CodeBuddy Code)
+    codebuddy_api_key: str = Field(
         default="",
-        description="DeepSeek API key (https://platform.deepseek.com/)",
+        description="CodeBuddy CLI credential (CODEBUDDY_API_KEY). Do not set CODEBUDDY_INTERNET_ENVIRONMENT.",
     )
-    deepseek_api_base: str = Field(
-        default="https://api.deepseek.com",
-        description="DeepSeek API base endpoint URL (default: https://api.deepseek.com)",
+    codebuddy_model: str = Field(
+        default="fast-model",
+        description="Primary CodeBuddy model id (CLI --model)",
     )
-    deepseek_model: str = Field(
-        default="deepseek-chat",
-        description="DeepSeek model identifier, e.g. deepseek-chat or deepseek-reasoner",
+    codebuddy_fallback_model: str = Field(
+        default="hy3",
+        description="Fallback CodeBuddy model id after primary failure",
+    )
+    codebuddy_cli: str = Field(
+        default="codebuddy",
+        description="CodeBuddy CLI executable on PATH",
     )
 
     # Urgency & hotness threshold gating
@@ -734,26 +738,13 @@ class Settings(_BaseClass):
         load_zone(text)
         return text
 
-    @field_validator("deepseek_api_key", "feishu_app_id", "feishu_app_secret", mode="before")
+    @field_validator("codebuddy_api_key", "feishu_app_id", "feishu_app_secret", mode="before")
     @classmethod
     def parse_secret_keys(cls, value: Any) -> str:
         """Accepts str or SecretStr and returns plaintext str."""
         if isinstance(value, SecretStr):
             return value.get_secret_value()
         return str(value).strip() if value is not None else ""
-
-    @model_validator(mode="before")
-    @classmethod
-    def map_legacy_grok_keys(cls, data: Any) -> Any:
-        """Transparently maps legacy grok keys to deepseek if provided."""
-        if isinstance(data, dict):
-            if not data.get("deepseek_api_key") and data.get("grok_api_key"):
-                data["deepseek_api_key"] = data["grok_api_key"]
-            if not data.get("deepseek_model") and data.get("grok_model"):
-                data["deepseek_model"] = data["grok_model"]
-            if not data.get("deepseek_api_base") and data.get("grok_api_base"):
-                data["deepseek_api_base"] = data["grok_api_base"]
-        return data
 
     @model_validator(mode="after")
     def sync_feishu_secrets(self) -> Settings:
@@ -830,41 +821,28 @@ class Settings(_BaseClass):
         return errors
 
     # --------------------------------------------------------------------------
-    # DeepSeek LLM Accessors & Backward Compatibility Aliases
+    # CodeBuddy LLM Accessors
     # --------------------------------------------------------------------------
 
     @property
     def active_llm_provider(self) -> str:
-        """Returns the active LLM provider name ('deepseek')."""
-        return "deepseek"
+        """Returns the active LLM provider name ('codebuddy')."""
+        return "codebuddy"
 
     @property
     def active_api_key(self) -> str:
-        """Returns the active DeepSeek API key."""
-        return self.deepseek_api_key
-
-    @property
-    def active_api_base(self) -> str:
-        """Returns the active DeepSeek API base URL."""
-        return self.deepseek_api_base
+        """Returns the CodeBuddy CLI API key."""
+        return self.codebuddy_api_key
 
     @property
     def active_model(self) -> str:
-        """Returns the active DeepSeek model name."""
-        return self.deepseek_model
-
-    # Compatibility aliases
-    @property
-    def grok_api_key(self) -> str:
-        return self.deepseek_api_key
+        """Returns the primary CodeBuddy model id."""
+        return self.codebuddy_model
 
     @property
-    def grok_api_base(self) -> str:
-        return self.deepseek_api_base
-
-    @property
-    def grok_model(self) -> str:
-        return self.deepseek_model
+    def active_fallback_model(self) -> str:
+        """Returns the fallback CodeBuddy model id."""
+        return self.codebuddy_fallback_model
 
     # --------------------------------------------------------------------------
     # Multi-source Construction & Loading Factory
