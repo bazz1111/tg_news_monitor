@@ -17,15 +17,6 @@ from tg_news_monitor.evaluator.fallback import (
     repair_json_string,
     strip_markdown_code_fences,
 )
-from tg_news_monitor.evaluator.grok_client import (
-    DeepSeekClient,
-    GrokClient,
-    GrokError,
-    GrokNetworkError,
-    GrokRateLimitError,
-    GrokServerError,
-    LLMEvaluatorClient,
-)
 from tg_news_monitor.evaluator.prompt import (
     DIGEST_SYSTEM_PROMPT,
     NEWS_EVALUATION_JSON_SCHEMA,
@@ -37,6 +28,16 @@ from tg_news_monitor.evaluator.prompt import (
     build_user_prompt,
     get_news_evaluation_json_schema,
 )
+
+_GROK_EXPORTS = {
+    "DeepSeekClient",
+    "GrokClient",
+    "GrokError",
+    "GrokNetworkError",
+    "GrokRateLimitError",
+    "GrokServerError",
+    "LLMEvaluatorClient",
+}
 
 __all__ = [
     "CodeBuddyEvaluator",
@@ -69,3 +70,12 @@ __all__ = [
     "heuristic_keyword_fallback",
     "BREAKING_KEYWORDS",
 ]
+
+
+def __getattr__(name: str):
+    """Load the leftover HTTP client only when tests import Grok/DeepSeek names."""
+    if name in _GROK_EXPORTS:
+        from tg_news_monitor.evaluator import grok_client
+
+        return getattr(grok_client, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

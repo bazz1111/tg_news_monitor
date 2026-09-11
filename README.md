@@ -2,12 +2,12 @@
 
 从 Telegram 公开频道预览页采集新闻，经本地过滤与 CodeBuddy CLI 批量评估，将重要消息发送到飞书。无需 Telegram 账号或 Bot Token；公开页面仍可能限流、不可访问或改变结构。
 
-适合个人或小团队的全球突发、宏观、军事和 AI 文字快讯筛选。完整分析见 [中文评估报告](REVIEW_REPORT.zh-CN.md)，推荐参数见 [均衡配置](monitor-tuning.env.example)。
+适合个人或小团队的全球突发、宏观、军事和 AI 文字快讯筛选。完整分析见历史基线 [中文评估报告](REVIEW_REPORT.zh-CN.md)（对应提交 `76f7aeb9`，不是当前行为说明），推荐起步参数见 [均衡配置示例](monitor-tuning.env.example)（示例值 ≠ 代码默认值）。
 
 ## 更新内容
 
 - **采集与模型解耦**：守护进程继续采集，一个后台线程负责评估与推送，最多运行一个评估任务。
-- **调用成本限制**：持久化最小调用间隔和每日次数；默认每批20条、每条800字符。CodeBuddy CLI 文本输出不提供 `usage.total_tokens`，失败后保留候选，冷却后再试。
+- **调用成本限制**：持久化最小调用间隔和每日**评估轮次**；默认每批20条、每条800字符。一轮预约会计入 `DIGEST_MAX_CALLS_PER_DAY`，该轮内 CLI 最多调用 2 次（主模型 + fallback）。CodeBuddy CLI 文本输出不提供 `usage.total_tokens`，失败后保留候选，冷却后再试。
 - **分层去重**：频道/消息ID、规范化正文指纹、24小时投递记录，以及最近20条投递摘要供模型比较新增事实。新闻卡片在飞书发送前再做一次**确定性近重复校验**（同组 24h 内 `title+summary` 与已投递摘要的实体/数字重合；`$6.06` 与 `$6` 视为同一量级）。同事件且未带实质更新（`is_update` + `update_reason` 中的新数字或新实体）则跳过发送、标 `near_duplicate`、不记为已投递。不额外调用模型。`wechat_photo` 不走此守卫。
 - **旧闻拦截**：新闻路径在模型调用前和逐条推送前检查时间；默认频道发布时间和模型提取的事件时间均不得超过30分钟。缺失、无时区或明显未来时间不能作为新快讯。`wechat_photo` / `old_photos` 不走此闸门（内容匹配，不是时效）；`news_max_age_seconds: 0` 表示不限龄。
 - **飞书卡片可读性**：单卡只展示「发布时间（北京时间）」；不展示页脚「事件时间」、不附带 `t.me` / 原文外链。摘要超过80字或超过2行时，在核心速览后追加「📌 事件详情」（优先模型要点，约3条）。晨报条目时间标为「北京时间：HH:MM」。
@@ -16,7 +16,7 @@
 - **加密内容过滤**：模型调用前后过滤加密货币及区块链内容；规则仍可能误伤或漏网。
 - **按组主题策略**：新闻组以 digest 提示词做主合规（宁可漏报）；可选的 `topic_filters.yaml` 只是按组本地正则安全网。词表不进代码仓库，部署时按组挂载策略文件。
 - **北京时间弹性静默**：按 `Asia/Shanghai` 窗口调整评估门槛与飞书推送；采集仍全天运行。跨午夜窗口（如 `23:00-01:00`）按半开区间 `[start, end)` 解析。
-- **微信公众号图片素材（`old_photos`）**：与 `news24` 对等隔离。只收照片/相册，按**内容匹配**而不是时效；不拦截频道发布时间或 `event_at`。可按 `scrape_history_pages` 用 `?before=` 向更早预览页回填（有页预算，整页已入库则停）。本地安全阀拒绝黄赌毒暴与时政敏感，`wechat_photo` 提示词宁缺毋滥；飞书卡只有标题、≤100 字说明和卡内嵌图（飞书应用上传 `image_key`；失败则回退为图片链接），无投资影响、无 Telegram/`t.me` 痕迹。默认低频（约 1 小时冷却、每日 8 次软顶）。图片不送入模型，CodeBuddy token 不变。
+- **微信公众号图片素材**：分组 id 是 `old_photos`，digest 提示词变体是 `wechat_photo`（不是两个产品）。与 `news24` 对等隔离。只收照片/相册，按**内容匹配**而不是时效；不拦截频道发布时间或 `event_at`。可按 `scrape_history_pages` 用 `?before=` 向更早预览页回填（有页预算，整页已入库则停）。本地安全阀拒绝黄赌毒暴与时政敏感，`wechat_photo` 提示词宁缺毋滥；飞书卡只有标题、≤100 字说明和卡内嵌图（飞书应用上传 `image_key`；失败则回退为图片链接），无投资影响、无 Telegram/`t.me` 痕迹。示例节奏（约 1 小时冷却、每日 8 次软顶）写在 `config.yaml.example`，不是全局代码默认。图片不送入模型，CodeBuddy token 不变。
 
 语义去重和时间提取依赖模型，不能保证百分之百准确。严格时效可能漏掉时间不明的消息；进程崩溃或投递不明也可能漏推。当前没有完整持久化发件箱、PDF/OCR或独立研报摘要通道。夜间识别仍可能漏报或误报。
 
@@ -235,7 +235,7 @@ Docker 若使用 `config.yaml`，把它挂进容器并设置 `CONFIG_PATH`，例
 | `DIGEST_MAX_WAIT_SECONDS` | 900 | 600 | 正常最长等待，秒，仍受预算与冷却限制 |
 | `DIGEST_MIN_INTERVAL_SECONDS` | 180 | 180 | 模型最小间隔，秒，重启后仍有效 |
 | `DIGEST_MAX_BATCH_SIZE` | 20 | 20 | 每批上限，可配置1–50 |
-| `DIGEST_MAX_CALLS_PER_DAY` | 288 | 288 | 每UTC日调用预约上限，失败也计数 |
+| `DIGEST_MAX_CALLS_PER_DAY` | 288 | 288 | 每UTC日**评估轮次**上限（失败也计数）；每轮 CLI 最多 2 次（主模型+fallback） |
 | `NEWS_MAX_AGE_SECONDS` | 1800 | 1800 | 频道与事件时间最大年龄，秒 |
 | `HOTNESS_THRESHOLD` | 7 | 7 | 推送评分下限，1–10 |
 | `DIGEST_CARD_INTERVAL_SECONDS` | 10 | 10 | 同批卡片间隔，秒 |
@@ -260,7 +260,7 @@ Docker 若使用 `config.yaml`，把它挂进容器并设置 `CONFIG_PATH`，例
 | `CODEBUDDY_AUTOCOMPACT` | `auto` | `auto` | CLI `--autocompact`，跟随模型上下文窗口 |
 | `CODEBUDDY_TIMEOUT` | 300 | 300 | CLI 子进程超时秒数；digest 使用 `max(300, timeout)` |
 
-兼容保留的 `QUIET_DIGEST_MIN_CANDIDATES`、`MORNING_FLUSH_MAX_AGE_SECONDS`、`MORNING_FLUSH_CARD_INTERVAL_SECONDS` 不再控制新夜间流程；以时间窗口和单张摘要为准。已有部署需同步更新旧窗口环境变量，再重启进程。
+`QUIET_*` / `SHOULDER_*` / `MORNING_FLUSH_*` 仍控制对应窗口的门槛、间隔、卡片上限与晨报评分。`QUIET_DIGEST_MIN_CANDIDATES`、`MORNING_FLUSH_MAX_AGE_SECONDS`、`MORNING_FLUSH_CARD_INTERVAL_SECONDS` 仍生效。已有部署需同步更新旧窗口环境变量，再重启进程。
 
 `TELEGRAM_CHANNELS` 默认空。CodeBuddy 和飞书凭据自行填写，签名密钥 `FEISHU_WEBHOOK_SECRET` 可选。`old_photos` 卡内嵌图还需 `FEISHU_APP_ID` 与 `FEISHU_APP_SECRET`（开放平台应用，具备上传图片权限）。代理建议通过OS/容器的 `HTTP_PROXY`、`HTTPS_PROXY` 设置，不要假设仅写入YAML的代理字段会传给HTTP客户端。容器内 `codebuddy` 装在 `/usr/local/bin`，非 root `appuser` 可直接调用；不要在镜像或 `.env` 里设置 `CODEBUDDY_INTERNET_ENVIRONMENT`。
 
@@ -270,7 +270,7 @@ Docker 若使用 `config.yaml`，把它挂进容器并设置 `CONFIG_PATH`，例
 
 持续每3分钟调用一次需要480次/天；288次预算在满负荷下约14.4小时耗尽。预算耗尽后继续采集，停止模型调用，过期消息过滤，不在次日补发。较低预算与全天高时效不能无条件兼得。
 
-每日限制是**调用次数，不是精确token总量**。输入有批次及字符限制；CodeBuddy CLI `--output-format text` 通常不回传 token 用量，`digest_calls.tokens` 多为未知，不能按零费用计算，以服务商账单为准。
+每日限制是**评估轮次，不是精确 token 总量，也不是 CLI 进程次数**。一轮预约最多打主模型 + fallback 各一次；把上限理解成「CLI 次数」会把日预算算紧一倍。输入有批次及字符限制；CodeBuddy CLI `--output-format text` 通常不回传 token 用量，`digest_calls.tokens` 多为未知，不能按零费用计算，以服务商账单为准。
 
 ## Docker 部署和升级
 
@@ -286,7 +286,7 @@ Compose挂载 `./data:/app/data`，数据库为 `/app/data/tg_news.db`。现有�
 
 升级前停止旧实例并一致性备份数据库及配置，再更新代码、合并参数、重建镜像。新增 `digest_calls`、`delivery_claims` 、`alert_schedule_state`、`night_candidates`、`morning_reports` 和 `night_alerts` 表在runner启动时自动创建。多组升级会给上述表和 `posts` 补上 `group_id`（旧行标为 `legacy` 或 `legacy_group_id`）。不要删库重置预算、去重和夜间卡片计数。
 
-新投递历史从升级后记录，不自动迁移旧版已发送摘要；原消息ID去重保留。当前建议单实例运行。回滚旧代码后新保护不再生效。容器健康检查仅检查CLI能运行，不能证明采集、模型或推送正常。
+新投递历史从升级后记录，不自动迁移旧版已发送摘要；原消息ID去重保留。当前建议单实例运行。回滚旧代码后新保护不再生效。容器 `HEALTHCHECK` 调用 `python -m tg_news_monitor.main --healthcheck`，检查 SQLite 里最近的采集/评估心跳（过期或缺失则非零退出）。Compose 的 `restart: unless-stopped` **不会**仅因 unhealthy 自动重建容器；若要按健康状态拉起，需额外的 autoheal 边车或编排器探针。`stop_grace_period: 90s` 给评估线程收尾时间；内存上限 `mem_limit` / `memswap_limit` 为 1g。
 
 ## 常见情况
 
@@ -317,7 +317,9 @@ python -m pytest -q
 python -m tg_news_monitor.main --help
 ```
 
-支持 `--once`、`--init-db`、`--config PATH`、`--version`。使用模拟服务，不代表线上语义判断、费用和飞书可用性已验证。
+支持 `--once`、`--init-db`、`--config PATH`、`--healthcheck`、`--version`。`--config` 仅当后缀恰好是 `.env` 时按 dotenv 加载（`environment.yaml` 不会被当成 env）。使用模拟服务，不代表线上语义判断、费用和飞书可用性已验证。
+
+生产镜像只装 runtime 依赖（`requirements.txt` / `pip install .`）。pytest 在 `[dev]` extra。许可证为 MIT，见 [LICENSE](LICENSE)。
 
 ## License
 

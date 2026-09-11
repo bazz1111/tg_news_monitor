@@ -5,6 +5,9 @@ services:
       dockerfile: Dockerfile
     container_name: tg_news_monitor
     restart: unless-stopped
+    stop_grace_period: 90s
+    mem_limit: 1g
+    memswap_limit: 1g
     # Nested Docker custom bridge cannot reach t.me (TCP timeout);
     # host net shares host egress. No host ports published by this app.
     network_mode: host

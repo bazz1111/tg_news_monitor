@@ -281,3 +281,99 @@ class TestPostLifecycleAndStateTracking:
         assert post.message_id == 2
         assert scraped_at.tzinfo is not None
 
+    def test_list_pending_respects_limit(self, repo):
+        repo.save_posts(
+            [create_sample_post("cap", i, f"Pending item number {i} with enough text.") for i in range(1, 8)]
+        )
+        assert len(repo.list_pending_posts(limit=3)) == 3
+        assert len(repo.list_pending_with_scraped_at(limit=3)) == 3
+
+    def test_purge_retention_removes_old_evaluated(self, repo):
+        from datetime import timedelta
+
+        from tg_news_monitor.storage.database import db_session, purge_retention
+
+        old = create_sample_post("oldch", 1, "An evaluated post from last quarter that should go.")
+        fresh = create_sample_post("oldch", 2, "A freshly evaluated post that must stay.")
+        pending = create_sample_post("oldch", 3, "Still pending evaluation and must stay.")
+        repo.save_posts([old, fresh, pending])
+        repo.update_evaluation("oldch", 1, score=5, summary="old", is_filtered=False)
+        repo.update_evaluation("oldch", 2, score=5, summary="new", is_filtered=False)
+        aged = (datetime.now(timezone.utc) - timedelta(days=120)).isoformat()
+        with db_session(repo.db_path) as conn:
+            conn.execute("UPDATE posts SET evaluated_at=? WHERE message_id=1", (aged,))
+        counts = purge_retention(repo.db_path)
+        assert counts["posts"] == 1
+        remaining = {p.message_id for p in repo.list_pending_posts()}
+        assert 3 in remaining
+        assert repo.is_processed("oldch", 2)
+
+
+class TestMigrationCrashSafety:
+    def test_posts_rebuild_rolls_back_on_insert_failure(self, temp_db):
+        import sqlite3
+
+        from tg_news_monitor.storage import database as dbmod
+
+        conn = sqlite3.connect(temp_db)
+        conn.execute(
+            """
+            CREATE TABLE posts (
+                id INTEGER PRIMARY KEY,
+                channel TEXT NOT NULL,
+                message_id INTEGER NOT NULL,
+                published_at TEXT NOT NULL,
+                scraped_at TEXT NOT NULL,
+                text TEXT NOT NULL,
+                has_media INTEGER NOT NULL DEFAULT 0,
+                media_type TEXT,
+                media_urls TEXT DEFAULT '[]',
+                direct_url TEXT NOT NULL,
+                forward_from TEXT,
+                views TEXT,
+                score INTEGER,
+                is_filtered INTEGER NOT NULL DEFAULT 0,
+                filter_reason TEXT,
+                summary TEXT,
+                key_takeaways TEXT DEFAULT '[]',
+                evaluated_at TEXT,
+                alert_sent INTEGER NOT NULL DEFAULT 0,
+                alert_sent_at TEXT,
+                alert_error TEXT,
+                retry_count INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT,
+                updated_at TEXT
+            )
+            """
+        )
+        conn.execute(
+            "INSERT INTO posts (channel, message_id, published_at, scraped_at, text, direct_url) "
+            "VALUES ('wire', 1, '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00', 'hello', 'https://t.me/wire/1')"
+        )
+        conn.commit()
+
+        class _Boom:
+            def __init__(self, inner: sqlite3.Connection) -> None:
+                self._inner = inner
+
+            def execute(self, sql, *args, **kwargs):
+                if isinstance(sql, str) and "INSERT INTO posts_migrate" in sql:
+                    raise sqlite3.OperationalError("injected failure")
+                return self._inner.execute(sql, *args, **kwargs)
+
+            def commit(self):
+                return self._inner.commit()
+
+            def rollback(self):
+                return self._inner.rollback()
+
+            def __getattr__(self, name):
+                return getattr(self._inner, name)
+
+        with pytest.raises(sqlite3.OperationalError, match="injected"):
+            dbmod._rebuild_posts(_Boom(conn), "legacy")
+        cols = [row[1] for row in conn.execute("PRAGMA table_info(posts)").fetchall()]
+        assert "channel" in cols
+        assert conn.execute("SELECT COUNT(*) FROM posts").fetchone()[0] == 1
+        conn.close()
+

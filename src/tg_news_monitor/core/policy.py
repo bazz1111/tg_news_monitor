@@ -104,12 +104,28 @@ class DeliveryPolicy:
         return fps
 
     def seen(self, text):
+        return bool(self.seen_many([text]))
+
+    def seen_many(self, texts):
+        """Return fingerprints that already have a live delivery claim (one connection)."""
+        items = [t for t in (texts or []) if t]
+        if not items:
+            return set()
+        fps = [fingerprint(t) for t in items]
         cutoff = self._claim_cutoff()
+        found = set()
+        chunk = 400
         with db_session(self.db_path) as conn:
-            return conn.execute(
-                'SELECT 1 FROM delivery_claims WHERE group_id=? AND fingerprint=? AND claimed>=?',
-                (self.group_id, fingerprint(text), cutoff),
-            ).fetchone() is not None
+            for i in range(0, len(fps), chunk):
+                part = fps[i:i + chunk]
+                placeholders = ",".join("?" * len(part))
+                rows = conn.execute(
+                    f"SELECT fingerprint FROM delivery_claims "
+                    f"WHERE group_id=? AND claimed>=? AND fingerprint IN ({placeholders})",
+                    (self.group_id, cutoff, *part),
+                ).fetchall()
+                found.update(row[0] for row in rows)
+        return found
 
     def recent_summaries(self, limit=20):
         """Unique claim summaries for this group in the 24h window, newest first."""

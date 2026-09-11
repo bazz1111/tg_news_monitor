@@ -68,6 +68,9 @@ VALID_CATEGORIES = {
 }
 
 
+_MAX_BACKOFF_EXPONENT = 16
+
+
 def calculate_backoff_delay(
     attempt: int,
     base_delay: float = 2.0,
@@ -75,10 +78,20 @@ def calculate_backoff_delay(
     jitter_range: Tuple[float, float] = (0.1, 0.5),
 ) -> float:
     """Calculates exponential backoff delay with randomized jitter.
-    
+
     Formula: delay = min(base_delay * (2 ** attempt) + uniform(jitter), max_delay)
+    Exponent is capped so a huge attempt cannot OverflowError (2**1024).
     """
-    delay = base_delay * (2**attempt) + random.uniform(*jitter_range)
+    try:
+        exp = min(max(0, int(attempt)), _MAX_BACKOFF_EXPONENT)
+    except (TypeError, ValueError):
+        exp = 0
+    try:
+        delay = base_delay * (2**exp) + random.uniform(*jitter_range)
+    except OverflowError:
+        return max_delay
+    if delay != delay:  # NaN
+        return max_delay
     return min(delay, max_delay)
 
 

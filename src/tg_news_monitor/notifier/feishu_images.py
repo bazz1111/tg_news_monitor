@@ -9,10 +9,13 @@ send is wired today. Image bytes never go to the LLM.
 
 from __future__ import annotations
 
+import ipaddress
+import socket
 import threading
 import time
-from typing import Any, Dict, List, Optional, Sequence, Tuple
-from urllib.parse import urlparse
+from collections import OrderedDict
+from typing import Any, Callable, List, Optional, Sequence, Tuple
+from urllib.parse import urljoin, urlparse
 
 import httpx
 
@@ -32,6 +35,16 @@ MAX_IMAGE_BYTES = 10 * 1024 * 1024
 TOKEN_REFRESH_SKEW_SECONDS = 120.0
 DEFAULT_TIMEOUT = 20.0
 DOWNLOAD_UA = "tg_news_monitor/feishu-images"
+KEY_CACHE_MAXSIZE = 1000
+MAX_DOWNLOAD_REDIRECTS = 3
+_BLOCKED_HOSTS = frozenset(
+    {
+        "localhost",
+        "localhost.localdomain",
+        "metadata.google.internal",
+        "metadata.google.com",
+    }
+)
 
 # (magic prefix-or-matcher) → (ext, mime)
 _JPEG_PREFIX = b"\xff\xd8\xff"
@@ -40,6 +53,56 @@ _GIF_PREFIXES = (b"GIF87a", b"GIF89a")
 _BMP_PREFIX = b"BM"
 _ICO_PREFIX = b"\x00\x00\x01\x00"
 _TIFF_PREFIXES = (b"II*\x00", b"MM\x00*")
+
+
+def resolve_host_ips(host: str) -> List[ipaddress.IPv4Address | ipaddress.IPv6Address]:
+    """Resolve a hostname to IP addresses. Tests may monkeypatch this."""
+    ips: List[ipaddress.IPv4Address | ipaddress.IPv6Address] = []
+    try:
+        for info in socket.getaddrinfo(host, None):
+            addr = info[4][0]
+            try:
+                ips.append(ipaddress.ip_address(addr))
+            except ValueError:
+                continue
+    except socket.gaierror:
+        return []
+    return ips
+
+
+def _ip_public(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    return not (
+        ip.is_private
+        or ip.is_loopback
+        or ip.is_link_local
+        or ip.is_multicast
+        or ip.is_reserved
+        or ip.is_unspecified
+    )
+
+
+def host_is_blocked(host: str) -> bool:
+    """True if host is private/loopback/link-local/metadata or resolves to one."""
+    name = (host or "").strip().lower().rstrip(".")
+    if not name:
+        return True
+    if name in _BLOCKED_HOSTS or name.endswith(".local") or name.endswith(".localhost"):
+        return True
+    try:
+        ip = ipaddress.ip_address(name)
+    except ValueError:
+        ips = resolve_host_ips(name)
+        if not ips:
+            return True
+        return any(not _ip_public(ip) for ip in ips)
+    return not _ip_public(ip)
+
+
+def url_is_safe_image(url: str) -> bool:
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"}:
+        return False
+    return not host_is_blocked(parsed.hostname or "")
 
 
 def sniff_image(data: bytes) -> Optional[Tuple[str, str]]:
@@ -74,17 +137,21 @@ class FeishuImageUploader:
         timeout: float = DEFAULT_TIMEOUT,
         max_bytes: int = MAX_IMAGE_BYTES,
         max_images: int = MAX_EMBEDDED_IMAGES,
+        key_cache_maxsize: int = KEY_CACHE_MAXSIZE,
+        host_checker: Optional[Callable[[str], bool]] = None,
     ) -> None:
         self.app_id = (app_id or "").strip()
         self.app_secret = (app_secret or "").strip()
         self.timeout = timeout
         self.max_bytes = max_bytes
         self.max_images = max_images
+        self._cache_max = max(1, int(key_cache_maxsize))
+        self._host_blocked = host_checker or host_is_blocked
         self._external_client = http_client
         self._lock = threading.Lock()
         self._token: str = ""
         self._token_expire_at: float = 0.0
-        self._key_by_url: Dict[str, str] = {}
+        self._key_by_url: OrderedDict[str, str] = OrderedDict()
 
     @classmethod
     def from_settings(cls, settings: Any, http_client: Optional[httpx.Client] = None) -> FeishuImageUploader:
@@ -111,7 +178,7 @@ class FeishuImageUploader:
             client = self._external_client
             should_close = False
         else:
-            client = httpx.Client(timeout=self.timeout, follow_redirects=True)
+            client = httpx.Client(timeout=self.timeout, follow_redirects=False, max_redirects=MAX_DOWNLOAD_REDIRECTS)
             should_close = True
         try:
             for url in candidates:
@@ -123,9 +190,22 @@ class FeishuImageUploader:
                 client.close()
         return keys
 
-    def _key_for_url(self, client: httpx.Client, url: str) -> str:
+    def _cache_get(self, url: str) -> str:
         with self._lock:
             cached = self._key_by_url.get(url)
+            if cached:
+                self._key_by_url.move_to_end(url)
+            return cached or ""
+
+    def _cache_put(self, url: str, key: str) -> None:
+        with self._lock:
+            self._key_by_url[url] = key
+            self._key_by_url.move_to_end(url)
+            while len(self._key_by_url) > self._cache_max:
+                self._key_by_url.popitem(last=False)
+
+    def _key_for_url(self, client: httpx.Client, url: str) -> str:
+        cached = self._cache_get(url)
         if cached:
             return cached
         blob = self._download(client, url)
@@ -139,40 +219,61 @@ class FeishuImageUploader:
         key = self._upload(client, blob, ext=ext, mime=mime)
         if not key:
             return ""
-        with self._lock:
-            self._key_by_url[url] = key
+        self._cache_put(url, key)
         return key
 
+    def _url_blocked(self, url: str) -> bool:
+        parsed = urlparse(url)
+        if parsed.scheme not in {"http", "https"}:
+            return True
+        return self._host_blocked(parsed.hostname or "")
+
     def _download(self, client: httpx.Client, url: str) -> Optional[bytes]:
-        host = urlparse(url).hostname or ""
+        current = url
         try:
-            with client.stream(
-                "GET",
-                url,
-                headers={"User-Agent": DOWNLOAD_UA},
-                follow_redirects=True,
-                timeout=self.timeout,
-            ) as resp:
-                if resp.status_code != 200:
-                    logger.warning(f"Skip Feishu image download HTTP {resp.status_code}: {url}")
+            for _hop in range(MAX_DOWNLOAD_REDIRECTS + 1):
+                if self._url_blocked(current):
+                    logger.warning(f"Skip Feishu image download, blocked host: {current}")
                     return None
-                cl = resp.headers.get("content-length")
-                if cl and cl.isdigit() and int(cl) > self.max_bytes:
-                    logger.warning(
-                        f"Skip Feishu image upload, Content-Length {cl} > {self.max_bytes}: {url}"
-                    )
-                    return None
-                buf = bytearray()
-                for chunk in resp.iter_bytes():
-                    if not chunk:
+                host = urlparse(current).hostname or ""
+                with client.stream(
+                    "GET",
+                    current,
+                    headers={"User-Agent": DOWNLOAD_UA},
+                    follow_redirects=False,
+                    timeout=self.timeout,
+                ) as resp:
+                    if resp.status_code in {301, 302, 303, 307, 308}:
+                        loc = (resp.headers.get("location") or "").strip()
+                        if not loc:
+                            logger.warning(f"Skip Feishu image download, empty redirect: {current}")
+                            return None
+                        current = urljoin(current, loc)
                         continue
-                    buf.extend(chunk)
-                    if len(buf) > self.max_bytes:
+                    if resp.status_code != 200:
                         logger.warning(
-                            f"Skip Feishu image upload, body > {self.max_bytes} bytes host={host}"
+                            f"Skip Feishu image download HTTP {resp.status_code}: {current}"
                         )
                         return None
-                return bytes(buf)
+                    cl = resp.headers.get("content-length")
+                    if cl and cl.isdigit() and int(cl) > self.max_bytes:
+                        logger.warning(
+                            f"Skip Feishu image upload, Content-Length {cl} > {self.max_bytes}: {current}"
+                        )
+                        return None
+                    buf = bytearray()
+                    for chunk in resp.iter_bytes():
+                        if not chunk:
+                            continue
+                        buf.extend(chunk)
+                        if len(buf) > self.max_bytes:
+                            logger.warning(
+                                f"Skip Feishu image upload, body > {self.max_bytes} bytes host={host}"
+                            )
+                            return None
+                    return bytes(buf)
+            logger.warning(f"Skip Feishu image download, too many redirects: {url}")
+            return None
         except (httpx.TimeoutException, httpx.NetworkError, httpx.RequestError, ValueError) as exc:
             logger.warning(f"Skip Feishu image download ({exc.__class__.__name__}): {url}")
             return None
@@ -262,8 +363,13 @@ class FeishuImageUploader:
 
 
 __all__ = [
+    "KEY_CACHE_MAXSIZE",
+    "MAX_DOWNLOAD_REDIRECTS",
     "MAX_EMBEDDED_IMAGES",
     "MAX_IMAGE_BYTES",
     "FeishuImageUploader",
+    "host_is_blocked",
+    "resolve_host_ips",
     "sniff_image",
+    "url_is_safe_image",
 ]

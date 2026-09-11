@@ -41,10 +41,10 @@ _CRYPTO_RES = [
 
 _PathLike = Union[str, Path, None]
 
-# (resolved_path, mtime) -> parsed mapping
+# Keep only the latest mtime per path (stale keys are dropped).
 _file_cache: Optional[Tuple[str, float, Dict[str, Any]]] = None
-# (resolved_path, mtime, group_id) -> compiled patterns (empty => disabled)
-_policy_cache: Dict[Tuple[str, float, str], Tuple[re.Pattern[str], ...]] = {}
+# (resolved_path, group_id) -> (mtime, compiled patterns); empty patterns => disabled
+_policy_cache: Dict[Tuple[str, str], Tuple[float, Tuple[re.Pattern[str], ...]]] = {}
 
 
 class TopicFilterPolicy(NamedTuple):
@@ -193,16 +193,17 @@ def load_topic_filters(
     if resolved is None:
         return TopicFilterPolicy(False, (), gid, None)
     mtime, raw = _read_topic_file(resolved)
-    cache_key = (str(resolved), mtime, gid)
-    if cache_key in _policy_cache:
-        patterns = _policy_cache[cache_key]
+    cache_key = (str(resolved), gid)
+    cached = _policy_cache.get(cache_key)
+    if cached is not None and cached[0] == mtime:
+        patterns = cached[1]
         return TopicFilterPolicy(bool(patterns), patterns, gid, resolved)
     block = _block_for_group(raw, gid)
     if not block or not block.get("enabled", False):
-        _policy_cache[cache_key] = ()
+        _policy_cache[cache_key] = (mtime, ())
         return TopicFilterPolicy(False, (), gid, resolved)
     patterns = _compile_patterns(_category_strings(block.get("categories")))
-    _policy_cache[cache_key] = patterns
+    _policy_cache[cache_key] = (mtime, patterns)
     return TopicFilterPolicy(bool(patterns), patterns, gid, resolved)
 
 

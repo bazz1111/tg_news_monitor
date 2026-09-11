@@ -76,6 +76,9 @@ GROUP_OVERRIDE_FIELDS = (
     "morning_flush_max_age_seconds",
     "morning_flush_hotness_threshold",
     "morning_flush_card_interval_seconds",
+    "pending_load_limit",
+    "pending_load_multiplier",
+    "pending_backlog_max_age_seconds",
 )
 
 
@@ -110,18 +113,40 @@ def normalize_channel_list(value: Any) -> List[str]:
     return [str(value).lower().lstrip("@").strip()]
 
 
-def lookup_env(name: str, env_lookup: Optional[Mapping[str, Any]] = None) -> str:
-    """Resolve an env var by original or lower-case name from a lookup map or os.environ."""
+class ConfigParseError(ValueError):
+    """Raised when a YAML/JSON config file is present but cannot be parsed."""
+
+
+def _os_environ_ci(name: str) -> str:
+    """Case-insensitive OS env lookup. Exact / upper / lower, then scan keys."""
     key = (name or "").strip()
     if not key:
         return ""
+    for candidate in (key, key.upper(), key.lower()):
+        if candidate in os.environ and os.environ[candidate] is not None:
+            return str(os.environ[candidate]).strip()
+    want = key.lower()
+    for env_k, env_v in os.environ.items():
+        if env_k.lower() == want and env_v is not None:
+            return str(env_v).strip()
+    return ""
+
+
+def lookup_env(name: str, env_lookup: Optional[Mapping[str, Any]] = None) -> str:
+    """Resolve an env var. OS wins over ``env_lookup`` on case-insensitive collision."""
+    key = (name or "").strip()
+    if not key:
+        return ""
+    from_os = _os_environ_ci(key)
+    if from_os:
+        return from_os
     if env_lookup:
         if key in env_lookup and env_lookup[key] is not None:
             return str(env_lookup[key]).strip()
         low = key.lower()
         if low in env_lookup and env_lookup[low] is not None:
             return str(env_lookup[low]).strip()
-    return (os.environ.get(key) or os.environ.get(key.upper()) or "").strip()
+    return ""
 
 
 class CardProfile(BaseModel):
@@ -197,8 +222,8 @@ class Group(BaseModel):
     channels: List[str] = Field(default_factory=list)
     enabled: bool = Field(default=True)
 
-    webhook_url: Optional[str] = Field(default=None, description="Direct webhook URL (tests / explicit)")
-    webhook_secret: Optional[str] = Field(default=None)
+    webhook_url: Optional[str] = Field(default=None, repr=False, description="Direct webhook URL (tests / explicit)")
+    webhook_secret: Optional[str] = Field(default=None, repr=False)
     webhook_url_env: Optional[str] = Field(default=None, description="Env var name holding the webhook URL")
     webhook_secret_env: Optional[str] = Field(default=None)
 
@@ -245,6 +270,9 @@ class Group(BaseModel):
     morning_flush_max_age_seconds: Optional[int] = Field(default=None, ge=60)
     morning_flush_hotness_threshold: Optional[int] = Field(default=None, ge=1, le=10)
     morning_flush_card_interval_seconds: Optional[float] = Field(default=None, ge=0)
+    pending_load_limit: Optional[int] = Field(default=None, ge=0)
+    pending_load_multiplier: Optional[int] = Field(default=None, ge=1, le=50)
+    pending_backlog_max_age_seconds: Optional[int] = Field(default=None, ge=0)
     card_profile: Optional[CardProfile] = None
 
     @field_validator("id")
@@ -389,8 +417,21 @@ def parse_dotenv_file(filepath: Union[str, Path]) -> Dict[str, str]:
     return values
 
 
+def _require_mapping(parsed: Any, source: str) -> Dict[str, Any]:
+    if parsed is None:
+        return {}
+    if isinstance(parsed, dict):
+        return parsed
+    raise ConfigParseError(f"{source} root must be a mapping, got {type(parsed).__name__}")
+
+
 def parse_yaml_file(filepath: Union[str, Path]) -> Dict[str, Any]:
-    """Parses a YAML or JSON configuration file into a dictionary."""
+    """Parse a YAML or JSON configuration file into a dictionary.
+
+    When PyYAML is installed, parse failures raise ConfigParseError (no silent
+    homemade fallback that can invent the wrong types). The fallback parser is
+    used only if PyYAML is absent, and logs a warning.
+    """
     path = Path(filepath)
     if not path.is_file():
         return {}
@@ -401,19 +442,33 @@ def parse_yaml_file(filepath: Union[str, Path]) -> Dict[str, Any]:
     if not content:
         return {}
 
+    suffix = path.suffix.lower()
+    label = str(path)
+
+    if suffix == ".json":
+        try:
+            return _require_mapping(json.loads(content), label)
+        except ConfigParseError:
+            raise
+        except Exception as exc:
+            raise ConfigParseError(f"invalid JSON config {label}: {exc}") from exc
+
     if HAS_YAML:
         try:
             parsed = yaml.safe_load(content)
-            if isinstance(parsed, dict):
-                return parsed
-        except Exception:
-            pass
+        except Exception as exc:
+            raise ConfigParseError(f"invalid YAML config {label}: {exc}") from exc
+        return _require_mapping(parsed, label)
 
-    # Fallback to JSON parser
+    import logging
+
+    logging.getLogger(__name__).warning(
+        "PyYAML is not installed; using a limited fallback parser for %s. "
+        "Install pyyaml to fail fast on invalid config.",
+        label,
+    )
     try:
-        parsed_json = json.loads(content)
-        if isinstance(parsed_json, dict):
-            return parsed_json
+        return _require_mapping(json.loads(content), label)
     except Exception:
         pass
 
@@ -558,6 +613,7 @@ class Settings(_BaseClass):
     # CodeBuddy CLI credentials & models (Tencent CodeBuddy Code)
     codebuddy_api_key: str = Field(
         default="",
+        repr=False,
         description="CodeBuddy CLI credential (CODEBUDDY_API_KEY). Do not set CODEBUDDY_INTERNET_ENVIRONMENT.",
     )
     codebuddy_model: str = Field(
@@ -612,7 +668,32 @@ class Settings(_BaseClass):
     )
     digest_min_interval_seconds: int = Field(default=180, ge=0)
     digest_max_batch_size: int = Field(default=20, ge=1, le=50)
-    digest_max_calls_per_day: int = Field(default=288, ge=1)
+    digest_max_calls_per_day: int = Field(
+        default=288,
+        ge=1,
+        description="Daily evaluation-round cap (UTC day). Each reserved round may invoke the CLI up to 2× (primary+fallback).",
+    )
+    pending_load_limit: int = Field(
+        default=0,
+        ge=0,
+        description="Max unevaluated rows loaded per group. 0 = digest_max_batch_size * pending_load_multiplier.",
+    )
+    pending_load_multiplier: int = Field(
+        default=5,
+        ge=1,
+        le=50,
+        description="When pending_load_limit is 0, load at most batch_size * this many pending rows.",
+    )
+    pending_backlog_max_age_seconds: int = Field(
+        default=0,
+        ge=0,
+        description="Optional backlog expiry for age-skip groups (wechat_photo). 0 = disabled.",
+    )
+    healthcheck_max_age_seconds: int = Field(
+        default=0,
+        ge=0,
+        description="Override --healthcheck staleness. 0 = auto from poll interval.",
+    )
 
     # Digest buffering gate (batch LLM + multi single cards)
     digest_min_candidates: int = Field(
@@ -666,22 +747,27 @@ class Settings(_BaseClass):
     # Feishu (Lark) Webhook dispatcher
     feishu_webhook_url: str = Field(
         default="",
+        repr=False,
         description="Feishu Custom Bot Webhook URL for interactive card dispatch",
     )
     feishu_webhook_secret: Optional[str] = Field(
         default=None,
+        repr=False,
         description="Optional Feishu HMAC-SHA256 signing secret",
     )
     feishu_secret: Optional[str] = Field(
         default=None,
+        repr=False,
         description="Alias for feishu_webhook_secret",
     )
     feishu_app_id: str = Field(
         default="",
+        repr=False,
         description="Feishu open-platform app id for tenant_access_token + image upload",
     )
     feishu_app_secret: str = Field(
         default="",
+        repr=False,
         description="Feishu open-platform app secret (never log or commit)",
     )
 
@@ -747,7 +833,7 @@ class Settings(_BaseClass):
             except Exception as exc:
                 raise ValueError(f"groups must be a YAML/JSON list: {exc}") from exc
         if isinstance(value, dict):
-            value = [value]
+            raise ValueError("groups must be a list of group objects, not a mapping")
         if not isinstance(value, list):
             raise ValueError("groups must be a list of group objects")
         return value
@@ -930,11 +1016,10 @@ class Settings(_BaseClass):
         env_lookup: Dict[str, str] = {}
 
         def _remember_env(key: str, value: Any) -> None:
+            """Store only lowercase keys so later OS writes always win collisions."""
             if value is None:
                 return
-            text = str(value)
-            env_lookup[key] = text
-            env_lookup[key.lower()] = text
+            env_lookup[str(key).lower()] = str(value)
 
         # 1. Load from YAML / JSON config file if present
         target_config = config_path or os.environ.get("CONFIG_PATH") or os.environ.get("CONFIG_FILE")
@@ -958,7 +1043,7 @@ class Settings(_BaseClass):
                 merged_values[k.lower()] = v
                 _remember_env(k, v)
 
-        # 3. Load from OS environment variables (case-insensitive)
+        # 3. Load from OS environment variables (case-insensitive; OS wins)
         for env_k, env_v in os.environ.items():
             merged_values[env_k.lower()] = env_v
             _remember_env(env_k, env_v)
@@ -971,31 +1056,31 @@ class Settings(_BaseClass):
         if "env_lookup" not in override_kwargs:
             merged_values["env_lookup"] = env_lookup
 
-        return cls(**merged_values)
+        return cls(_from_load=True, **merged_values)
 
     def __init__(self, **data: Any) -> None:
-        """Initializes Settings, automatically merging env and .env if not using pydantic_settings."""
-        if HAS_PYDANTIC_SETTINGS and isinstance(self, BaseSettings):
+        """Merge .env then OS (OS wins), then kwargs — same order as Settings.load() minus YAML.
+
+        pydantic-settings also reads OS env; we still apply .env for keys the OS
+        does not set so Settings() and Settings.load() agree on OS > .env.
+        """
+        if data.pop("_from_load", False):
             super().__init__(**data)
-        else:
-            # Emulate BaseSettings automatic environment resolution
-            merged: Dict[str, Any] = {}
+            return
 
-            # Check default .env in cwd
-            if Path(".env").is_file():
-                for k, v in parse_dotenv_file(".env").items():
-                    merged[k.lower()] = v
-
-            # Merge os.environ
-            for k, v in os.environ.items():
+        merged: Dict[str, Any] = {}
+        if Path(".env").is_file():
+            for k, v in parse_dotenv_file(".env").items():
                 merged[k.lower()] = v
-
-            # Merge explicit kwargs
-            for k, v in data.items():
-                if v is not None:
-                    merged[k.lower()] = v
-
-            super().__init__(**merged)
+        os_keys = {k.lower() for k in os.environ}
+        for k, v in os.environ.items():
+            merged[k.lower()] = v
+        for k, v in data.items():
+            if v is not None:
+                merged[str(k).lower()] = v
+            elif str(k).lower() not in os_keys:
+                merged.pop(str(k).lower(), None)
+        super().__init__(**merged)
 
 
 # ==============================================================================

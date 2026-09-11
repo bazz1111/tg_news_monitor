@@ -61,7 +61,7 @@ from tg_news_monitor.notifier.feishu_card import FeishuCardBuilder
 from tg_news_monitor.notifier.feishu_images import FeishuImageUploader
 from tg_news_monitor.notifier.card_format import format_morning_item_md
 from tg_news_monitor.notifier.webhook_sender import FeishuWebhookSender
-from tg_news_monitor.scraper.client import TelegramScraperClient
+from tg_news_monitor.scraper.client import TelegramScraperClient, interruptible_sleep
 from tg_news_monitor.scraper.parser import TelegramWebParser
 from tg_news_monitor.storage.repository import PostRepository
 
@@ -138,6 +138,7 @@ class NewsMonitorRunner:
             self.scraper_client = TelegramScraperClient(
                 base_interval=float(self.config.poll_interval_seconds),
                 jitter_ratio=jitter_ratio,
+                stop_check=lambda: self._stop_requested,
             )
 
         # CodeBuddy CLI evaluator (primary → fallback model, then local heuristic)
@@ -190,6 +191,7 @@ class NewsMonitorRunner:
                 webhook_url=self.config.feishu_webhook_url,
                 secret=secret,
                 max_retries=1,
+                stop_check=lambda: self._stop_requested,
             )
 
         if not enabled:
@@ -531,7 +533,8 @@ class NewsMonitorRunner:
             if page_idx > 0:
                 delay = self._history_page_delay()
                 if delay > 0:
-                    time.sleep(delay)
+                    if interruptible_sleep(delay, lambda: self._stop_requested):
+                        break
 
             try:
                 html = self._fetch_channel_html(clean_channel, before=before)
@@ -878,6 +881,14 @@ class NewsMonitorRunner:
             digest.has_material_news = False
             digest.filtered_note = ((digest.filtered_note or "") + "; wechat_photo_empty").strip("; ")
 
+    def _pending_load_limit(self, cfg) -> int:
+        batch = int(getattr(cfg, "digest_max_batch_size", 20) or 20)
+        explicit = int(getattr(cfg, "pending_load_limit", 0) or 0)
+        if explicit > 0:
+            return explicit
+        mult = int(getattr(cfg, "pending_load_multiplier", 5) or 5)
+        return max(batch, batch * max(1, mult))
+
     def _oldest_age_seconds(
         self,
         pending_pairs: List[Tuple[TelegramPost, datetime]],
@@ -1043,8 +1054,10 @@ class NewsMonitorRunner:
 
             if idx < len(channel_jobs) - 1 and not self._stop_requested:
                 pause = self.config.inter_channel_delay_seconds
-                time.sleep(max(0.1, pause))
+                interruptible_sleep(max(0.1, pause), lambda: self._stop_requested)
 
+        if hasattr(self.storage, "record_heartbeat"):
+            self.storage.record_heartbeat("ingest")
         if ingest_only:
             return pass_summary
         return self.process_pending(pass_summary)
@@ -1067,7 +1080,24 @@ class NewsMonitorRunner:
                 quiet_hours = getattr(cfg, "quiet_hours", "") or ""
                 shoulder_hours = getattr(cfg, "shoulder_hours", "") or ""
                 mode = alert_schedule.classify_alert_mode(local, quiet_hours, shoulder_hours)
-                knobs = alert_schedule.knobs_for(cfg, mode, now_local=local)
+                morning_recap = self.quiet.morning_due(clock) and not self._is_wechat_photo()
+                flush = False
+                if (
+                    not morning_recap
+                    and mode == alert_schedule.MODE_DAY
+                    and getattr(cfg, "morning_flush_enabled", True)
+                    and not self._is_wechat_photo()
+                ):
+                    flush = self.policy.peek_morning_flush(
+                        mode,
+                        local,
+                        alert_schedule.day_start_minutes(quiet_hours, shoulder_hours),
+                    )
+                knobs = alert_schedule.knobs_for(
+                    cfg, mode, is_morning_flush=flush, now_local=local
+                )
+                if flush:
+                    self.policy.mark_morning_flush(local)
                 self.policy.sync_quiet_window(mode, knobs.quiet_window_id)
                 logger.info(
                     f"group={self._group_id} Alert window: mode={knobs.mode} tz={tz_name} "
@@ -1088,15 +1118,20 @@ class NewsMonitorRunner:
 
         pass_summary["posts_evaluated"] = totals_eval
         pass_summary["alerts_sent"] = totals_alert
+        if hasattr(self.storage, "record_heartbeat"):
+            self.storage.record_heartbeat("eval")
         return pass_summary
 
     def _process_pending_with_knobs(self, pass_summary, clock, knobs, live_clock=True):
         quiet = knobs.mode == "quiet"
         cfg = self._group_config
         # 2. Load this group's pending posts (never mix groups in one LLM call)
+        pending_limit = self._pending_load_limit(cfg)
         if hasattr(self.storage, "list_pending_with_scraped_at"):
             try:
-                pending_pairs = self.storage.list_pending_with_scraped_at(group_id=self._group_id)
+                pending_pairs = self.storage.list_pending_with_scraped_at(
+                    group_id=self._group_id, limit=pending_limit
+                )
             except TypeError:
                 pending_pairs = self.storage.list_pending_with_scraped_at()
         else:
@@ -1119,18 +1154,37 @@ class NewsMonitorRunner:
 
         pending_posts = [p for p, _ in pending_pairs]
         skip_age = self._skip_publish_freshness()
+        backlog_age = int(getattr(cfg, "pending_backlog_max_age_seconds", 0) or 0)
+
+        def _scraped_of(post):
+            for p, scraped_at in pending_pairs:
+                if p is post:
+                    return scraped_at
+            return clock
+
         def eligible(post):
             if skip_age:
+                if backlog_age > 0:
+                    scraped = _scraped_of(post)
+                    if scraped.tzinfo is None:
+                        scraped = scraped.replace(tzinfo=timezone.utc)
+                    if (clock - scraped).total_seconds() > backlog_age:
+                        return False
                 return True
             return (quiet and self.quiet.in_window(post.published_at, clock)) or is_fresh(post.published_at, knobs.max_age_seconds, clock)
         expired = [p for p in pending_posts if not eligible(p)]
         self._mark_all_filtered(expired, "expired_or_invalid_time")
         pending_posts = [p for p in pending_posts if eligible(p)]
         unique, duplicates, seen = [], [], set()
-        for post in sorted(pending_posts, key=lambda p: p.published_at, reverse=True):
+        ordered = sorted(pending_posts, key=lambda p: p.published_at, reverse=True)
+        claimed = set()
+        if hasattr(self.policy, "seen_many"):
+            claimed = self.policy.seen_many([self._delivery_text(p) for p in ordered])
+        for post in ordered:
             material = self._delivery_text(post)
             key = fingerprint(material)
-            if key in seen or self.policy.seen(material):
+            already = key in claimed if claimed or hasattr(self.policy, "seen_many") else self.policy.seen(material)
+            if key in seen or already:
                 duplicates.append(post)
             else:
                 seen.add(key)
@@ -1385,7 +1439,8 @@ class NewsMonitorRunner:
                         f"Waiting {card_gap:.0f}s before next Feishu card "
                         f"({idx + 1}/{len(digest.items)})…"
                     )
-                    time.sleep(card_gap)
+                    if interruptible_sleep(card_gap, lambda: self._stop_requested):
+                        break
                 ch = str(item.channel).lower().lstrip("@").strip()
                 mid = int(item.message_id)
                 matched_post = post_by_key.get((ch, mid))
@@ -1602,8 +1657,18 @@ class NewsMonitorRunner:
 
         executor = ThreadPoolExecutor(max_workers=1)
         worker = None
+        last_maintenance = 0.0
         while not self._stop_requested:
             try:
+                now_ts = time.time()
+                if now_ts - last_maintenance >= 86400:
+                    try:
+                        if hasattr(self.storage, "purge_retention"):
+                            purged = self.storage.purge_retention()
+                            logger.info(f"Retention maintenance: {purged}")
+                    except Exception as exc:
+                        logger.warning(f"Retention maintenance failed: {exc}")
+                    last_maintenance = now_ts
                 start_time = time.time()
                 summary = self.run_once(ingest_only=True)
                 if worker is None or worker.done():
@@ -1612,7 +1677,8 @@ class NewsMonitorRunner:
                             worker.result()
                         except Exception as exc:
                             logger.error(f"Digest worker failed: {exc}")
-                    worker = executor.submit(self.process_pending)
+                    if not self._stop_requested:
+                        worker = executor.submit(self.process_pending)
                 elapsed = time.time() - start_time
 
                 logger.info(
@@ -1632,10 +1698,7 @@ class NewsMonitorRunner:
                 )
                 delay = max(0.0, delay - elapsed)
                 logger.debug(f"Sleeping for {delay:.1f}s until next polling pass...")
-
-                sleep_end = time.time() + delay
-                while time.time() < sleep_end and not self._stop_requested:
-                    time.sleep(0.5)
+                interruptible_sleep(delay, lambda: self._stop_requested)
 
             except KeyboardInterrupt:
                 logger.info("KeyboardInterrupt received. Stopping daemon...")
@@ -1643,7 +1706,7 @@ class NewsMonitorRunner:
                 break
             except Exception as exc:
                 logger.error(f"Unexpected error in runner main loop: {exc}")
-                time.sleep(5.0)
+                interruptible_sleep(5.0, lambda: self._stop_requested)
 
         executor.shutdown(wait=True)
         logger.info("NewsMonitorRunner daemon loop exited cleanly.")

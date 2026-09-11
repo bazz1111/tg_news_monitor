@@ -5,10 +5,18 @@ from __future__ import annotations
 import os
 import tempfile
 from pathlib import Path
+from textwrap import dedent
 import pytest
 from pydantic import ValidationError, SecretStr
 
-from tg_news_monitor.config import Settings, get_config, parse_dotenv_file, parse_yaml_file
+from tg_news_monitor.config import (
+    ConfigParseError,
+    Settings,
+    get_config,
+    lookup_env,
+    parse_dotenv_file,
+    parse_yaml_file,
+)
 
 
 class TestConfigDefaultsAndParsing:
@@ -263,15 +271,17 @@ class TestFileConfigurationLoading:
         with local_temp_dir() as tmpdir:
             yaml_path = tmpdir / "config.yaml"
             yaml_path.write_text(
-                """
-                telegram_channels:
-                  - durov
-                  - telegram
-                poll_interval_seconds: 120
-                hotness_threshold: 6
-                codebuddy_model: fast-model
-                db_path: /custom/path.db
-                """,
+                dedent(
+                    """
+                    telegram_channels:
+                      - durov
+                      - telegram
+                    poll_interval_seconds: 120
+                    hotness_threshold: 6
+                    codebuddy_model: fast-model
+                    db_path: /custom/path.db
+                    """
+                ),
                 encoding="utf-8",
             )
 
@@ -293,11 +303,13 @@ class TestFileConfigurationLoading:
         with local_temp_dir() as tmpdir:
             yaml_path = tmpdir / "config.yaml"
             yaml_path.write_text(
-                """
-                poll_interval_seconds: 100
-                hotness_threshold: 5
-                log_level: DEBUG
-                """,
+                dedent(
+                    """
+                    poll_interval_seconds: 100
+                    hotness_threshold: 5
+                    log_level: DEBUG
+                    """
+                ),
                 encoding="utf-8",
             )
 
@@ -326,6 +338,40 @@ class TestFileConfigurationLoading:
             s3 = Settings.load(config_path=yaml_path, env_file=env_path, hotness_threshold=10)
             assert s3.hotness_threshold == 10      # from kwargs
             assert s3.poll_interval_seconds == 80
+
+    def test_os_wins_case_insensitive_env_collision(self, monkeypatch: pytest.MonkeyPatch):
+        with local_temp_dir() as tmpdir:
+            env_path = tmpdir / ".env"
+            env_path.write_text("hotness_threshold=3\n", encoding="utf-8")
+            monkeypatch.setenv("HOTNESS_THRESHOLD", "9")
+            loaded = Settings.load(env_file=env_path)
+            constructed = Settings(_from_load=True, **{"hotness_threshold": 9})
+            assert loaded.hotness_threshold == 9
+            assert lookup_env("hotness_threshold", loaded.env_lookup) == "9"
+            assert constructed.hotness_threshold == 9
+
+    def test_invalid_yaml_raises(self):
+        with local_temp_dir() as tmpdir:
+            path = tmpdir / "broken.yaml"
+            path.write_text("groups: [\n  - :\n", encoding="utf-8")
+            with pytest.raises(ConfigParseError):
+                parse_yaml_file(path)
+            with pytest.raises(ConfigParseError):
+                Settings.load(config_path=path)
+
+    def test_settings_repr_hides_secrets(self):
+        s = Settings(codebuddy_api_key="cb-should-not-appear", feishu_app_secret="app-secret-xyz")
+        dumped = repr(s)
+        assert "cb-should-not-appear" not in dumped
+        assert "app-secret-xyz" not in dumped
+
+    def test_invalid_timezone_rejected(self):
+        with pytest.raises(ValidationError):
+            Settings(timezone="NotA/RealZone")
+
+    def test_groups_mapping_rejected(self):
+        with pytest.raises(ValidationError):
+            Settings(groups={"news24": {"channels": ["wire"]}})
 
 
 

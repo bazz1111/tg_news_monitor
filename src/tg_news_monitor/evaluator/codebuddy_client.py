@@ -36,6 +36,35 @@ DEFAULT_AUTOCOMPACT = "auto"
 DEFAULT_TIMEOUT = 300.0
 DIGEST_TIMEOUT_FLOOR = 300.0
 
+# Child process must not inherit Feishu / DB / webhook secrets.
+_CHILD_ENV_ALLOW = frozenset(
+    {
+        "PATH",
+        "HOME",
+        "USER",
+        "LOGNAME",
+        "SHELL",
+        "TMPDIR",
+        "TEMP",
+        "TMP",
+        "LANG",
+        "LANGUAGE",
+        "LC_ALL",
+        "LC_CTYPE",
+        "LC_MESSAGES",
+        "LC_COLLATE",
+        "LC_TIME",
+        "TZ",
+        "TERM",
+        "XDG_CACHE_HOME",
+        "XDG_CONFIG_HOME",
+        "XDG_DATA_HOME",
+        "XDG_RUNTIME_DIR",
+        "NODE_PATH",
+        "NPM_CONFIG_UPDATE_NOTIFIER",
+    }
+)
+
 
 class CodeBuddyError(Exception):
     """Raised when CodeBuddy CLI evaluation fails after retries."""
@@ -76,12 +105,23 @@ class CodeBuddyEvaluator:
         self.last_usage: Optional[int] = None
 
     def _child_env(self) -> dict[str, str]:
-        """Copy the process env, inject the CLI key, never set the international-site flag."""
-        env = {k: v for k, v in os.environ.items() if v is not None}
-        env.pop("CODEBUDDY_INTERNET_ENVIRONMENT", None)
+        """Whitelist PATH/locale/CODEBUDDY_* only. Never pass FEISHU_* secrets."""
+        env: dict[str, str] = {}
+        for key, value in os.environ.items():
+            if value is None:
+                continue
+            if key in _CHILD_ENV_ALLOW or key.startswith("LC_"):
+                env[key] = value
+            elif key.startswith("CODEBUDDY_") and key != "CODEBUDDY_INTERNET_ENVIRONMENT":
+                env[key] = value
         if self.api_key:
             env["CODEBUDDY_API_KEY"] = self.api_key
-        env.update(self.extra_env)
+        for key, value in self.extra_env.items():
+            if value is None:
+                continue
+            if key == "CODEBUDDY_INTERNET_ENVIRONMENT" or key.startswith("FEISHU_"):
+                continue
+            env[key] = value
         env.pop("CODEBUDDY_INTERNET_ENVIRONMENT", None)
         return env
 

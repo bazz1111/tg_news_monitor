@@ -50,9 +50,10 @@ RUN mkdir -p /app/data && \
 # Switch to non-root user for principle of least privilege
 USER appuser:appgroup
 
-# Container healthcheck ensuring Python runtime integrity and CLI responsiveness
-HEALTHCHECK --interval=60s --timeout=10s --start-period=15s --retries=3 \
-    CMD python -m tg_news_monitor.main --version || exit 1
+# Business heartbeat: recent ingest + eval. Compose `restart` does not
+# recreate the container on unhealthy alone (needs an autoheal sidecar).
+HEALTHCHECK --interval=60s --timeout=15s --start-period=180s --retries=3 \
+    CMD python -m tg_news_monitor.main --healthcheck || exit 1
 
 # Headless service entrypoint
 ENTRYPOINT ["python", "-m", "tg_news_monitor.main"]
