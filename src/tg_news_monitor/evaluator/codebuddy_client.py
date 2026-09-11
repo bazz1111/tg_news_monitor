@@ -195,7 +195,7 @@ class CodeBuddyEvaluator:
 
         self.last_usage = None
         prompt = self._compose_digest_prompt(posts)
-        digest_timeout = max(60.0, float(self.timeout or 30.0))
+        digest_timeout = max(180.0, float(self.timeout or 30.0))
         last_error: Optional[Exception] = None
         try:
             brief = self._complete_with_fallback(prompt, parse_digest_brief, timeout=digest_timeout)

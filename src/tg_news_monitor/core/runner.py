@@ -146,7 +146,7 @@ class NewsMonitorRunner:
                 api_key=self.config.codebuddy_api_key,
                 model=self.config.codebuddy_model,
                 fallback_model=self.config.codebuddy_fallback_model,
-                timeout=60.0,
+                timeout=180.0,
                 cli_bin=getattr(self.config, "codebuddy_cli", "codebuddy"),
             )
             logger.info(
