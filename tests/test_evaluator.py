@@ -32,6 +32,7 @@ from tg_news_monitor.evaluator.fallback import (
     heuristic_keyword_fallback,
     normalize_and_validate_evaluation,
     parse_and_repair_evaluation,
+    parse_digest_brief,
     repair_json_string,
     strip_markdown_code_fences,
 )
@@ -330,6 +331,50 @@ class TestResponseParsingAndNormalization:
         evaluation = parse_and_repair_evaluation(llm_response)
         assert evaluation.score == 8
         assert "降息" in evaluation.title
+
+    def test_parse_digest_brief_missing_impact_fields_use_defaults(self) -> None:
+        """Omitted or null impact_* fields must not fail DigestBrief validation."""
+        payload = {
+            "headline": "本轮快讯",
+            "overview": "测试",
+            "has_material_news": True,
+            "items": [
+                {
+                    "rank": 1,
+                    "channel": "wire",
+                    "message_id": 1,
+                    "title": "缺大宗影响",
+                    "summary": "模型漏了 impact_commodities。",
+                    "category": "宏观财经",
+                    "score": 8,
+                    "impact_overall": "总体偏多说明",
+                    "impact_us": "无直接影响",
+                    "impact_cn": "对上证情绪构成支撑",
+                },
+                {
+                    "rank": 2,
+                    "channel": "wire",
+                    "message_id": 2,
+                    "title": "缺美股影响",
+                    "summary": "模型漏了 impact_us。",
+                    "category": "科技/AI",
+                    "score": 7,
+                    "impact_overall": None,
+                    "impact_cn": "无直接影响",
+                    "impact_commodities": "传导尚不明确",
+                },
+            ],
+        }
+
+        brief = parse_digest_brief(json.dumps(payload, ensure_ascii=False))
+        first, second = brief.items
+        assert first.impact_commodities == "无直接影响"
+        assert first.impact_overall == "总体偏多说明"
+        assert first.impact_us == "无直接影响"
+        assert first.impact_cn == "对上证情绪构成支撑"
+        assert second.impact_us == "无直接影响"
+        assert second.impact_overall == "无直接影响"
+        assert second.impact_commodities == "传导尚不明确"
 
 
 # ==============================================================================

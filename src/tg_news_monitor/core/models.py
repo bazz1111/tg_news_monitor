@@ -2,7 +2,7 @@
 
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class TelegramPost(BaseModel):
@@ -94,10 +94,34 @@ class DigestItem(BaseModel):
         default="不确定",
         description="Commodities direction tag: 利多|利空|中性|不确定",
     )
-    impact_overall: str = Field(..., description="Overall market / industry impact analysis")
-    impact_us: str = Field(..., description="Impact on US stocks")
-    impact_cn: str = Field(..., description="Impact on China equities (上证/中国市场)")
-    impact_commodities: str = Field(..., description="Impact on commodities (黄金/原油等)")
+    impact_overall: str = Field(
+        default="无直接影响",
+        description="Overall market / industry impact analysis",
+    )
+    impact_us: str = Field(default="无直接影响", description="Impact on US stocks")
+    impact_cn: str = Field(
+        default="无直接影响",
+        description="Impact on China equities (上证/中国市场)",
+    )
+    impact_commodities: str = Field(
+        default="无直接影响",
+        description="Impact on commodities (黄金/原油等)",
+    )
+
+    @field_validator(
+        "impact_overall",
+        "impact_us",
+        "impact_cn",
+        "impact_commodities",
+        mode="before",
+    )
+    @classmethod
+    def _default_null_impact(cls, value: Any) -> Any:
+        # LLM JSON sometimes emits null for a skipped dimension.
+        if value is None:
+            return "无直接影响"
+        return value
+
     event_at: Optional[datetime] = None
     is_update: bool = False
     night_alert: bool = False
