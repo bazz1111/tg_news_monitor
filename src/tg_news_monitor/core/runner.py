@@ -146,12 +146,17 @@ class NewsMonitorRunner:
                 api_key=self.config.codebuddy_api_key,
                 model=self.config.codebuddy_model,
                 fallback_model=self.config.codebuddy_fallback_model,
-                timeout=180.0,
+                timeout=self.config.codebuddy_timeout,
+                effort=self.config.codebuddy_effort,
+                autocompact=self.config.codebuddy_autocompact,
                 cli_bin=getattr(self.config, "codebuddy_cli", "codebuddy"),
             )
             logger.info(
                 f"CodeBuddy Evaluator initialized: model={self.config.codebuddy_model}, "
-                f"fallback={self.config.codebuddy_fallback_model}"
+                f"fallback={self.config.codebuddy_fallback_model}, "
+                f"timeout={self.config.codebuddy_timeout}, "
+                f"effort={self.config.codebuddy_effort}, "
+                f"autocompact={self.config.codebuddy_autocompact}"
             )
 
         self._init_group_runtimes(webhook_sender)
@@ -1369,7 +1374,10 @@ class NewsMonitorRunner:
         )
         logger.info(
             f"CodeBuddy Model : {self.config.codebuddy_model} "
-            f"(fallback={self.config.codebuddy_fallback_model})"
+            f"(fallback={self.config.codebuddy_fallback_model}, "
+            f"timeout={self.config.codebuddy_timeout}, "
+            f"effort={self.config.codebuddy_effort}, "
+            f"autocompact={self.config.codebuddy_autocompact})"
         )
         logger.info(f"Database Path   : {self.config.db_path}")
         logger.info("=" * 60)

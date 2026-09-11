@@ -434,17 +434,31 @@ class TestNewsMonitorRunner:
         runner.stop()
         assert runner._stop_requested is True
 
+    def test_runner_uses_codebuddy_quality_defaults(self):
+        runner = NewsMonitorRunner(config=Settings(codebuddy_api_key="cb-unit-test"))
+        assert runner.evaluator.model == "deepseek-v4.1-flash"
+        assert runner.evaluator.fallback_model == "hy3"
+        assert runner.evaluator.timeout == 300.0
+        assert runner.evaluator.effort == "max"
+        assert runner.evaluator.autocompact == "auto"
+
     def test_runner_initializes_with_codebuddy_config(self):
         config = Settings(
             codebuddy_api_key="cb-unit-test",
             codebuddy_model="fast-model",
             codebuddy_fallback_model="hy3",
+            codebuddy_timeout=420.0,
+            codebuddy_effort="high",
+            codebuddy_autocompact="aggressive",
         )
         runner = NewsMonitorRunner(config=config)
         assert runner.evaluator.provider == "codebuddy"
         assert runner.evaluator.api_key == "cb-unit-test"
         assert runner.evaluator.model == "fast-model"
         assert runner.evaluator.fallback_model == "hy3"
+        assert runner.evaluator.timeout == 420.0
+        assert runner.evaluator.effort == "high"
+        assert runner.evaluator.autocompact == "aggressive"
 
     def test_buffering_skips_llm_when_below_min_candidates(self):
         """With default min_candidates=3, a single pending post stays unevaluated."""

@@ -539,7 +539,7 @@ class Settings(_BaseClass):
         description="CodeBuddy CLI credential (CODEBUDDY_API_KEY). Do not set CODEBUDDY_INTERNET_ENVIRONMENT.",
     )
     codebuddy_model: str = Field(
-        default="fast-model",
+        default="deepseek-v4.1-flash",
         description="Primary CodeBuddy model id (CLI --model)",
     )
     codebuddy_fallback_model: str = Field(
@@ -549,6 +549,19 @@ class Settings(_BaseClass):
     codebuddy_cli: str = Field(
         default="codebuddy",
         description="CodeBuddy CLI executable on PATH",
+    )
+    codebuddy_effort: str = Field(
+        default="max",
+        description="CodeBuddy CLI --effort (minimal|low|medium|high|xhigh|max)",
+    )
+    codebuddy_autocompact: str = Field(
+        default="auto",
+        description="CodeBuddy CLI --autocompact (follow model context window)",
+    )
+    codebuddy_timeout: float = Field(
+        default=300.0,
+        gt=0,
+        description="CodeBuddy CLI subprocess timeout in seconds",
     )
 
     # Urgency & hotness threshold gating

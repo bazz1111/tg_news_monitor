@@ -28,9 +28,13 @@ from tg_news_monitor.evaluator.prompt import (
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_MODEL = "fast-model"
+DEFAULT_MODEL = "deepseek-v4.1-flash"
 DEFAULT_FALLBACK_MODEL = "hy3"
 DEFAULT_CLI_BIN = "codebuddy"
+DEFAULT_EFFORT = "max"
+DEFAULT_AUTOCOMPACT = "auto"
+DEFAULT_TIMEOUT = 300.0
+DIGEST_TIMEOUT_FLOOR = 300.0
 
 
 class CodeBuddyError(Exception):
@@ -45,19 +49,23 @@ class CodeBuddyEvaluator:
         api_key: str = "",
         model: str = DEFAULT_MODEL,
         fallback_model: str = DEFAULT_FALLBACK_MODEL,
-        timeout: float = 60.0,
+        timeout: float = DEFAULT_TIMEOUT,
         fallback_on_exhaustion: bool = True,
         cli_bin: str = DEFAULT_CLI_BIN,
         extra_env: Optional[dict[str, str]] = None,
         run_cli: Optional[Callable[..., subprocess.CompletedProcess[str]]] = None,
+        effort: str = DEFAULT_EFFORT,
+        autocompact: str = DEFAULT_AUTOCOMPACT,
     ) -> None:
         self.provider = "codebuddy"
         self.api_key = api_key or ""
         self.model = (model or DEFAULT_MODEL).strip() or DEFAULT_MODEL
         self.fallback_model = (fallback_model or DEFAULT_FALLBACK_MODEL).strip() or DEFAULT_FALLBACK_MODEL
-        self.timeout = float(timeout or 60.0)
+        self.timeout = float(timeout or DEFAULT_TIMEOUT)
         self.fallback_on_exhaustion = fallback_on_exhaustion
         self.cli_bin = (cli_bin or DEFAULT_CLI_BIN).strip() or DEFAULT_CLI_BIN
+        self.effort = (effort or DEFAULT_EFFORT).strip() or DEFAULT_EFFORT
+        self.autocompact = (autocompact or DEFAULT_AUTOCOMPACT).strip() or DEFAULT_AUTOCOMPACT
         self.extra_env = dict(extra_env or {})
         self._run_cli = run_cli or subprocess.run
         self.fallback_handler = MultiStageFallbackHandler()
@@ -89,7 +97,9 @@ class CodeBuddyEvaluator:
             "--model",
             model,
             "--effort",
-            "minimal",
+            self.effort,
+            "--autocompact",
+            self.autocompact,
             prompt,
         ]
 
@@ -195,7 +205,7 @@ class CodeBuddyEvaluator:
 
         self.last_usage = None
         prompt = self._compose_digest_prompt(posts)
-        digest_timeout = max(180.0, float(self.timeout or 30.0))
+        digest_timeout = max(DIGEST_TIMEOUT_FLOOR, float(self.timeout))
         last_error: Optional[Exception] = None
         try:
             brief = self._complete_with_fallback(prompt, parse_digest_brief, timeout=digest_timeout)
@@ -229,6 +239,8 @@ def create_evaluator(
     api_base: Optional[str] = None,
     model: Optional[str] = None,
     fallback_model: Optional[str] = None,
+    effort: Optional[str] = None,
+    autocompact: Optional[str] = None,
     **kwargs: Any,
 ) -> CodeBuddyEvaluator:
     """Factory: always returns the CodeBuddy CLI evaluator (DeepSeek HTTP is removed)."""
@@ -242,5 +254,7 @@ def create_evaluator(
         api_key=api_key,
         model=model or DEFAULT_MODEL,
         fallback_model=fallback_model or DEFAULT_FALLBACK_MODEL,
+        effort=effort or DEFAULT_EFFORT,
+        autocompact=autocompact or DEFAULT_AUTOCOMPACT,
         **kwargs,
     )

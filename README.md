@@ -89,14 +89,17 @@ Windows PowerShell 使用 `.venv/Scripts/Activate.ps1` 激活环境，使用 `Co
 ```dotenv
 TELEGRAM_CHANNELS=zaobaosg,cnalatest,solidot
 CODEBUDDY_API_KEY=your-api-key
-CODEBUDDY_MODEL=fast-model
+CODEBUDDY_MODEL=deepseek-v4.1-flash
 CODEBUDDY_FALLBACK_MODEL=hy3
+CODEBUDDY_EFFORT=max
+CODEBUDDY_AUTOCOMPACT=auto
+CODEBUDDY_TIMEOUT=300
 FEISHU_WEBHOOK_URL=https://open.feishu.cn/open-apis/bot/v2/hook/your-bot-id
 FEISHU_WEBHOOK_SECRET=
 DB_PATH=data/tg_news.db
 ```
 
-`CODEBUDDY_API_KEY` 是 CodeBuddy CLI 凭据。主模型默认 `fast-model`，失败后重试 `hy3`（套餐标注 credits x0.00），两次都失败再走本地启发式。不要设置 `CODEBUDDY_INTERNET_ENVIRONMENT`（会切到国际站）。不要提交真实凭据。将 [均衡配置片段](monitor-tuning.env.example) 合并进现有 `.env`，保留频道、凭据和数据库路径。
+`CODEBUDDY_API_KEY` 是 CodeBuddy CLI 凭据。主模型默认 `deepseek-v4.1-flash`（免费档），失败后重试 `hy3`（套餐标注 credits x0.00），两次都失败再走本地启发式。CLI 质量旋钮默认 `--effort max`、`--autocompact auto`（跟随模型上下文窗口），子进程超时默认 `CODEBUDDY_TIMEOUT=300` 秒；digest 评估使用 `max(300, timeout)`。不要设置 `CODEBUDDY_INTERNET_ENVIRONMENT`（会切到国际站）。不要提交真实凭据。将 [均衡配置片段](monitor-tuning.env.example) 合并进现有 `.env`，保留频道、凭据和数据库路径。
 
 ```bash
 python -m tg_news_monitor.main --init-db
@@ -173,8 +176,11 @@ FEISHU_WEBHOOK_SECRET_NEWS24=
 # FEISHU_WEBHOOK_OLD_PHOTOS=
 # FEISHU_WEBHOOK_XHS=
 CODEBUDDY_API_KEY=...
-CODEBUDDY_MODEL=fast-model
+CODEBUDDY_MODEL=deepseek-v4.1-flash
 CODEBUDDY_FALLBACK_MODEL=hy3
+CODEBUDDY_EFFORT=max
+CODEBUDDY_AUTOCOMPACT=auto
+CODEBUDDY_TIMEOUT=300
 # 卡内嵌图（old_photos / wechat_photo）。自定义机器人 webhook 不能按 URL 嵌图，
 # 需开放平台应用上传拿 image_key。不增加 LLM token。
 # FEISHU_APP_ID=cli_xxx
@@ -232,6 +238,11 @@ Docker 若使用 `config.yaml`，把它挂进容器并设置 `CONFIG_PATH`，例
 | `MORNING_FLUSH_HOTNESS_THRESHOLD` | 7 | 7 | 夜间摘要评分下限 |
 | `DB_PATH` | `data/tg_news.db` | 持久化路径 | SQLite文件 |
 | `LOG_LEVEL` | `INFO` | `INFO` | 日志等级 |
+| `CODEBUDDY_MODEL` | `deepseek-v4.1-flash` | `deepseek-v4.1-flash` | 主模型，CLI `--model` |
+| `CODEBUDDY_FALLBACK_MODEL` | `hy3` | `hy3` | 主模型失败后的回退模型 |
+| `CODEBUDDY_EFFORT` | `max` | `max` | CLI `--effort`（minimal\|low\|medium\|high\|xhigh\|max） |
+| `CODEBUDDY_AUTOCOMPACT` | `auto` | `auto` | CLI `--autocompact`，跟随模型上下文窗口 |
+| `CODEBUDDY_TIMEOUT` | 300 | 300 | CLI 子进程超时秒数；digest 使用 `max(300, timeout)` |
 
 兼容保留的 `QUIET_DIGEST_MIN_CANDIDATES`、`MORNING_FLUSH_MAX_AGE_SECONDS`、`MORNING_FLUSH_CARD_INTERVAL_SECONDS` 不再控制新夜间流程；以时间窗口和单张摘要为准。已有部署需同步更新旧窗口环境变量，再重启进程。
 
