@@ -9,13 +9,13 @@
 - **采集与模型解耦**：守护进程继续采集，一个后台线程负责评估与推送，最多运行一个评估任务。
 - **调用成本限制**：持久化最小调用间隔和每日次数；默认每批20条、每条800字符。CodeBuddy CLI 文本输出不提供 `usage.total_tokens`，失败后保留候选，冷却后再试。
 - **分层去重**：频道/消息ID、规范化正文指纹、24小时投递记录，以及最近20条投递摘要供模型比较新增事实。新闻卡片在飞书发送前再做一次**确定性近重复校验**（同组 24h 内 `title+summary` 与已投递摘要的实体/数字重合；`$6.06` 与 `$6` 视为同一量级）。同事件且未带实质更新（`is_update` + `update_reason` 中的新数字或新实体）则跳过发送、标 `near_duplicate`、不记为已投递。不额外调用模型。`wechat_photo` 不走此守卫。
-- **旧闻拦截**：模型调用前和逐条推送前检查时间；默认频道发布时间和模型提取的事件时间均不得超过30分钟。缺失、无时区或明显未来时间不能作为新快讯。
+- **旧闻拦截**：新闻路径在模型调用前和逐条推送前检查时间；默认频道发布时间和模型提取的事件时间均不得超过30分钟。缺失、无时区或明显未来时间不能作为新快讯。`wechat_photo` / `old_photos` 不走此闸门（内容匹配，不是时效）；`news_max_age_seconds: 0` 表示不限龄。
 - **飞书卡片可读性**：单卡只展示「发布时间（北京时间）」；不展示页脚「事件时间」、不附带 `t.me` / 原文外链。摘要超过80字或超过2行时，在核心速览后追加「📌 事件详情」（优先模型要点，约3条）。晨报条目时间标为「北京时间：HH:MM」。
 - **投资方向标签**：`bias_*` 仅允许利多/利空/中性/不确定，须与对应 `impact_*` 说明方向一致；有明确支撑/承压时不得默认中性或不确定。
 - **不明投递避免重发**：主流程默认只尝试一次Webhook，提前记录投递认领；结果不明记为 `unknown`，不自动重试。
 - **加密内容过滤**：模型调用前后过滤加密货币及区块链内容；规则仍可能误伤或漏网。
 - **北京时间弹性静默**：按 `Asia/Shanghai` 窗口调整评估门槛与飞书推送；采集仍全天运行。跨午夜窗口（如 `23:00-01:00`）按半开区间 `[start, end)` 解析。
-- **微信公众号图片素材（`old_photos`）**：与 `news24` 对等隔离。只收照片/相册，本地安全阀拒绝黄赌毒暴与时政敏感，`wechat_photo` 提示词宁缺毋滥；飞书卡只有标题、≤100 字说明和卡内嵌图（飞书应用上传 `image_key`；失败则回退为图片链接），无投资影响、无 Telegram/`t.me` 痕迹。默认低频（约 1 小时冷却、每日 8 次软顶）。图片不送入模型，CodeBuddy token 不变。
+- **微信公众号图片素材（`old_photos`）**：与 `news24` 对等隔离。只收照片/相册，按**内容匹配**而不是时效；不拦截频道发布时间或 `event_at`。可按 `scrape_history_pages` 用 `?before=` 向更早预览页回填（有页预算，整页已入库则停）。本地安全阀拒绝黄赌毒暴与时政敏感，`wechat_photo` 提示词宁缺毋滥；飞书卡只有标题、≤100 字说明和卡内嵌图（飞书应用上传 `image_key`；失败则回退为图片链接），无投资影响、无 Telegram/`t.me` 痕迹。默认低频（约 1 小时冷却、每日 8 次软顶）。图片不送入模型，CodeBuddy token 不变。
 
 语义去重和时间提取依赖模型，不能保证百分之百准确。严格时效可能漏掉时间不明的消息；进程崩溃或投递不明也可能漏推。当前没有完整持久化发件箱、PDF/OCR或独立研报摘要通道。夜间识别仍可能漏报或误报。
 
@@ -67,7 +67,7 @@ flowchart LR
 
 重要程度仍控制是否入选和夜间是否允许打断，不决定选中消息的发送先后。新闻时效检查、去重、夜间静默与调用预算继续生效。跨批次不保证全局时间顺序：若较早发布的消息后来才采集到，它仍可能晚于已发送消息出现。此行为默认启用，无需新增配置；更新代码并重启进程或重建容器即可生效。
 
-频道仍依次抓取，网络异常会拖长采集轮次；公开页面窗口外的消息不保证补采。建议单实例运行并持久化数据库。
+频道仍依次抓取，网络异常会拖长采集轮次。新闻组默认只看最新预览页；`old_photos` 可按页预算用 `?before=` 回填更早内容，仍受页数和软顶限制。建议单实例运行并持久化数据库。
 
 ## 快速开始
 
@@ -147,7 +147,9 @@ groups:
     quiet_hours: ""
     shoulder_hours: ""
     morning_flush_enabled: false
-    news_max_age_seconds: 86400
+    news_max_age_seconds: 0         # 0 = 不限龄；wechat_photo 也会跳过发布时间闸门
+    scrape_history_pages: 10        # 用 ?before= 向更早页翻；默认新闻组仍是 1 页
+    scrape_history_max_new_posts: 40
     digest_min_candidates: 2
     digest_max_wait_seconds: 7200
     digest_min_interval_seconds: 3600
@@ -193,18 +195,18 @@ CODEBUDDY_TIMEOUT=300
 
 | 步骤 | 行为 |
 |---|---|
-| 进料 | 仅 `has_media` 且 `media_type` 为 `photo`/`album`、且 `media_urls` 非空。纯文字、纯视频丢掉。短说明不因字数不够被当成垃圾。 |
+| 进料 | 仅 `has_media` 且 `media_type` 为 `photo`/`album`、且 `media_urls` 非空。纯文字、纯视频丢掉。短说明不因字数不够被当成垃圾。默认按 `scrape_history_pages`（示例 10）在最新预览页之后用 `?before=<本页最旧 message_id>` 向更早页翻；一页没有新未处理帖或空页则停，可用 `scrape_history_max_new_posts` 做每频道每轮软顶。新闻组默认仍只抓最新一页。 |
 | 本地硬过滤 | 黄赌毒、血腥暴力、领导人/党宣、当代地缘鼓动、以及新闻/能源/冲突类（如「原油」「美伊」「冲突」、分类「能源」）直接拒绝，宁错杀。过不了的不进模型；发送前再拦一次，且必须有可点击图片 URL。 |
 | 模型 | `prompt_variant: wechat_photo`，比 `story` 更严：只要适合大陆公众号的历史/文化静帧；无把握不选。 |
 | 说明 | 模型写中文完整句，≤100 字，不以省略号收尾，无时政评论；发送前再截断一次。 |
 | 飞书卡 | 标题 + 说明 + **卡内嵌图**（发送前把 `media_urls` 的 http(s) 图下载并 `POST /im/v1/images` 上传，卡片用 `img` / `img_key`，最多 9 张）。部分失败则嵌入成功的；全部失败或未配置 `FEISHU_APP_ID`/`FEISHU_APP_SECRET` 时回退为可点击图片链接。**无**投资影响、**无**频道名/`t.me`/原文。图片只在发卡时上传，**不**送进 CodeBuddy。 |
-| 节奏 | 非实时。默认 `digest_min_interval_seconds=3600`、`digest_max_calls_per_day=8`、`digest_min_candidates=2`、`digest_max_wait_seconds=7200`。`news_max_age_seconds` 须明显长于冷却（默认 86400），否则帖子会在等待中过期。关闭 `quiet_hours` / 晨报。频率可以后再调组级旋钮。 |
+| 节奏 | 非实时、看内容匹配。默认 `digest_min_interval_seconds=3600`、`digest_max_calls_per_day=8`、`digest_min_candidates=2`、`digest_max_wait_seconds=7200`。`wechat_photo` **不**用频道 `published_at` 或 `event_at` 做时效拦截（`news24` 仍拦截）。`news_max_age_seconds: 0` 表示不限龄，可与显式 wechat 跳过同时用。关闭 `quiet_hours` / 晨报。频率可以后再调组级旋钮。 |
 
-历史事件本身很旧，因此该组**不**用 `event_at` 做 30 分钟时效拦截（`news24` 仍拦截）。图片像素不做识别，只能靠说明文字与模型。启用嵌图：在 `.env` 设置 `FEISHU_APP_ID` / `FEISHU_APP_SECRET`（`wechat_photo` 的 `embed_images` 默认为 true）。关掉嵌图可在该组 `card_profile.embed_images: false`，卡片会继续用 markdown 链接。
+历史影像本身可以很旧，因此该组按内容适合度筛选，不用发布时间卡候选或发卡（`news24` 的 30 分钟时效不变）。图片像素不做识别，只能靠说明文字与模型。启用嵌图：在 `.env` 设置 `FEISHU_APP_ID` / `FEISHU_APP_SECRET`（`wechat_photo` 的 `embed_images` 默认为 true）。关掉嵌图可在该组 `card_profile.embed_images: false`，卡片会继续用 markdown 链接。
 
 **从 `TELEGRAM_CHANNELS` 迁移：** 若配置里**没有** `groups` 字段，但存在旧的 `TELEGRAM_CHANNELS` + `FEISHU_WEBHOOK_URL`，启动时会合成一个对等 Group（默认 `id: legacy`，可用 `legacy_group_id` 改名）。这不是运行时特权默认组，只是兼容现有部署。一旦 YAML/配置里出现 `groups`，就不再把旧的单一频道列表当主数据源。升级后已有 SQLite 行会标上该 legacy id；若希望旧 pending/认领接到 `news24`，把该组 `id` 设为 `legacy`，或设 `legacy_group_id: news24` 后再迁库。
 
-可选 per-group 覆盖（现在就生效，不是后期）：`quiet_hours` / `shoulder_hours`（写成 `""` 表示本组关闭这些窗口，不继承全局；省略字段才继承）、各档 `hotness_threshold`、digest 门槛/间隔/卡片间隔、`quiet_card_cap`、晨报开关与门槛、`digest_max_calls_per_day`（软）、`news_max_age_seconds`、`card_profile`（`prompt_variant`：`news` / `story` / `wechat_photo`；`embed_images`：wechat_photo 默认 true）、`enabled`。空频道或 `enabled: false` 的组会被跳过。
+可选 per-group 覆盖（现在就生效，不是后期）：`quiet_hours` / `shoulder_hours`（写成 `""` 表示本组关闭这些窗口，不继承全局；省略字段才继承）、各档 `hotness_threshold`、digest 门槛/间隔/卡片间隔、`quiet_card_cap`、晨报开关与门槛、`digest_max_calls_per_day`（软）、`news_max_age_seconds`（`0` = 不限龄）、`scrape_history_pages` / `scrape_history_max_new_posts`、`card_profile`（`prompt_variant`：`news` / `story` / `wechat_photo`；`embed_images`：wechat_photo 默认 true）、`enabled`。空频道或 `enabled: false` 的组会被跳过。
 
 存储与去重按 `group_id` 隔离：帖子唯一键为 `(group_id, channel, message_id)`，投递指纹与晨报/静默认领也按组分开。同一正文可以分别推到两个组的 webhook。日志带 `group=<id>`。
 

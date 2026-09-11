@@ -43,6 +43,9 @@ class TestConfigDefaultsAndParsing:
         assert settings.codebuddy_autocompact == "auto"
         assert settings.codebuddy_timeout == 300.0
         assert settings.hotness_threshold == 7
+        assert settings.news_max_age_seconds == 1800
+        assert settings.scrape_history_pages == 1
+        assert settings.scrape_history_max_new_posts is None
         assert settings.timezone == "Asia/Shanghai"
         assert settings.quiet_hours == "00:00-08:00"
         assert settings.shoulder_hours == "22:00-00:00"
@@ -112,6 +115,40 @@ class TestConfigValidationBounds:
 
         with pytest.raises(ValidationError):
             Settings(hotness_threshold=11)
+
+    def test_news_max_age_zero_and_scrape_history_knobs(self):
+        s = Settings(
+            news_max_age_seconds=0,
+            scrape_history_pages=1,
+            groups=[
+                {
+                    "id": "old_photos",
+                    "channels": ["oldpix"],
+                    "webhook_url": "https://example.com/photos",
+                    "news_max_age_seconds": 0,
+                    "scrape_history_pages": 10,
+                    "scrape_history_max_new_posts": 40,
+                },
+                {
+                    "id": "news24",
+                    "channels": ["wire"],
+                    "webhook_url": "https://example.com/news24",
+                },
+            ],
+        )
+        photos = s.group_settings("old_photos")
+        news = s.group_settings("news24")
+        assert photos.news_max_age_seconds == 0
+        assert photos.scrape_history_pages == 10
+        assert photos.scrape_history_max_new_posts == 40
+        assert news.news_max_age_seconds == 0
+        assert news.scrape_history_pages == 1
+        assert news.scrape_history_max_new_posts is None
+        assert Settings(news_max_age_seconds=0).news_max_age_seconds == 0
+        with pytest.raises(ValidationError):
+            Settings(news_max_age_seconds=-1)
+        with pytest.raises(ValidationError):
+            Settings(scrape_history_pages=0)
 
 
 class TestEnvironmentAndSecretSync:

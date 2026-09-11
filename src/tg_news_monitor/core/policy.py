@@ -21,10 +21,22 @@ def fingerprint(text):
 
 
 def is_fresh(value, max_age, now=None):
+    """True if an aware timestamp is not far in the future and not older than max_age.
+
+    max_age <= 0 means unlimited age. Naive/None timestamps still fail.
+    """
     if value is None or value.tzinfo is None:
         return False
     age = ((now or datetime.now(timezone.utc)) - value).total_seconds()
-    return -120 <= age <= max_age
+    if max_age is None:
+        return False
+    try:
+        limit = int(max_age)
+    except (TypeError, ValueError):
+        return False
+    if limit <= 0:
+        return age >= -120
+    return -120 <= age <= limit
 
 
 def urgent(text):

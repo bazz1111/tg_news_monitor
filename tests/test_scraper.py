@@ -265,6 +265,17 @@ class TestTelegramScraperClient:
         assert client.format_channel_url("@durov") == "https://t.me/s/durov"
         assert client.format_channel_url("durov", before=500) == "https://t.me/s/durov?before=500"
 
+    def test_fetch_passes_before_query(self):
+        def handler(request: httpx.Request) -> httpx.Response:
+            assert str(request.url) == "https://t.me/s/test_channel?before=500"
+            return httpx.Response(200, text=SAMPLE_REGULAR_HTML)
+
+        transport = httpx.MockTransport(handler)
+        mock_http = httpx.Client(transport=transport)
+        scraper = TelegramScraperClient(http_client=mock_http)
+        html = scraper.fetch_channel_html("test_channel", before=500)
+        assert html == SAMPLE_REGULAR_HTML
+
     def test_fetch_success_200(self):
         def handler(request: httpx.Request) -> httpx.Response:
             assert request.url == "https://t.me/s/test_channel"

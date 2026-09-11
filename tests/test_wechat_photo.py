@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
+import httpx
 import pytest
 from pydantic import ValidationError
 
@@ -20,6 +21,7 @@ from tg_news_monitor.core.wechat_photo import (
     wechat_photo_prefilter,
     wechat_photo_unsafe,
 )
+from tg_news_monitor.scraper.client import TelegramScraperClient
 from tg_news_monitor.evaluator.prompt import (
     DIGEST_SYSTEM_PROMPT,
     WECHAT_PHOTO_DIGEST_SYSTEM_PROMPT,
@@ -28,7 +30,7 @@ from tg_news_monitor.evaluator.prompt import (
 )
 from tg_news_monitor.notifier.feishu_card import FeishuCardBuilder
 from tg_news_monitor.storage.repository import PostRepository
-from tests.test_runner import MockEvaluator, MockScraper, MockWebhookSender
+from tests.test_runner import MockEvaluator, MockScraper, MockWebhookSender, make_sample_html
 
 
 def _now() -> datetime:
@@ -754,6 +756,355 @@ class TestWechatRunnerIsolation:
         assert sender.sent_payloads == []
         reason = repo.get_post("oldpix", 43, group_id="old_photos")["filter_reason"]
         assert reason in {"wechat_unsafe", "wechat_news_like"}
+
+    def test_old_published_at_blocks_news_not_photos(self, tmp_path):
+        db = str(tmp_path / "pub_age.db")
+        repo = PostRepository(db)
+        now = _now()
+        stale = now - timedelta(days=30)
+        repo.save_posts(
+            [
+                TelegramPost(
+                    channel="wire",
+                    message_id=11,
+                    text="Central bank announces emergency rate cut for the economy.",
+                    direct_url="https://t.me/wire/11",
+                    published_at=stale,
+                )
+            ],
+            group_id="news24",
+        )
+        repo.save_posts(
+            [_post(21, "民国时期的码头工人在卸货。", published_at=stale)],
+            group_id="old_photos",
+        )
+        evaluator = MockEvaluator(digest_builder=self._builder())
+        sender = MockWebhookSender()
+        runner = NewsMonitorRunner(self._settings(db), repo, MockScraper(), evaluator, sender)
+        summary = runner.process_pending(now=now)
+        assert summary["alerts_sent"] == 1
+        assert "公众号图片素材" in str(sender.sent_payloads)
+        assert "投资情报快报" not in str(sender.sent_payloads)
+        news_row = repo.get_post("wire", 11, group_id="news24")
+        assert news_row["filter_reason"] == "expired_or_invalid_time"
+        photo_row = repo.get_post("oldpix", 21, group_id="old_photos")
+        assert photo_row["alert_sent"] == 1
+        assert photo_row.get("filter_reason") in {None, ""}
+
+
+class TestHistoryPagination:
+    def _settings(self, db: str, **photo_over: object) -> Settings:
+        photo = {
+            "id": "old_photos",
+            "channels": ["oldpix"],
+            "webhook_url": "https://example.com/photos",
+            "scrape_history_pages": 10,
+            "card_profile": {
+                "prompt_variant": "wechat_photo",
+                "include_investment_impact": False,
+            },
+        }
+        photo.update(photo_over)
+        return Settings(
+            db_path=db,
+            inter_channel_delay_seconds=0,
+            groups=[
+                {
+                    "id": "news24",
+                    "channels": ["wire"],
+                    "webhook_url": "https://example.com/news24",
+                    "card_profile": {"prompt_variant": "news"},
+                },
+                photo,
+            ],
+        )
+
+    def test_pages_with_before_and_stops_on_budget(self, tmp_path):
+        db = str(tmp_path / "hist_budget.db")
+        channel = "oldpix"
+        page1 = make_sample_html(
+            channel,
+            [
+                {"message_id": 30, "text": "thirty"},
+                {"message_id": 29, "text": "twenty-nine"},
+                {"message_id": 28, "text": "twenty-eight"},
+            ],
+        )
+        page2 = make_sample_html(
+            channel,
+            [
+                {"message_id": 27, "text": "twenty-seven"},
+                {"message_id": 26, "text": "twenty-six"},
+                {"message_id": 25, "text": "twenty-five"},
+            ],
+        )
+        page3 = make_sample_html(
+            channel,
+            [{"message_id": 24, "text": "twenty-four"}],
+        )
+        scraper = MockScraper(
+            page_map={
+                (channel, None): page1,
+                (channel, 28): page2,
+                (channel, 25): page3,
+            }
+        )
+        runner = NewsMonitorRunner(
+            self._settings(db, scrape_history_pages=2),
+            PostRepository(db),
+            scraper,
+            MockEvaluator(),
+            MockWebhookSender(),
+        )
+        posts, result = runner._ingest_channel(channel, group_id="old_photos")
+        assert result["success"] is True
+        assert result["posts_discovered"] == 6
+        assert scraper.fetch_args == [(channel, None), (channel, 28)]
+        assert {p.message_id for p in posts} == {30, 29, 28, 27, 26, 25}
+
+    def test_stops_when_history_page_already_ingested(self, tmp_path):
+        db = str(tmp_path / "hist_caught.db")
+        channel = "oldpix"
+        repo = PostRepository(db)
+        now = _now()
+        repo.save_posts(
+            [
+                TelegramPost(
+                    channel=channel,
+                    message_id=mid,
+                    text=f"old {mid}",
+                    direct_url=f"https://t.me/{channel}/{mid}",
+                    published_at=now,
+                )
+                for mid in (80, 85, 89)
+            ],
+            group_id="old_photos",
+        )
+        page1 = make_sample_html(
+            channel,
+            [
+                {"message_id": 100, "text": "hundred"},
+                {"message_id": 95, "text": "ninety-five"},
+                {"message_id": 90, "text": "ninety"},
+            ],
+        )
+        page2 = make_sample_html(
+            channel,
+            [
+                {"message_id": 89, "text": "eighty-nine"},
+                {"message_id": 85, "text": "eighty-five"},
+                {"message_id": 80, "text": "eighty"},
+            ],
+        )
+        page3 = make_sample_html(channel, [{"message_id": 70, "text": "seventy"}])
+        scraper = MockScraper(
+            page_map={
+                (channel, None): page1,
+                (channel, 90): page2,
+                (channel, 80): page3,
+            }
+        )
+        runner = NewsMonitorRunner(
+            self._settings(db, scrape_history_pages=8),
+            repo,
+            scraper,
+            MockEvaluator(),
+            MockWebhookSender(),
+        )
+        posts, result = runner._ingest_channel(channel, group_id="old_photos")
+        assert result["posts_discovered"] == 3
+        assert {p.message_id for p in posts} == {100, 95, 90}
+        assert scraper.fetch_args == [(channel, None), (channel, 90)]
+
+    def test_latest_ingested_still_walks_older_new_history(self, tmp_path):
+        db = str(tmp_path / "hist_backfill.db")
+        channel = "oldpix"
+        repo = PostRepository(db)
+        now = _now()
+        repo.save_posts(
+            [
+                TelegramPost(
+                    channel=channel,
+                    message_id=mid,
+                    text=f"latest {mid}",
+                    direct_url=f"https://t.me/{channel}/{mid}",
+                    published_at=now,
+                )
+                for mid in (100, 95, 90)
+            ],
+            group_id="old_photos",
+        )
+        page1 = make_sample_html(
+            channel,
+            [
+                {"message_id": 100, "text": "hundred"},
+                {"message_id": 95, "text": "ninety-five"},
+                {"message_id": 90, "text": "ninety"},
+            ],
+        )
+        page2 = make_sample_html(
+            channel,
+            [
+                {"message_id": 80, "text": "eighty"},
+                {"message_id": 70, "text": "seventy"},
+            ],
+        )
+        scraper = MockScraper(
+            page_map={
+                (channel, None): page1,
+                (channel, 90): page2,
+            }
+        )
+        runner = NewsMonitorRunner(
+            self._settings(db, scrape_history_pages=10),
+            repo,
+            scraper,
+            MockEvaluator(),
+            MockWebhookSender(),
+        )
+        posts, result = runner._ingest_channel(channel, group_id="old_photos")
+        assert result["posts_discovered"] == 2
+        assert {p.message_id for p in posts} == {80, 70}
+        assert scraper.fetch_args == [(channel, None), (channel, 90)]
+
+    def test_empty_history_page_stops(self, tmp_path):
+        db = str(tmp_path / "hist_empty.db")
+        channel = "oldpix"
+        page1 = make_sample_html(channel, [{"message_id": 12, "text": "twelve"}])
+        scraper = MockScraper(
+            page_map={
+                (channel, None): page1,
+                (channel, 12): "<html><body></body></html>",
+            }
+        )
+        runner = NewsMonitorRunner(
+            self._settings(db, scrape_history_pages=6),
+            PostRepository(db),
+            scraper,
+            MockEvaluator(),
+            MockWebhookSender(),
+        )
+        posts, result = runner._ingest_channel(channel, group_id="old_photos")
+        assert result["posts_discovered"] == 1
+        assert posts[0].message_id == 12
+        assert scraper.fetch_args == [(channel, None), (channel, 12)]
+
+    def test_soft_cap_stops_before_next_page(self, tmp_path):
+        db = str(tmp_path / "hist_cap.db")
+        channel = "oldpix"
+        page1 = make_sample_html(
+            channel,
+            [
+                {"message_id": 5, "text": "five"},
+                {"message_id": 4, "text": "four"},
+                {"message_id": 3, "text": "three"},
+            ],
+        )
+        page2 = make_sample_html(channel, [{"message_id": 2, "text": "two"}])
+        scraper = MockScraper(
+            page_map={
+                (channel, None): page1,
+                (channel, 3): page2,
+            }
+        )
+        runner = NewsMonitorRunner(
+            self._settings(db, scrape_history_pages=5, scrape_history_max_new_posts=2),
+            PostRepository(db),
+            scraper,
+            MockEvaluator(),
+            MockWebhookSender(),
+        )
+        posts, result = runner._ingest_channel(channel, group_id="old_photos")
+        assert result["posts_discovered"] == 2
+        assert {p.message_id for p in posts} == {5, 4}
+        assert scraper.fetch_args == [(channel, None)]
+
+    def test_news_default_is_single_page(self, tmp_path):
+        db = str(tmp_path / "hist_news.db")
+        channel = "wire"
+        page1 = make_sample_html(channel, [{"message_id": 9, "text": "nine"}])
+        page2 = make_sample_html(channel, [{"message_id": 8, "text": "eight"}])
+        scraper = MockScraper(
+            page_map={
+                (channel, None): page1,
+                (channel, 9): page2,
+            }
+        )
+        runner = NewsMonitorRunner(
+            self._settings(db),
+            PostRepository(db),
+            scraper,
+            MockEvaluator(),
+            MockWebhookSender(),
+        )
+        posts, result = runner._ingest_channel(channel, group_id="news24")
+        assert result["posts_discovered"] == 1
+        assert posts[0].message_id == 9
+        assert scraper.fetch_args == [(channel, None)]
+
+    def test_http_before_query_and_caught_up(self, tmp_path):
+        urls: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            urls.append(str(request.url))
+            if "before=90" in str(request.url):
+                return httpx.Response(
+                    200,
+                    text=make_sample_html(
+                        "oldpix",
+                        [
+                            {"message_id": 80, "text": "eighty"},
+                            {"message_id": 85, "text": "eighty-five"},
+                            {"message_id": 89, "text": "eighty-nine"},
+                        ],
+                    ),
+                )
+            if "before=" in str(request.url):
+                return httpx.Response(200, text="<html><body></body></html>")
+            return httpx.Response(
+                200,
+                text=make_sample_html(
+                    "oldpix",
+                    [
+                        {"message_id": 90, "text": "ninety"},
+                        {"message_id": 95, "text": "ninety-five"},
+                        {"message_id": 100, "text": "hundred"},
+                    ],
+                ),
+            )
+
+        db = str(tmp_path / "hist_http.db")
+        repo = PostRepository(db)
+        now = _now()
+        repo.save_posts(
+            [
+                TelegramPost(
+                    channel="oldpix",
+                    message_id=mid,
+                    text=f"old {mid}",
+                    direct_url=f"https://t.me/oldpix/{mid}",
+                    published_at=now,
+                )
+                for mid in (80, 85, 89)
+            ],
+            group_id="old_photos",
+        )
+        client = TelegramScraperClient(
+            http_client=httpx.Client(transport=httpx.MockTransport(handler))
+        )
+        runner = NewsMonitorRunner(
+            self._settings(db, scrape_history_pages=8),
+            repo,
+            client,
+            MockEvaluator(),
+            MockWebhookSender(),
+        )
+        posts, result = runner._ingest_channel("oldpix", group_id="old_photos")
+        assert result["success"] is True
+        assert {p.message_id for p in posts} == {100, 95, 90}
+        assert urls[0] == "https://t.me/s/oldpix"
+        assert urls[1] == "https://t.me/s/oldpix?before=90"
+        assert len(urls) == 2
 
 
 def test_photo_link_urls_dedupes_and_drops_tme():

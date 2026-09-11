@@ -47,8 +47,11 @@ groups:
     quiet_hours: ""
     shoulder_hours: ""
     morning_flush_enabled: false
-    # 频道帖可在池中等待评估（默认 30 分钟会在 1 小时冷却里过期）
-    news_max_age_seconds: 86400
+    # 历史影像看内容匹配，不看出频道时间。0 = 不限龄；wechat_photo 也会跳过发布时间闸门。
+    news_max_age_seconds: 0
+    # 最新预览页之后用 ?before=最旧消息ID 向更早页翻；整页已入库或空页则停。
+    scrape_history_pages: 10
+    scrape_history_max_new_posts: 40
     hotness_threshold: 7
     digest_min_candidates: 2
     digest_max_wait_seconds: 7200          # 不足 2 条时最多等 2 小时再评估
