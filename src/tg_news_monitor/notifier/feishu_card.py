@@ -632,12 +632,14 @@ class FeishuCardBuilder:
         if keys:
             elements.append({"tag": "hr"})
             for key in keys:
+                # Schema 2.0 img: tag/img_key/alt + scale_type.
+                # Do not set legacy `mode` — webhook accepts HTTP 200 then
+                # rejects the card with 11246 "img mode is not supported".
                 elements.append(
                     {
                         "tag": "img",
                         "img_key": key,
                         "alt": {"tag": "plain_text", "content": "图片"},
-                        "mode": "fit_horizontal",
                         "scale_type": "fit_horizontal",
                         "preview": True,
                     }

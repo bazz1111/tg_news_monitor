@@ -204,7 +204,7 @@ CODEBUDDY_TIMEOUT=300
 
 **从 `TELEGRAM_CHANNELS` 迁移：** 若配置里**没有** `groups` 字段，但存在旧的 `TELEGRAM_CHANNELS` + `FEISHU_WEBHOOK_URL`，启动时会合成一个对等 Group（默认 `id: legacy`，可用 `legacy_group_id` 改名）。这不是运行时特权默认组，只是兼容现有部署。一旦 YAML/配置里出现 `groups`，就不再把旧的单一频道列表当主数据源。升级后已有 SQLite 行会标上该 legacy id；若希望旧 pending/认领接到 `news24`，把该组 `id` 设为 `legacy`，或设 `legacy_group_id: news24` 后再迁库。
 
-可选 per-group 覆盖（现在就生效，不是后期）：`quiet_hours` / `shoulder_hours`、各档 `hotness_threshold`、digest 门槛/间隔/卡片间隔、`quiet_card_cap`、晨报开关与门槛、`digest_max_calls_per_day`（软）、`news_max_age_seconds`、`card_profile`（`prompt_variant`：`news` / `story` / `wechat_photo`；`embed_images`：wechat_photo 默认 true）、`enabled`。空频道或 `enabled: false` 的组会被跳过。
+可选 per-group 覆盖（现在就生效，不是后期）：`quiet_hours` / `shoulder_hours`（写成 `""` 表示本组关闭这些窗口，不继承全局；省略字段才继承）、各档 `hotness_threshold`、digest 门槛/间隔/卡片间隔、`quiet_card_cap`、晨报开关与门槛、`digest_max_calls_per_day`（软）、`news_max_age_seconds`、`card_profile`（`prompt_variant`：`news` / `story` / `wechat_photo`；`embed_images`：wechat_photo 默认 true）、`enabled`。空频道或 `enabled: false` 的组会被跳过。
 
 存储与去重按 `group_id` 隔离：帖子唯一键为 `(group_id, channel, message_id)`，投递指纹与晨报/静默认领也按组分开。同一正文可以分别推到两个组的 webhook。日志带 `group=<id>`。
 

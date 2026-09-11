@@ -244,16 +244,31 @@ class TestWechatCard:
         blob = str(card)
         keys = _img_keys(card)
         assert keys == ["img_v2_aaa", "img_v2_bbb"]
-        assert any(el.get("tag") == "img" for el in card["card"]["body"]["elements"])
-        assert any(
-            el.get("mode") == "fit_horizontal"
-            for el in card["card"]["body"]["elements"]
-            if el.get("tag") == "img"
-        )
+        imgs = [el for el in card["card"]["body"]["elements"] if el.get("tag") == "img"]
+        assert imgs
+        for el in imgs:
+            assert "mode" not in el
+            assert el.get("scale_type") in {None, "crop_center", "crop_top", "fit_horizontal"}
+            assert el.get("img_key")
+            assert el.get("alt", {}).get("tag") == "plain_text"
         assert "img_v2_aaa" in blob
         assert "https://cdn.example.com/a.jpg" not in blob
         assert "t.me" not in blob
         assert "投资影响" not in blob
+
+    def test_embedded_img_omits_unsupported_mode(self):
+        card = FeishuCardBuilder.build_wechat_photo_card(
+            _item(),
+            media_urls=["https://cdn.example.com/a.jpg"],
+            image_keys=["img_v2_aaa"],
+        )
+        imgs = [el for el in card["card"]["body"]["elements"] if el.get("tag") == "img"]
+        assert len(imgs) == 1
+        el = imgs[0]
+        assert set(el) <= {"tag", "img_key", "alt", "scale_type", "preview", "title", "corner_radius", "size"}
+        assert "mode" not in el
+        if "scale_type" in el:
+            assert el["scale_type"] in {"crop_center", "crop_top", "fit_horizontal"}
 
     def test_card_falls_back_to_links_without_keys(self):
         item = _item()
