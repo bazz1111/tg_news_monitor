@@ -40,7 +40,18 @@ groups:
   - id: old_photos
     name: 公众号历史图片素材
     enabled: true
-    channels: []
+    channels:
+      - ussrpictures
+      - pfff_history
+      - whichtimes
+      - old_history_photos
+      - historicalpictures
+      - record_history
+      - Discoveryzhongwen
+      - sovietvisuals
+      # 历史光影档案馆：中国向历史影像（寺庙、拉卜楞/卓尼等）。t.me/s/fengls7 公开图文预览。
+      # 陵墓/宫殿/遗址向专用公开 TG 很少，多数在微博等平台，故只加这一路已核验频道。
+      - fengls7
     webhook_url_env: FEISHU_WEBHOOK_OLD_PHOTOS
     webhook_secret_env: FEISHU_WEBHOOK_SECRET_OLD_PHOTOS
     # 空字符串 = 本组关闭静默/过渡窗口（不继承全局）；省略字段才继承

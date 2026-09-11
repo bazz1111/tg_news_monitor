@@ -142,7 +142,16 @@ groups:
       # embed_images: true          # 预留；目前仅 wechat_photo 发送路径会上传嵌入
   - id: old_photos
     name: 公众号历史图片素材
-    channels: []                    # 填入历史影像向公开频道后才会采集
+    channels:
+      - ussrpictures
+      - pfff_history
+      - whichtimes
+      - old_history_photos
+      - historicalpictures
+      - record_history
+      - Discoveryzhongwen
+      - sovietvisuals
+      - fengls7                     # 中国历史影像；见下方说明
     webhook_url_env: FEISHU_WEBHOOK_OLD_PHOTOS
     quiet_hours: ""
     shoulder_hours: ""
@@ -191,7 +200,7 @@ CODEBUDDY_TIMEOUT=300
 
 #### `old_photos`：微信公众号历史影像素材
 
-这是材料台，不是新闻快讯：公开 TG 频道只作进料，飞书是审稿箱，人工再发公众号。与 `news24` 分组隔离（独立 pending、模型批次、webhook、去重），互不影响。
+这是材料台，不是新闻快讯：公开 TG 频道只作进料，飞书是审稿箱，人工再发公众号。与 `news24` 分组隔离（独立 pending、模型批次、webhook、去重），互不影响。进料现含中国历史影像频道 `fengls7`（历史光影档案馆，`t.me/s/fengls7` 可预览照片）。专门做中国陵墓/宫殿/遗址的公开 TG 频道很少，这类素材大多在微博等平台。
 
 | 步骤 | 行为 |
 |---|---|
