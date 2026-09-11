@@ -965,7 +965,8 @@ class TestHistoryPagination:
         posts, result = runner._ingest_channel(channel, group_id="old_photos")
         assert result["posts_discovered"] == 2
         assert {p.message_id for p in posts} == {80, 70}
-        assert scraper.fetch_args == [(channel, None), (channel, 90)]
+        assert scraper.fetch_args[:2] == [(channel, None), (channel, 90)]
+        assert scraper.fetch_args[2] == (channel, 70)
 
     def test_empty_history_page_stops(self, tmp_path):
         db = str(tmp_path / "hist_empty.db")
