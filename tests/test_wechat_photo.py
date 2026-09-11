@@ -7,7 +7,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 from pydantic import ValidationError
 
-from tg_news_monitor.config import Settings
+from tg_news_monitor.config import CardProfile, Settings
 from tg_news_monitor.core.models import DigestBrief, DigestItem, TelegramPost
 from tg_news_monitor.core.runner import NewsMonitorRunner
 from tg_news_monitor.core.wechat_photo import (
@@ -184,6 +184,30 @@ class TestWechatCaption:
         assert "…" not in out[-3:]
 
 
+class FakeUploader:
+    """Test double for FeishuImageUploader.embed_keys."""
+
+    def __init__(self, mapping: dict[str, str] | None = None, *, fail: bool = False, configured: bool = True):
+        self.mapping = mapping
+        self.fail = fail
+        self.configured = configured
+        self.calls: list[list[str]] = []
+
+    def embed_keys(self, urls):
+        self.calls.append(list(urls or []))
+        if self.fail:
+            return []
+        kept = photo_link_urls(urls)
+        if self.mapping is None:
+            return [f"img_v2_{idx}" for idx, _ in enumerate(kept, 1)]
+        return [self.mapping[u] for u in kept if u in self.mapping]
+
+
+def _img_keys(payload) -> list[str]:
+    elements = payload.get("card", {}).get("body", {}).get("elements", [])
+    return [str(el.get("img_key") or "") for el in elements if el.get("tag") == "img"]
+
+
 class TestWechatCard:
     def test_card_is_minimal_and_has_image_links(self):
         item = _item()
@@ -204,6 +228,42 @@ class TestWechatCard:
         assert "原文" not in blob
         assert "@oldpix" not in blob
         assert "Telegram" not in blob
+
+    def test_card_embeds_img_keys_when_upload_ok(self):
+        item = _item()
+        urls = [
+            "https://cdn.example.com/a.jpg",
+            "https://cdn.example.com/b.jpg",
+            "https://t.me/oldpix/1",
+        ]
+        card = FeishuCardBuilder.build_wechat_photo_card(
+            item,
+            media_urls=urls,
+            image_keys=["img_v2_aaa", "img_v2_bbb"],
+        )
+        blob = str(card)
+        keys = _img_keys(card)
+        assert keys == ["img_v2_aaa", "img_v2_bbb"]
+        assert any(el.get("tag") == "img" for el in card["card"]["body"]["elements"])
+        assert any(
+            el.get("mode") == "fit_horizontal"
+            for el in card["card"]["body"]["elements"]
+            if el.get("tag") == "img"
+        )
+        assert "img_v2_aaa" in blob
+        assert "https://cdn.example.com/a.jpg" not in blob
+        assert "t.me" not in blob
+        assert "投资影响" not in blob
+
+    def test_card_falls_back_to_links_without_keys(self):
+        item = _item()
+        card = FeishuCardBuilder.build_wechat_photo_card(
+            item,
+            media_urls=["https://cdn.example.com/a.jpg"],
+            image_keys=[],
+        )
+        assert _img_keys(card) == []
+        assert "https://cdn.example.com/a.jpg" in str(card)
 
     def test_news_card_still_has_investment_and_time(self):
         item = _item(
@@ -233,6 +293,14 @@ class TestWechatPromptAndConfig:
             ]
         )
         assert s.groups[0].resolved_card_profile().prompt_variant == "wechat_photo"
+
+    def test_embed_images_defaults_true_only_for_wechat_photo(self):
+        wechat = CardProfile(prompt_variant="wechat_photo")
+        news = CardProfile(prompt_variant="news")
+        assert wechat.embed_images_enabled() is True
+        assert news.embed_images_enabled() is False
+        assert CardProfile(prompt_variant="wechat_photo", embed_images=False).embed_images_enabled() is False
+        assert CardProfile(prompt_variant="news", embed_images=True).embed_images_enabled() is True
 
     def test_unknown_variant_rejected(self):
         with pytest.raises(ValidationError, match="wechat_photo"):
@@ -294,6 +362,8 @@ class TestWechatRunnerIsolation:
             digest_max_wait_seconds=0,
             digest_card_interval_seconds=0,
             digest_min_interval_seconds=0,
+            feishu_app_id="",
+            feishu_app_secret="",
             groups=[
                 {
                     "id": "news24",
@@ -427,6 +497,123 @@ class TestWechatRunnerIsolation:
         assert "发布时间" not in str(photo_card)
         assert "投资影响" not in str(photo_card)
         assert "t.me" not in str(photo_card)
+
+    def test_send_embeds_img_when_upload_ok(self, tmp_path):
+        db = str(tmp_path / "embed_ok.db")
+        config = self._settings(db)
+        sender = MockWebhookSender()
+        uploader = FakeUploader(mapping={"https://cdn.example.com/p.jpg": "img_v2_ok"})
+        runner = NewsMonitorRunner(
+            config, PostRepository(db), MockScraper(), MockEvaluator(), sender, uploader
+        )
+        photo = next(g for g in config.enabled_groups() if g.id == "old_photos")
+        item = _item(media_urls=["https://cdn.example.com/p.jpg", "https://t.me/oldpix/1"])
+        with runner._bind_group(photo):
+            assert runner._send_digest_item_card(item) is True
+        assert len(uploader.calls) == 1
+        payload = sender.sent_payloads[0]
+        assert _img_keys(payload) == ["img_v2_ok"]
+        blob = str(payload)
+        assert "img_key" in blob
+        assert "cdn.example.com/p.jpg" not in blob
+        assert "t.me" not in blob
+        assert "投资影响" not in blob
+
+    def test_send_embeds_partial_upload_success(self, tmp_path):
+        db = str(tmp_path / "embed_partial.db")
+        config = self._settings(db)
+        sender = MockWebhookSender()
+        uploader = FakeUploader(mapping={"https://cdn.example.com/a.jpg": "img_v2_a"})
+        runner = NewsMonitorRunner(
+            config, PostRepository(db), MockScraper(), MockEvaluator(), sender, uploader
+        )
+        photo = next(g for g in config.enabled_groups() if g.id == "old_photos")
+        item = _item(media_urls=["https://cdn.example.com/a.jpg", "https://cdn.example.com/b.jpg"])
+        with runner._bind_group(photo):
+            assert runner._send_digest_item_card(item) is True
+        payload = sender.sent_payloads[0]
+        assert _img_keys(payload) == ["img_v2_a"]
+        blob = str(payload)
+        assert "cdn.example.com/b.jpg" not in blob
+        assert "t.me" not in blob
+
+    def test_send_falls_back_to_links_when_upload_fails(self, tmp_path):
+        db = str(tmp_path / "embed_fail.db")
+        config = self._settings(db)
+        sender = MockWebhookSender()
+        uploader = FakeUploader(fail=True)
+        runner = NewsMonitorRunner(
+            config, PostRepository(db), MockScraper(), MockEvaluator(), sender, uploader
+        )
+        photo = next(g for g in config.enabled_groups() if g.id == "old_photos")
+        item = _item(media_urls=["https://cdn.example.com/p.jpg"])
+        with runner._bind_group(photo):
+            assert runner._send_digest_item_card(item) is True
+        blob = str(sender.sent_payloads[0])
+        assert _img_keys(sender.sent_payloads[0]) == []
+        assert "https://cdn.example.com/p.jpg" in blob
+        assert "img_key" not in blob
+
+    def test_send_falls_back_to_links_when_missing_creds(self, tmp_path):
+        db = str(tmp_path / "embed_nocred.db")
+        config = self._settings(db)
+        sender = MockWebhookSender()
+        runner = NewsMonitorRunner(config, PostRepository(db), MockScraper(), MockEvaluator(), sender)
+        assert runner._image_uploader.configured is False
+        photo = next(g for g in config.enabled_groups() if g.id == "old_photos")
+        item = _item(media_urls=["https://cdn.example.com/p.jpg"])
+        with runner._bind_group(photo):
+            assert runner._send_digest_item_card(item) is True
+        blob = str(sender.sent_payloads[0])
+        assert _img_keys(sender.sent_payloads[0]) == []
+        assert "https://cdn.example.com/p.jpg" in blob
+
+    def test_embed_images_false_keeps_markdown_links(self, tmp_path):
+        db = str(tmp_path / "embed_off.db")
+        config = self._settings(
+            db,
+            card_profile={
+                "subtitle": "公众号图片素材",
+                "include_investment_impact": False,
+                "prompt_variant": "wechat_photo",
+                "embed_images": False,
+            },
+        )
+        sender = MockWebhookSender()
+        uploader = FakeUploader()
+        runner = NewsMonitorRunner(
+            config, PostRepository(db), MockScraper(), MockEvaluator(), sender, uploader
+        )
+        photo = next(g for g in config.enabled_groups() if g.id == "old_photos")
+        item = _item(media_urls=["https://cdn.example.com/p.jpg"])
+        with runner._bind_group(photo):
+            assert runner._send_digest_item_card(item) is True
+        assert uploader.calls == []
+        assert "https://cdn.example.com/p.jpg" in str(sender.sent_payloads[0])
+        assert _img_keys(sender.sent_payloads[0]) == []
+
+    def test_news24_send_does_not_call_uploader(self, tmp_path):
+        db = str(tmp_path / "news_no_upload.db")
+        config = self._settings(db)
+        sender = MockWebhookSender()
+        uploader = FakeUploader()
+        runner = NewsMonitorRunner(
+            config, PostRepository(db), MockScraper(), MockEvaluator(), sender, uploader
+        )
+        news = next(g for g in config.enabled_groups() if g.id == "news24")
+        item = _item(
+            channel="wire",
+            title="央行紧急降息",
+            summary="央行宣布紧急降息以稳定经济。",
+            score=9,
+            category="宏观财经",
+        )
+        with runner._bind_group(news):
+            assert runner._send_digest_item_card(item) is True
+        assert uploader.calls == []
+        blob = str(sender.sent_payloads[0])
+        assert "img_key" not in blob
+        assert "投资情报快报" in blob
 
     def test_old_event_at_blocks_news_not_photos(self, tmp_path):
         db = str(tmp_path / "age.db")

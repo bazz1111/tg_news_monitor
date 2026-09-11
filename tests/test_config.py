@@ -45,6 +45,8 @@ class TestConfigDefaultsAndParsing:
         assert settings.db_path == "data/tg_news.db"
         assert settings.log_level == "INFO"
         assert settings.telegram_channels == []
+        assert settings.feishu_app_id == ""
+        assert settings.feishu_app_secret == ""
 
     def test_comma_separated_channel_string_parsing(self):
         s = Settings(telegram_channels="durov, @telegram, whale_alert , ")
@@ -118,6 +120,8 @@ class TestEnvironmentAndSecretSync:
         monkeypatch.setenv("GROK_MODEL", "grok-beta")
         monkeypatch.setenv("FEISHU_WEBHOOK_URL", "https://open.feishu.cn/hook/xyz")
         monkeypatch.setenv("FEISHU_SECRET", "sign-secret-123")
+        monkeypatch.setenv("FEISHU_APP_ID", "cli_test_app")
+        monkeypatch.setenv("FEISHU_APP_SECRET", "test_app_secret")
         monkeypatch.setenv("DB_PATH", "custom/storage.db")
 
         settings = Settings.load()
@@ -129,6 +133,8 @@ class TestEnvironmentAndSecretSync:
         assert settings.feishu_webhook_url == "https://open.feishu.cn/hook/xyz"
         assert settings.feishu_webhook_secret == "sign-secret-123"
         assert settings.feishu_secret == "sign-secret-123"
+        assert settings.feishu_app_id == "cli_test_app"
+        assert settings.feishu_app_secret == "test_app_secret"
         assert settings.db_path == "custom/storage.db"
 
     def test_load_deepseek_from_environment_variables(self, monkeypatch: pytest.MonkeyPatch):

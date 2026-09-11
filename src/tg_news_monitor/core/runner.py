@@ -57,6 +57,7 @@ from tg_news_monitor.core.wechat_photo import (
 )
 from tg_news_monitor.evaluator.grok_client import GrokClient
 from tg_news_monitor.notifier.feishu_card import FeishuCardBuilder
+from tg_news_monitor.notifier.feishu_images import FeishuImageUploader
 from tg_news_monitor.notifier.card_format import format_morning_item_md
 from tg_news_monitor.notifier.webhook_sender import FeishuWebhookSender
 from tg_news_monitor.scraper.client import TelegramScraperClient
@@ -101,6 +102,7 @@ class NewsMonitorRunner:
         scraper_client: Optional[TelegramScraperClient] = None,
         evaluator: Optional[GrokClient] = None,
         webhook_sender: Optional[FeishuWebhookSender] = None,
+        image_uploader: Any = None,
     ) -> None:
         """Initializes runner with configuration and injectable dependencies."""
         self.config = config or get_config()
@@ -154,6 +156,12 @@ class NewsMonitorRunner:
             )
 
         self._init_group_runtimes(webhook_sender)
+        self._image_uploader = (
+            image_uploader
+            if image_uploader is not None
+            else FeishuImageUploader.from_settings(self.config)
+        )
+        self._warned_no_feishu_app = False
 
         self._stop_requested = False
         self.stats: Dict[str, Any] = {
@@ -321,6 +329,31 @@ class NewsMonitorRunner:
 
     def _is_wechat_photo(self) -> bool:
         return is_wechat_photo_variant(getattr(self._card_profile, "prompt_variant", None))
+
+    def _wechat_image_keys(self, urls: List[str]) -> List[str]:
+        """Upload wechat_photo media for in-card img. Empty list → markdown-link fallback."""
+        profile = self._card_profile
+        if not profile.embed_images_enabled():
+            return []
+        uploader = getattr(self, "_image_uploader", None)
+        if uploader is None:
+            return []
+        if not getattr(uploader, "configured", True):
+            if not self._warned_no_feishu_app:
+                logger.info(
+                    "FEISHU_APP_ID/FEISHU_APP_SECRET unset; wechat_photo cards use markdown image links"
+                )
+                self._warned_no_feishu_app = True
+            return []
+        method = getattr(uploader, "embed_keys", None)
+        if not callable(method):
+            return []
+        try:
+            keys = method(urls)
+        except Exception as exc:
+            logger.warning(f"group={self._group_id} Feishu image embed failed: {exc}")
+            return []
+        return [str(k).strip() for k in (keys or []) if str(k).strip()]
 
     def _delivery_text(self, post: TelegramPost) -> str:
         if self._is_wechat_photo():
@@ -597,9 +630,11 @@ class NewsMonitorRunner:
                     f"{getattr(item, 'title', '')!r}"
                 )
                 return False
+            media_urls = list(getattr(item, "media_urls", None) or [])
             payload = FeishuCardBuilder.build_wechat_photo_card(
                 item,
-                media_urls=list(getattr(item, "media_urls", None) or []),
+                media_urls=media_urls,
+                image_keys=self._wechat_image_keys(media_urls),
                 subtitle=profile.subtitle or "公众号图片素材",
             )
         else:

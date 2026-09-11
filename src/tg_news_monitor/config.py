@@ -143,6 +143,14 @@ class CardProfile(BaseModel):
         default=None,
         description="Digest system-prompt variant key: news | story | wechat_photo",
     )
+    embed_images: Optional[bool] = Field(
+        default=None,
+        description=(
+            "Upload images to Feishu and embed img_key in the card. "
+            "None = true for wechat_photo, false otherwise. news24 can set true later; "
+            "only the wechat_photo send path uploads today."
+        ),
+    )
 
     @field_validator("prompt_variant", mode="before")
     @classmethod
@@ -155,6 +163,26 @@ class CardProfile(BaseModel):
         if text not in {"news", "story", "wechat_photo"}:
             raise ValueError("card_profile.prompt_variant must be 'news', 'story', or 'wechat_photo'")
         return text
+
+    @field_validator("embed_images", mode="before")
+    @classmethod
+    def normalize_embed_images(cls, value: Any) -> Optional[bool]:
+        if value is None or value == "":
+            return None
+        if isinstance(value, bool):
+            return value
+        text = str(value).strip().lower()
+        if text in {"true", "1", "yes", "on"}:
+            return True
+        if text in {"false", "0", "no", "off"}:
+            return False
+        raise ValueError("card_profile.embed_images must be a boolean")
+
+    def embed_images_enabled(self) -> bool:
+        """Default on for wechat_photo; other variants opt in via embed_images=true."""
+        if self.embed_images is not None:
+            return bool(self.embed_images)
+        return (self.prompt_variant or "").strip().lower() == "wechat_photo"
 
 
 class Group(BaseModel):
@@ -594,6 +622,14 @@ class Settings(_BaseClass):
         default=None,
         description="Alias for feishu_webhook_secret",
     )
+    feishu_app_id: str = Field(
+        default="",
+        description="Feishu open-platform app id for tenant_access_token + image upload",
+    )
+    feishu_app_secret: str = Field(
+        default="",
+        description="Feishu open-platform app secret (never log or commit)",
+    )
 
     # Storage and runtime parameters
     db_path: str = Field(
@@ -698,13 +734,13 @@ class Settings(_BaseClass):
         load_zone(text)
         return text
 
-    @field_validator("deepseek_api_key", mode="before")
+    @field_validator("deepseek_api_key", "feishu_app_id", "feishu_app_secret", mode="before")
     @classmethod
     def parse_secret_keys(cls, value: Any) -> str:
         """Accepts str or SecretStr and returns plaintext str."""
         if isinstance(value, SecretStr):
             return value.get_secret_value()
-        return str(value) if value is not None else ""
+        return str(value).strip() if value is not None else ""
 
     @model_validator(mode="before")
     @classmethod
