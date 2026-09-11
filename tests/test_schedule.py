@@ -165,6 +165,12 @@ class TestKnobsAndSettings:
             Settings(quiet_hours="not-a-window")
         assert Settings(quiet_hours="", shoulder_hours="").quiet_hours == ""
 
+    def test_unknown_timezone_errors(self):
+        with pytest.raises(ValueError, match="unknown timezone"):
+            load_zone("NotA/RealZone")
+        shanghai = load_zone("Asia/Shanghai")
+        assert shanghai is not None
+
     def test_zero_quiet_cap_is_preserved(self):
         knobs = knobs_for(SimpleNamespace(quiet_card_cap=0, quiet_hours="01:00-08:00"), MODE_QUIET, now_local=local(3))
         assert knobs.quiet_card_cap == 0

@@ -29,6 +29,9 @@ def test_freshness_budget_and_persistent_duplicate_claim(tmp_path):
     assert policy.claim('Fed raises rates 25 bps', 'Rate decision')
     assert not DeliveryPolicy(db).claim('Fed raises rates 25 bps', 'Another title')
     assert 'Rate decision' in policy.history()
+    claimed = policy.seen_many(['Fed raises rates 25 bps', 'Unrelated equity comment'])
+    assert fingerprint('Fed raises rates 25 bps') in claimed
+    assert fingerprint('Unrelated equity comment') not in claimed
 
 
 def test_pipeline_stale_duplicate_failure_batch_and_model_output(tmp_path):

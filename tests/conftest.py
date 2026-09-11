@@ -566,16 +566,17 @@ def temp_sqlite_conn(temp_sqlite_db_path: Path):
 
 @pytest.fixture(autouse=True)
 def _force_day_alert_mode(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Keep existing runner tests on daytime knobs unless marked real_schedule."""
+    """Pin wall-clock-sensitive runner tests to day mode unless marked real_schedule.
+
+    Quiet / shoulder / morning-flush coverage lives in tests marked ``real_schedule``
+    (see test_quiet_hours.py, test_schedule.py). This fixture does not patch
+    DeliveryPolicy.peek_morning_flush — that helper is wired for day-entry flush.
+    """
     if request.node.get_closest_marker("real_schedule"):
         return
     monkeypatch.setattr(
         "tg_news_monitor.core.schedule.classify_alert_mode",
         lambda *args, **kwargs: "day",
-    )
-    monkeypatch.setattr(
-        "tg_news_monitor.core.policy.DeliveryPolicy.peek_morning_flush",
-        lambda self, *args, **kwargs: False,
     )
 
 

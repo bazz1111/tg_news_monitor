@@ -439,6 +439,9 @@ class TestHeuristicFallbackEngine:
         assert 8.0 <= d2 <= 8.1
         assert d0 < d1 < d2
 
+        huge = calculate_backoff_delay(1024, base_delay=2.0, max_delay=60.0, jitter_range=(0.0, 0.0))
+        assert huge == 60.0
+
     def test_multistage_fallback_handler_complete_flow(
         self, sample_exploit_post: TelegramPost
     ) -> None:
@@ -764,6 +767,29 @@ class TestCodeBuddyEvaluator:
         ev.evaluate_post(sample_breaking_post)
         assert captured_env.get("CODEBUDDY_API_KEY") == "cb-key"
         assert "CODEBUDDY_INTERNET_ENVIRONMENT" not in captured_env
+
+    def test_child_env_does_not_pass_feishu_secrets(
+        self, sample_breaking_post: TelegramPost, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("FEISHU_APP_SECRET", "feishu-secret-value")
+        monkeypatch.setenv("FEISHU_WEBHOOK_URL", "https://open.feishu.cn/open-apis/bot/v2/hook/xyz")
+        monkeypatch.setenv("PATH", "/usr/bin")
+        captured_env: dict[str, str] = {}
+
+        def fake_run(cmd, **kwargs):
+            captured_env.update(kwargs.get("env") or {})
+            return self._cli(json.dumps(GROK_EVAL_SCORE_9, ensure_ascii=False))
+
+        ev = CodeBuddyEvaluator(
+            api_key="cb-key",
+            extra_env={"FEISHU_APP_SECRET": "injected", "CODEBUDDY_INTERNET_ENVIRONMENT": "2"},
+            run_cli=fake_run,
+        )
+        ev.evaluate_post(sample_breaking_post)
+        assert "FEISHU_APP_SECRET" not in captured_env
+        assert "FEISHU_WEBHOOK_URL" not in captured_env
+        assert "CODEBUDDY_INTERNET_ENVIRONMENT" not in captured_env
+        assert captured_env.get("PATH") == "/usr/bin"
 
     def test_primary_fail_fallback_success(self, sample_breaking_post: TelegramPost) -> None:
         models: List[str] = []

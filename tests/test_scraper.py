@@ -5,7 +5,11 @@ import pytest
 import httpx
 
 from tg_news_monitor.core.models import TelegramPost
-from tg_news_monitor.scraper.client import TelegramScraperClient
+from tg_news_monitor.scraper.client import (
+    TelegramScraperClient,
+    capped_backoff,
+    parse_retry_after,
+)
 from tg_news_monitor.scraper.parser import TelegramWebParser
 
 
@@ -333,3 +337,19 @@ class TestTelegramScraperClient:
         assert html is None
         assert scraper.consecutive_errors >= 3
         assert len(slept_durations) == 2  # slept between attempts 1->2 and 2->3
+
+    def test_retry_after_and_exponent_are_capped(self, monkeypatch):
+        slept = []
+        monkeypatch.setattr("time.sleep", lambda s: slept.append(s))
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(429, headers={"Retry-After": "999999"})
+
+        scraper = TelegramScraperClient(
+            max_retries=2, max_backoff=5.0, http_client=httpx.Client(transport=httpx.MockTransport(handler))
+        )
+        assert scraper.fetch_channel_html("test_channel") is None
+        assert slept
+        assert all(d <= 7.0 for d in slept)  # cap + small jitter
+        assert parse_retry_after("999999", 5.0) == 5.0
+        assert capped_backoff(2.0, 1024, 5.0, 30.0) == 30.0

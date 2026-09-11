@@ -5,8 +5,10 @@ from __future__ import annotations
 import httpx
 
 from tg_news_monitor.notifier.feishu_images import (
+    KEY_CACHE_MAXSIZE,
     MAX_EMBEDDED_IMAGES,
     FeishuImageUploader,
+    host_is_blocked,
     sniff_image,
 )
 
@@ -17,7 +19,8 @@ MINI_JPEG = (
 
 
 def _uploader(handler, **kwargs) -> FeishuImageUploader:
-    client = httpx.Client(transport=httpx.MockTransport(handler), follow_redirects=True)
+    client = httpx.Client(transport=httpx.MockTransport(handler), follow_redirects=False)
+    kwargs.setdefault("host_checker", lambda host: False)
     return FeishuImageUploader(
         app_id="cli_test_app",
         app_secret="test_app_secret",
@@ -77,7 +80,7 @@ class TestFeishuImageUploader:
         assert seen["upload"] == 1
         assert seen["get"] == ["https://cdn.example.com/a.jpg"]
 
-        # Process-lifetime cache: same URL does not re-download or re-upload.
+        # Bounded LRU cache: same URL does not re-download or re-upload.
         again = up.embed_keys(["https://cdn.example.com/a.jpg"])
         assert again == ["img_v2_ok"]
         assert seen["token"] == 1
@@ -209,3 +212,42 @@ class TestFeishuImageUploader:
         assert len(keys) == 9
         assert len(uploads) == 9
         assert MAX_EMBEDDED_IMAGES == 9
+
+    def test_lru_evicts_oldest_url(self):
+        uploads = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if "tenant_access_token" in str(request.url):
+                return httpx.Response(
+                    200,
+                    json={"code": 0, "expire": 7200, "tenant_access_token": "t-x"},
+                )
+            if str(request.url).endswith("/im/v1/images"):
+                uploads.append(str(request.url))
+                return httpx.Response(
+                    200,
+                    json={"code": 0, "data": {"image_key": f"img_v2_{len(uploads)}"}},
+                )
+            return httpx.Response(200, content=MINI_JPEG)
+
+        up = _uploader(handler, key_cache_maxsize=2)
+        assert up.embed_keys(["https://cdn.example.com/a.jpg"]) == ["img_v2_1"]
+        assert up.embed_keys(["https://cdn.example.com/b.jpg"]) == ["img_v2_2"]
+        assert up.embed_keys(["https://cdn.example.com/c.jpg"]) == ["img_v2_3"]
+        # a.jpg was evicted
+        assert up.embed_keys(["https://cdn.example.com/a.jpg"]) == ["img_v2_4"]
+        assert len(uploads) == 4
+        assert KEY_CACHE_MAXSIZE >= 500
+
+    def test_blocks_loopback_and_private_hosts(self):
+        assert host_is_blocked("127.0.0.1")
+        assert host_is_blocked("10.1.2.3")
+        assert host_is_blocked("192.168.0.8")
+        assert host_is_blocked("169.254.169.254")
+        assert host_is_blocked("localhost")
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            raise AssertionError("must not fetch private hosts")
+
+        up = _uploader(handler, host_checker=host_is_blocked)
+        assert up.embed_keys(["http://127.0.0.1/x.jpg"]) == []
