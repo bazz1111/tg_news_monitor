@@ -14,6 +14,8 @@ from tg_news_monitor.core.models import TelegramPost
 
 WECHAT_PHOTO_VARIANT = "wechat_photo"
 WECHAT_CAPTION_MAX = 100
+WECHAT_CARD_MAX_IMAGES = 1
+WECHAT_DIGEST_MAX_ITEMS = 2
 PHOTO_MEDIA_TYPES = frozenset({"photo", "album"})
 
 _TG_LINK_RE = re.compile(r"https?://(?:www\.)?t\.me/\S+|t\.me/\S+", re.I)
@@ -224,6 +226,8 @@ def wechat_photo_prefilter(
 __all__ = [
     "PHOTO_MEDIA_TYPES",
     "WECHAT_CAPTION_MAX",
+    "WECHAT_CARD_MAX_IMAGES",
+    "WECHAT_DIGEST_MAX_ITEMS",
     "WECHAT_PHOTO_VARIANT",
     "is_photo_album_post",
     "is_wechat_photo_variant",

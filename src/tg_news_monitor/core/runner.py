@@ -47,6 +47,8 @@ from tg_news_monitor.core.filters import (
 )
 from tg_news_monitor.core.models import DigestBrief, DigestItem, NewsEvaluation, TelegramPost
 from tg_news_monitor.core.wechat_photo import (
+    WECHAT_CARD_MAX_IMAGES,
+    WECHAT_DIGEST_MAX_ITEMS,
     is_wechat_photo_variant,
     normalize_wechat_caption,
     photo_link_urls,
@@ -801,7 +803,7 @@ class NewsMonitorRunner:
                     f"{getattr(item, 'title', '')!r}"
                 )
                 return False
-            media_urls = list(getattr(item, "media_urls", None) or [])
+            media_urls = photo_link_urls(getattr(item, "media_urls", None))[:WECHAT_CARD_MAX_IMAGES]
             payload = FeishuCardBuilder.build_wechat_photo_card(
                 item,
                 media_urls=media_urls,
@@ -861,7 +863,7 @@ class NewsMonitorRunner:
                     if not urls:
                         reason = "no_photo_urls"
                     else:
-                        item.media_urls = urls
+                        item.media_urls = urls[:WECHAT_CARD_MAX_IMAGES]
             if reason:
                 self.storage.update_evaluation(
                     channel=ch,
@@ -876,6 +878,25 @@ class NewsMonitorRunner:
                 )
                 continue
             kept.append(item)
+        extras = kept[WECHAT_DIGEST_MAX_ITEMS:]
+        if extras:
+            extra_posts: List[TelegramPost] = []
+            for item in extras:
+                ch = str(item.channel).lower().lstrip("@").strip()
+                try:
+                    mid = int(item.message_id)
+                except (TypeError, ValueError):
+                    continue
+                post = by_key.get((ch, mid))
+                if post is not None:
+                    extra_posts.append(post)
+            self._mark_all_filtered(extra_posts, "wechat_digest_cap")
+            logger.info(
+                f"group={self._group_id} wechat_photo digest capped to "
+                f"{WECHAT_DIGEST_MAX_ITEMS} items; "
+                f"{len(extras)} surplus marked wechat_digest_cap"
+            )
+            kept = kept[:WECHAT_DIGEST_MAX_ITEMS]
         digest.items = kept
         if not kept:
             digest.has_material_news = False

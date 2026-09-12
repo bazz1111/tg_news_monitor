@@ -13,6 +13,7 @@ from datetime import timedelta
 
 from tg_news_monitor.core.models import DigestBrief, DigestItem, NewsEvaluation, TelegramPost
 from tg_news_monitor.core.wechat_photo import (
+    WECHAT_CARD_MAX_IMAGES,
     normalize_wechat_caption,
     photo_link_urls,
     strip_tg_traces,
@@ -23,7 +24,6 @@ from tg_news_monitor.notifier.card_format import (
     polish_overview_bullet,
     shorten_summary,
 )
-from tg_news_monitor.notifier.feishu_images import MAX_EMBEDDED_IMAGES
 
 
 # ==============================================================================
@@ -601,10 +601,10 @@ class FeishuCardBuilder:
         subtitle: str = "公众号图片素材",
         image_keys: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
-        """Title + ≤100字说明 + in-card images (img_key) or markdown link fallback.
+        """Title + ≤100字说明 + one in-card image (img_key) or markdown link fallback.
 
         No TG traces, no investment block. Image bytes are uploaded elsewhere;
-        this builder only places keys or http(s) links.
+        this builder only places the first key or first http(s) link.
         """
         title = strip_tg_traces((getattr(item, "title", None) or "").strip()) or "历史影像"
         title = title[:50]
@@ -617,7 +617,8 @@ class FeishuCardBuilder:
         urls = photo_link_urls(media_urls)
         if not urls:
             urls = photo_link_urls(getattr(item, "media_urls", None))
-        keys = [str(k).strip() for k in (image_keys or []) if str(k).strip()][:MAX_EMBEDDED_IMAGES]
+        urls = urls[:WECHAT_CARD_MAX_IMAGES]
+        keys = [str(k).strip() for k in (image_keys or []) if str(k).strip()][:WECHAT_CARD_MAX_IMAGES]
 
         def _md_div(content: str) -> Dict[str, Any]:
             return {"tag": "div", "text": {"tag": "lark_md", "content": content}}
