@@ -291,6 +291,9 @@ class TestWechatCard:
             score=9,
             category="宏观财经",
         )
+        item.verification_status = "official"
+        item.bias_overall = "利多"
+        item.impact_overall = "总体偏多"
         news = FeishuCardBuilder.build_digest_item_card(item, include_investment_impact=True)
         blob = str(news)
         assert "💹 投资影响" in blob
@@ -422,18 +425,21 @@ class TestWechatRunnerIsolation:
                 if event_at_offset is not None:
                     ev = p.published_at + event_at_offset
                 is_news = str(p.channel).lower().lstrip("@") == "wire"
-                items.append(
-                    _item(
-                        channel=p.channel,
-                        message_id=p.message_id,
-                        title=p.text[:16],
-                        summary=p.text if p.text.endswith("。") else p.text + "。",
-                        score=9 if is_news else score,
-                        category="宏观财经" if is_news else "历史影像",
-                        event_at=ev,
-                        media_urls=list(p.media_urls or []),
-                    )
+                news_item = _item(
+                    channel=p.channel,
+                    message_id=p.message_id,
+                    title=p.text[:16],
+                    summary=p.text if p.text.endswith("。") else p.text + "。",
+                    score=9 if is_news else score,
+                    category="宏观财经" if is_news else "历史影像",
+                    event_at=ev,
+                    media_urls=list(p.media_urls or []),
                 )
+                if is_news:
+                    news_item.verification_status = "official"
+                    news_item.bias_overall = "利多"
+                    news_item.impact_overall = "总体偏多"
+                items.append(news_item)
             return DigestBrief(
                 headline="iso",
                 overview="",
@@ -670,6 +676,7 @@ class TestWechatRunnerIsolation:
             score=9,
             category="宏观财经",
         )
+        item.verification_status = "official"
         with runner._bind_group(news):
             assert runner._send_digest_item_card(item) is True
         assert uploader.calls == []

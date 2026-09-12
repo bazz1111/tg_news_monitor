@@ -19,7 +19,7 @@ from tg_news_monitor.notifier.feishu_card import (
 )
 
 
-def _item(*, score: int, category: str) -> DigestItem:
+def _item(*, score: int, category: str, verification_status: str = "official") -> DigestItem:
     return DigestItem(
         rank=1,
         channel="wire",
@@ -28,6 +28,7 @@ def _item(*, score: int, category: str) -> DigestItem:
         summary="央行宣布紧急降息以稳定经济。",
         category=category,
         score=score,
+        verification_status=verification_status,
         summary_bullets=["央行宣布紧急降息以稳定经济。"],
         actionable_insight="关注后续官方确认。",
         bias_overall="利多",
@@ -58,7 +59,10 @@ def _has_investment_block(blob: str) -> bool:
 class TestShouldShowInvestmentImpact:
     @pytest.mark.parametrize("category", ["军事", "地缘政治", "宏观财经", " 宏观财经 "])
     def test_score_9_whitelist_on(self, category: str) -> None:
-        assert should_show_investment_impact(9, category, True) is True
+        assert should_show_investment_impact(9, category, True, "official") is True
+
+    def test_score_9_single_source_off(self) -> None:
+        assert should_show_investment_impact(9, "宏观财经", True, "single_source") is False
 
     def test_score_8_macro_off(self) -> None:
         assert should_show_investment_impact(8, "宏观财经", True) is False
@@ -75,13 +79,13 @@ class TestShouldShowInvestmentImpact:
 
 class TestDigestItemCardGate:
     @pytest.mark.parametrize("category", ["军事", "地缘政治", "宏观财经"])
-    def test_score_9_whitelist_renders_block_and_four_rows(self, category: str) -> None:
+    def test_score_9_whitelist_renders_block_and_non_neutral_rows(self, category: str) -> None:
         blob = _card_blob(9, category)
         assert _has_investment_block(blob)
         assert "🌐 整体" in blob
-        assert "📈 美股" in blob
         assert "📊 上证" in blob
-        assert "🛢️ 大宗" in blob
+        assert "📈 美股" not in blob
+        assert "🛢️ 大宗" not in blob
         assert "🕒 **发布时间**" in blob
         assert "**📌 核心速览**" in blob
         assert "**🎯 关注建议**" in blob

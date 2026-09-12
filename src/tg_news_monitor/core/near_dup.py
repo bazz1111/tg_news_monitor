@@ -82,6 +82,14 @@ _TEMPLATE_PHRASES = tuple(
             "宣布",
             "表示",
             "指出",
+            "照片为",
+            "照片记录",
+            "照片显示",
+            "画面呈现",
+            "画面中",
+            "珍贵影像",
+            "繁荣景象",
+            "历史瞬间",
         ),
         key=len,
         reverse=True,
@@ -152,6 +160,10 @@ _NUM_RE = re.compile(
     r"(\d{1,3}(?:,\d{3})+|\d+)(?:\.(\d+))?",
     re.I,
 )
+_ERA_RE = re.compile(
+    r"(春日|夏日|秋日|冬日|春季|夏季|秋季|冬季|春天|夏天|秋天|冬天|"
+    r"民国|清朝|明朝|宋代|唐代|元代)"
+)
 _LATIN_RE = re.compile(r"[a-z]{2,}")
 _CJK_RE = re.compile(r"[\u4e00-\u9fff]+")
 _CLAUSE_SPLIT_RE = re.compile(r"[。！？；;：:\n]|，(?=\S)")
@@ -159,6 +171,11 @@ _CLAUSE_SPLIT_RE = re.compile(r"[。！？；;：:\n]|，(?=\S)")
 
 def normalize_news_text(text: str) -> str:
     return re.sub(r"\s+", " ", unicodedata.normalize("NFKC", text or "").casefold()).strip()
+
+
+def era_buckets(text: str) -> Set[str]:
+    """Season / dynasty markers so 春日 vs 冬日 is not the same event."""
+    return set(_ERA_RE.findall(normalize_news_text(text)))
 
 
 def number_buckets(text: str) -> Set[str]:
@@ -228,6 +245,11 @@ def similar_event(left: str, right: str) -> bool:
     right_nums = number_buckets(right)
     numbers_ok = (not left_nums or not right_nums) or bool(left_nums & right_nums)
     if not numbers_ok:
+        return False
+    left_eras = era_buckets(left)
+    right_eras = era_buckets(right)
+    eras_ok = (not left_eras or not right_eras) or bool(left_eras & right_eras)
+    if not eras_ok:
         return False
     specific = (left_tokens & right_tokens) - _GENERIC_TOKENS
     if jaccard >= NEAR_DUP_JACCARD and len(specific) >= NEAR_DUP_SPECIFIC_MIN:

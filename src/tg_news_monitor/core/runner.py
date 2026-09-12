@@ -1524,32 +1524,31 @@ class NewsMonitorRunner:
                 delivery_text = self._delivery_text(matched_post)
                 extra_event_key = not self._is_wechat_photo()
                 skip_near_dup = False
-                if extra_event_key:
-                    followup = sanitize_followup_copy(
-                        item.title,
-                        item.summary,
-                        getattr(item, "summary_bullets", None) or [],
-                        self.policy.recent_summaries(),
-                        is_update=bool(getattr(item, "is_update", False)),
-                        update_reason=getattr(item, "update_reason", "") or "",
+                followup = sanitize_followup_copy(
+                    item.title,
+                    item.summary,
+                    getattr(item, "summary_bullets", None) or [],
+                    self.policy.recent_summaries(),
+                    is_update=bool(getattr(item, "is_update", False)),
+                    update_reason=getattr(item, "update_reason", "") or "",
+                )
+                if followup.skip:
+                    skip_near_dup = True
+                elif followup.rewritten:
+                    logger.info(
+                        f"group={self._group_id} Stripped overlapping follow-up copy: "
+                        f"#{item.rank} {item.title!r} -> {followup.title!r}"
                     )
-                    if followup.skip:
-                        skip_near_dup = True
-                    elif followup.rewritten:
-                        logger.info(
-                            f"group={self._group_id} Stripped overlapping follow-up copy: "
-                            f"#{item.rank} {item.title!r} -> {followup.title!r}"
-                        )
-                        item.title = followup.title
-                        item.summary = followup.summary
-                        item.summary_bullets = followup.bullets
-                    elif self.policy.is_near_duplicate(
-                        item.title,
-                        item.summary,
-                        is_update=bool(getattr(item, "is_update", False)),
-                        update_reason=getattr(item, "update_reason", "") or "",
-                    ):
-                        skip_near_dup = True
+                    item.title = followup.title
+                    item.summary = followup.summary
+                    item.summary_bullets = followup.bullets
+                elif self.policy.is_near_duplicate(
+                    item.title,
+                    item.summary,
+                    is_update=bool(getattr(item, "is_update", False)),
+                    update_reason=getattr(item, "update_reason", "") or "",
+                ):
+                    skip_near_dup = True
                 claim_summary = reader_copy_blob(
                     item.title,
                     item.summary,

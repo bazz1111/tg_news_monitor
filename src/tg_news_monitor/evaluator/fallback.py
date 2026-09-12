@@ -15,7 +15,7 @@ import re
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
-from tg_news_monitor.core.models import DigestBrief, NewsEvaluation, TelegramPost
+from tg_news_monitor.core.models import DigestBrief, DigestItem, NewsEvaluation, TelegramPost
 
 logger = logging.getLogger(__name__)
 
@@ -291,6 +291,10 @@ def parse_digest_brief(raw_response: str) -> DigestBrief:
     if isinstance(items, list) and len(items) > 5:
         data["items"] = items[:5]
     brief = DigestBrief.model_validate(data)
+    for item in brief.items:
+        item.verification_status = DigestItem._coerce_verification_status(
+            getattr(item, "verification_status", None)
+        )
     if not brief.items:
         brief.has_material_news = False
     return brief
