@@ -34,6 +34,7 @@ from tg_news_monitor.config import (
     Settings,
     get_config,
 )
+from tg_news_monitor.core.near_dup import reader_copy_blob, sanitize_followup_copy
 from tg_news_monitor.core.policy import DeliveryPolicy, fingerprint, is_fresh, urgent
 from tg_news_monitor.core import schedule as alert_schedule
 from tg_news_monitor.core.quiet_hours import QuietHours, BEIJING
@@ -1521,14 +1522,40 @@ class NewsMonitorRunner:
                         )
                         continue
                 delivery_text = self._delivery_text(matched_post)
-                claim_summary = f"{item.title}: {item.summary}"
                 extra_event_key = not self._is_wechat_photo()
-                if extra_event_key and self.policy.is_near_duplicate(
+                skip_near_dup = False
+                if extra_event_key:
+                    followup = sanitize_followup_copy(
+                        item.title,
+                        item.summary,
+                        getattr(item, "summary_bullets", None) or [],
+                        self.policy.recent_summaries(),
+                        is_update=bool(getattr(item, "is_update", False)),
+                        update_reason=getattr(item, "update_reason", "") or "",
+                    )
+                    if followup.skip:
+                        skip_near_dup = True
+                    elif followup.rewritten:
+                        logger.info(
+                            f"group={self._group_id} Stripped overlapping follow-up copy: "
+                            f"#{item.rank} {item.title!r} -> {followup.title!r}"
+                        )
+                        item.title = followup.title
+                        item.summary = followup.summary
+                        item.summary_bullets = followup.bullets
+                    elif self.policy.is_near_duplicate(
+                        item.title,
+                        item.summary,
+                        is_update=bool(getattr(item, "is_update", False)),
+                        update_reason=getattr(item, "update_reason", "") or "",
+                    ):
+                        skip_near_dup = True
+                claim_summary = reader_copy_blob(
                     item.title,
                     item.summary,
-                    is_update=bool(getattr(item, "is_update", False)),
-                    update_reason=getattr(item, "update_reason", "") or "",
-                ):
+                    getattr(item, "summary_bullets", None),
+                )
+                if skip_near_dup:
                     self.storage.update_evaluation(
                         channel=ch,
                         message_id=mid,

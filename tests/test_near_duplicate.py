@@ -14,6 +14,7 @@ from tg_news_monitor.core.near_dup import (
     event_key,
     is_material_update,
     is_near_duplicate_blob,
+    sanitize_followup_copy,
     similar_event,
 )
 from tg_news_monitor.core.policy import DeliveryPolicy
@@ -49,6 +50,7 @@ def _item(
     update_reason: str = "",
     score: int = 8,
     category: str = "宏观财经",
+    summary_bullets=None,
 ) -> DigestItem:
     return DigestItem(
         rank=1,
@@ -61,6 +63,7 @@ def _item(
         event_at=post.published_at,
         is_update=is_update,
         update_reason=update_reason,
+        summary_bullets=list(summary_bullets or []),
         impact_overall="能源成本上升",
         impact_us="交运与通胀预期承压",
         impact_cn="无直接影响",
@@ -104,6 +107,7 @@ class TestSimilarEventDieselPair:
 
     def test_framing_only_update_reason_is_not_material(self):
         assert not is_material_update(True, "创历史新高", DIESEL_BLOB_1)
+        assert not is_material_update(True, "补充加州地区", DIESEL_BLOB_1)
         assert is_near_duplicate_blob(
             DIESEL_BLOB_2,
             [DIESEL_BLOB_1],
@@ -272,6 +276,66 @@ class TestNews24RunnerDieselGuard:
         assert len(sender.sent_payloads) == 2
 
 
+AMODEI_TITLE_1 = "Anthropic CEO Amodei呼吁放缓前沿AI"
+AMODEI_SUMMARY_1 = "Anthropic首席执行官Amodei呼吁放缓前沿模型部署，并提出三步走监管路径。"
+AMODEI_BLOB_1 = f"{AMODEI_TITLE_1}: {AMODEI_SUMMARY_1}"
+AMODEI_BULLETS_1 = [
+    "Anthropic首席执行官Dario Amodei呼吁放缓前沿人工智能模型的部署节奏。",
+    "他提出先评估、再限制、后放开的三步走监管路径。",
+]
+AMODEI_TITLE_2 = "Amodei再吁放缓并承诺第三方评估永久访问"
+AMODEI_SUMMARY_2 = "Amodei再次呼吁放缓前沿模型，并承诺向第三方评估方提供永久访问权限。"
+AMODEI_BULLETS_2 = [
+    "Anthropic CEO Amodei再次呼吁放缓前沿人工智能模型部署。",
+    "他重申先评估、再限制、后放开的三步走监管路径。",
+    "Anthropic承诺给予第三方评估方对模型的永久访问权。",
+]
+AMODEI_REASON = "承诺给予第三方评估方永久访问权"
+AMODEI_REHASH_TITLE = "Amodei再度呼吁放缓前沿AI部署"
+AMODEI_REHASH_SUMMARY = "Anthropic首席执行官再次呼吁放缓前沿模型并重申三步走路径。"
+AMODEI_REHASH_BULLETS = [
+    "Amodei再次呼吁放缓前沿人工智能模型的部署节奏。",
+    "他重申三步走监管路径。",
+]
+
+
+class TestFollowupCopySanitize:
+    def test_new_angle_keeps_delta_drops_old_premise(self):
+        result = sanitize_followup_copy(
+            AMODEI_TITLE_2,
+            AMODEI_SUMMARY_2,
+            AMODEI_BULLETS_2,
+            [AMODEI_BLOB_1],
+            is_update=True,
+            update_reason=AMODEI_REASON,
+        )
+        assert result.skip is False
+        assert result.rewritten is True
+        blob = " ".join([result.title, result.summary, *result.bullets])
+        assert "永久访问" in blob or "第三方" in blob
+        assert not any("放缓" in b and "永久" not in b and "第三方" not in b for b in result.bullets)
+        assert "三步走" not in blob
+        assert not result.title.startswith("Amodei再吁放缓")
+
+    def test_rephrased_old_facts_are_skipped(self):
+        result = sanitize_followup_copy(
+            AMODEI_REHASH_TITLE,
+            AMODEI_REHASH_SUMMARY,
+            AMODEI_REHASH_BULLETS,
+            [AMODEI_BLOB_1],
+        )
+        assert result.skip is True
+
+    def test_diesel_rewrite_still_skipped(self):
+        result = sanitize_followup_copy(
+            DIESEL_TITLE_2,
+            DIESEL_SUMMARY_2,
+            [],
+            [DIESEL_BLOB_1],
+        )
+        assert result.skip is True
+
+
 class TestPromptNudgeAndWechatBypass:
     def test_news_and_story_prompts_require_is_update_for_repeats(self):
         needle = "仅当 is_update=true 且 update_reason 写明新增关键事实"
@@ -279,11 +343,117 @@ class TestPromptNudgeAndWechatBypass:
         assert needle in STORY_DIGEST_SYSTEM_PROMPT
         from tg_news_monitor.evaluator.prompt import compose_digest_prompts
 
-        _system, user = compose_digest_prompts(
+        system, user = compose_digest_prompts(
             [_post(1, "placeholder news text here", BJ_1541)]
         )
         assert "is_update=true" in user
         assert "update_reason" in user
+        assert "只写本次新增事实" in system
+        assert "禁止复述" in user
+        assert "只写新增事实" in user
+
+    def test_followup_with_new_fact_sends_stripped_card(self, tmp_path):
+        db = str(tmp_path / "amodei.db")
+        repo = PostRepository(db)
+        repo.save_post(_post(50001, "Amodei calls to slow down frontier AI.", BJ_1541, channel="wire"))
+        config = _news_settings(db)
+        evaluator = MockEvaluator(
+            digest_builder=lambda posts: DigestBrief(
+                headline="放缓",
+                overview="",
+                items=[
+                    _item(
+                        posts[0],
+                        AMODEI_TITLE_1,
+                        AMODEI_SUMMARY_1,
+                        category="科技/AI",
+                        summary_bullets=AMODEI_BULLETS_1,
+                    )
+                ],
+                has_material_news=True,
+            )
+        )
+        sender = MockWebhookSender()
+        runner = NewsMonitorRunner(config, repo, MockScraper(), evaluator, sender)
+        assert runner.process_pending(now=BJ_1541)["alerts_sent"] == 1
+
+        repo.save_post(
+            _post(
+                50002,
+                "Anthropic pledges permanent third-party evaluator access.",
+                BJ_1547,
+                channel="wire",
+            )
+        )
+        evaluator.digest_builder = lambda posts: DigestBrief(
+            headline="评估访问",
+            overview="",
+            items=[
+                _item(
+                    posts[0],
+                    AMODEI_TITLE_2,
+                    AMODEI_SUMMARY_2,
+                    is_update=True,
+                    update_reason=AMODEI_REASON,
+                    category="科技/AI",
+                    summary_bullets=AMODEI_BULLETS_2,
+                )
+            ],
+            has_material_news=True,
+        )
+        assert runner.process_pending(now=BJ_1547)["alerts_sent"] == 1
+        assert len(sender.sent_payloads) == 2
+        second = str(sender.sent_payloads[1])
+        assert "永久访问" in second or "第三方" in second
+        assert "三步走" not in second
+        # Reader-facing bullets should not reopen with the already-delivered slowdown.
+        assert "再次呼吁放缓" not in second
+
+    def test_followup_with_only_rephrased_old_facts_is_filtered(self, tmp_path):
+        db = str(tmp_path / "amodei_rehash.db")
+        repo = PostRepository(db)
+        repo.save_post(_post(50001, "Amodei calls to slow down frontier AI.", BJ_1541, channel="wire"))
+        config = _news_settings(db)
+        evaluator = MockEvaluator(
+            digest_builder=lambda posts: DigestBrief(
+                headline="放缓",
+                overview="",
+                items=[
+                    _item(
+                        posts[0],
+                        AMODEI_TITLE_1,
+                        AMODEI_SUMMARY_1,
+                        category="科技/AI",
+                        summary_bullets=AMODEI_BULLETS_1,
+                    )
+                ],
+                has_material_news=True,
+            )
+        )
+        sender = MockWebhookSender()
+        runner = NewsMonitorRunner(config, repo, MockScraper(), evaluator, sender)
+        assert runner.process_pending(now=BJ_1541)["alerts_sent"] == 1
+
+        repo.save_post(_post(50003, "Amodei again urges a slowdown.", BJ_1547, channel="wire"))
+        evaluator.digest_builder = lambda posts: DigestBrief(
+            headline="再放缓",
+            overview="",
+            items=[
+                _item(
+                    posts[0],
+                    AMODEI_REHASH_TITLE,
+                    AMODEI_REHASH_SUMMARY,
+                    category="科技/AI",
+                    summary_bullets=AMODEI_REHASH_BULLETS,
+                )
+            ],
+            has_material_news=True,
+        )
+        assert runner.process_pending(now=BJ_1547)["alerts_sent"] == 0
+        assert len(sender.sent_payloads) == 1
+        row = repo.get_post("wire", 50003)
+        assert row["is_filtered"] == 1
+        assert row["filter_reason"] == "near_duplicate"
 
     def test_wechat_photo_similar_captions_still_send(self, tmp_path):
         db = str(tmp_path / "photo.db")
