@@ -9,8 +9,8 @@ from pathlib import Path
 import pytest
 
 from tg_news_monitor.config import parse_yaml_file
-from tg_news_monitor.core.models import DigestItem
-from tg_news_monitor.core.near_dup import similar_event
+from tg_news_monitor.core.models import DigestBrief, DigestItem
+from tg_news_monitor.core.near_dup import claim_blob, similar_event
 from tg_news_monitor.core.runner import NewsMonitorRunner
 from tg_news_monitor.evaluator.fallback import parse_digest_brief
 from tg_news_monitor.evaluator.prompt import (
@@ -28,6 +28,22 @@ from tests.test_wechat_photo import _post as _wechat_post
 BJ = datetime(2026, 9, 12, 4, 0, tzinfo=timezone.utc)
 
 IRAN_RUMOR_TITLE = "伊朗或将封锁霍尔木兹海峡冲击油价"
+CONFIRMED_SUMMARY = "外交部官网发布声明，证实相关安排并公布细节。"
+RUMOR_SUMMARY = "社交媒体流传伊朗可能封锁霍尔木兹海峡，尚无官方证实。"
+MISLABEL_OFFICIAL_SUMMARY = "匿名消息称伊朗将推进核试验，尚无官方证实。"
+REVERSAL_CONFIRMED_SUMMARY = "此前未经证实，但现已获官方确认伊朗将推进相关安排。"
+
+# Exact Feishu old-photo pair (Codex review regression).
+FEISHU_SIMAO_1_TITLE = "缅寺前马帮商队"
+FEISHU_SIMAO_1_BODY = (
+    "照片为云南思茅缅寺前往来的马帮商队，骡马驮载货物穿行于古城街巷，"
+    "展现昔日思茅边地商贸往来的繁忙景象。"
+)
+FEISHU_SIMAO_2_TITLE = "思茅马帮商队"
+FEISHU_SIMAO_2_BODY = (
+    "照片记录云南思茅的马帮商队，成群骡马驮载货物穿行于街巷之间，"
+    "折射出当年思茅作为滇南商贸重镇的繁荣景象。"
+)
 
 
 def _news_item(
@@ -36,6 +52,7 @@ def _news_item(
     category: str = "地缘政治",
     verification_status: str = "single_source",
     title: str = IRAN_RUMOR_TITLE,
+    summary: str | None = None,
     bias_overall: str = "利空",
     bias_us: str = "利空",
     bias_cn: str = "中性",
@@ -45,16 +62,22 @@ def _news_item(
     impact_cn: str = "无直接影响",
     impact_commodities: str = "原油偏多、风险偏好回落",
 ) -> DigestItem:
+    if summary is None:
+        summary = (
+            CONFIRMED_SUMMARY
+            if verification_status in {"official", "multi_source"}
+            else RUMOR_SUMMARY
+        )
     return DigestItem(
         rank=1,
         channel="breakingnews",
         message_id=88,
         title=title,
-        summary="社交媒体流传伊朗可能封锁霍尔木兹海峡，尚无官方证实。",
+        summary=summary,
         category=category,
         score=score,
         verification_status=verification_status,
-        summary_bullets=["社交媒体流传伊朗可能封锁海峡，尚未获官方证实。"],
+        summary_bullets=[summary],
         actionable_insight="等待官方与主流通讯社核实后再判断方向。",
         bias_overall=bias_overall,
         bias_us=bias_us,
@@ -206,11 +229,34 @@ class TestCompactHeaderAndInvestmentLines:
 
     def test_rumor_header_uses_hearsay_level(self) -> None:
         item = _news_item(score=10, verification_status="rumor")
-        card, _ = _card_elements(item)
+        card, blob = _card_elements(item)
         header = card["header"]["title"]["content"]
         assert IRAN_RUMOR_TITLE not in header
-        assert header.endswith("传闻") or "｜传闻" in header
+        assert header == "⚡ 地缘政治｜重要·传闻"
+        assert "🎚️ 等级 **重要**" in blob
+        assert "🔎 核验 **传闻**" in blob
         assert IRAN_RUMOR_TITLE in card["body"]["elements"][0]["text"]["content"]
+
+    def test_official_header_separates_importance_and_credibility(self) -> None:
+        item = _news_item(score=10, verification_status="official")
+        card, blob = _card_elements(item)
+        header = card["header"]["title"]["content"]
+        assert header == "🚨 地缘政治｜特急·官方"
+        assert "🎚️ 等级 **特急**" in blob
+        assert "🔎 核验 **官方**" in blob
+        assert "🎚️ 紧急" not in blob
+
+    def test_single_source_header_uses_pending_label(self) -> None:
+        item = _news_item(score=10, verification_status="single_source")
+        card, blob = _card_elements(item)
+        assert card["header"]["title"]["content"] == "⚡ 地缘政治｜重要·单源待核实"
+        assert "🔎 核验 **单源待核实**" in blob
+
+    def test_multi_source_label(self) -> None:
+        item = _news_item(score=9, verification_status="multi_source")
+        card, blob = _card_elements(item)
+        assert card["header"]["title"]["content"] == "🚨 地缘政治｜特急·多源确认"
+        assert "🔎 核验 **多源确认**" in blob
 
     def test_investment_only_non_neutral_max_three_lines(self) -> None:
         item = _news_item(verification_status="multi_source")
@@ -241,6 +287,168 @@ class TestCompactHeaderAndInvestmentLines:
 SIMAO_1930 = "照片为云南思茅马帮在茶马古道上负重前行，约1930年代。"
 SIMAO_1980 = "照片记录1980年代思茅另一支马帮在江边歇脚，画面呈现商队生活。"
 SIMAO_DUP = "画面呈现云南思茅马帮在茶马古道上负重前行，约1930年代。"
+
+
+class TestNegativeEvidenceVeto:
+    def test_mislabeled_official_cannot_keep_red_or_investment(self) -> None:
+        from tg_news_monitor.notifier.feishu_card import (
+            display_score,
+            effective_verification_status,
+        )
+
+        item = _news_item(
+            score=10,
+            verification_status="official",
+            summary=MISLABEL_OFFICIAL_SUMMARY,
+        )
+        assert item.score == 10
+        assert item.verification_status == "official"
+        assert effective_verification_status("official", MISLABEL_OFFICIAL_SUMMARY) == "rumor"
+        assert display_score(item) <= 8
+        card, blob = _card_elements(item)
+        assert card["header"]["template"] == "orange"
+        assert card["header"]["title"]["content"] == "⚡ 地缘政治｜重要·传闻"
+        assert "特急" not in blob
+        assert "🔥🔥🔥🔥🔥" not in blob
+        assert "💹 投资影响" not in blob
+        assert "🔎 核验 **传闻**" in blob
+        assert item.score == 10
+        assert item.verification_status == "official"
+
+    def test_reversal_confirmation_stays_official(self) -> None:
+        from tg_news_monitor.notifier.feishu_card import (
+            display_score,
+            effective_verification_status,
+        )
+
+        item = _news_item(
+            score=10,
+            verification_status="official",
+            summary=REVERSAL_CONFIRMED_SUMMARY,
+        )
+        assert (
+            effective_verification_status("official", REVERSAL_CONFIRMED_SUMMARY) == "official"
+        )
+        assert (
+            effective_verification_status("multi_source", REVERSAL_CONFIRMED_SUMMARY)
+            == "multi_source"
+        )
+        assert display_score(item) == 10
+        card, blob = _card_elements(item)
+        assert card["header"]["template"] == "red"
+        assert card["header"]["title"]["content"] == "🚨 地缘政治｜特急·官方"
+        assert "💹 投资影响" in blob
+        assert item.score == 10
+
+    def test_runner_vetoes_from_matched_post_text_not_channel(self, tmp_path) -> None:
+        from tg_news_monitor.config import Settings
+        from tg_news_monitor.core.models import TelegramPost
+
+        db = str(tmp_path / "veto_post.db")
+        repo = PostRepository(db)
+        post = TelegramPost(
+            channel="reuters",
+            message_id=88,
+            text=MISLABEL_OFFICIAL_SUMMARY,
+            direct_url="https://t.me/reuters/88",
+            published_at=BJ,
+        )
+        repo.save_post(post)
+
+        def builder(batch):
+            item = _news_item(
+                score=10,
+                verification_status="official",
+                summary="伊朗将推进核试验。",
+            )
+            item.channel = batch[0].channel
+            item.message_id = batch[0].message_id
+            item.event_at = batch[0].published_at
+            return DigestBrief(
+                headline="核试验", overview="", items=[item], has_material_news=True
+            )
+
+        sender = MockWebhookSender()
+        runner = NewsMonitorRunner(
+            Settings(
+                db_path=db,
+                telegram_channels=["reuters"],
+                digest_min_candidates=1,
+                digest_max_wait_seconds=0,
+                digest_card_interval_seconds=0,
+                digest_min_interval_seconds=0,
+                news_max_age_seconds=86400,
+                morning_flush_enabled=False,
+                quiet_hours="",
+                shoulder_hours="",
+                hotness_threshold=7,
+            ),
+            repo,
+            MockScraper(),
+            MockEvaluator(digest_builder=builder),
+            sender,
+        )
+        assert runner.process_pending(now=BJ)["alerts_sent"] == 1
+        payload = sender.sent_payloads[0]
+        card = payload["card"]
+        blob = str(payload)
+        assert card["header"]["template"] == "orange"
+        assert "💹 投资影响" not in blob
+        assert "🔎 核验 **传闻**" in blob
+        assert "reuters" not in card["header"]["title"]["content"].lower()
+
+    def test_runner_reversal_on_post_text_stays_official(self, tmp_path) -> None:
+        from tg_news_monitor.config import Settings
+        from tg_news_monitor.core.models import TelegramPost
+
+        db = str(tmp_path / "veto_ok.db")
+        repo = PostRepository(db)
+        post = TelegramPost(
+            channel="reuters",
+            message_id=89,
+            text=REVERSAL_CONFIRMED_SUMMARY,
+            direct_url="https://t.me/reuters/89",
+            published_at=BJ,
+        )
+        repo.save_post(post)
+
+        def builder(batch):
+            item = _news_item(
+                score=10,
+                verification_status="official",
+                summary="伊朗将推进相关安排。",
+            )
+            item.channel = batch[0].channel
+            item.message_id = batch[0].message_id
+            item.event_at = batch[0].published_at
+            return DigestBrief(
+                headline="确认", overview="", items=[item], has_material_news=True
+            )
+
+        sender = MockWebhookSender()
+        runner = NewsMonitorRunner(
+            Settings(
+                db_path=db,
+                telegram_channels=["reuters"],
+                digest_min_candidates=1,
+                digest_max_wait_seconds=0,
+                digest_card_interval_seconds=0,
+                digest_min_interval_seconds=0,
+                news_max_age_seconds=86400,
+                morning_flush_enabled=False,
+                quiet_hours="",
+                shoulder_hours="",
+                hotness_threshold=7,
+            ),
+            repo,
+            MockScraper(),
+            MockEvaluator(digest_builder=builder),
+            sender,
+        )
+        assert runner.process_pending(now=BJ)["alerts_sent"] == 1
+        payload = sender.sent_payloads[0]
+        assert payload["card"]["header"]["template"] == "red"
+        assert "💹 投资影响" in str(payload)
 
 
 class TestWechatNearDupAndPrompt:
@@ -390,6 +598,53 @@ class TestWechatNearDupAndPrompt:
         assert len(sender.sent_payloads) == 1
         row = repo.get_post("oldpix", 32, group_id="old_photos")
         assert row["filter_reason"] == "near_duplicate"
+
+    def test_feishu_simao_pair_news_jaccard_stays_below_threshold(self) -> None:
+        left = claim_blob(FEISHU_SIMAO_1_TITLE, FEISHU_SIMAO_1_BODY)
+        right = claim_blob(FEISHU_SIMAO_2_TITLE, FEISHU_SIMAO_2_BODY)
+        assert similar_event(left, right) is False
+
+    def test_feishu_simao_pair_photo_predicate_is_near_dup(self) -> None:
+        from tg_news_monitor.core.near_dup import similar_photo_event
+
+        left = claim_blob(FEISHU_SIMAO_1_TITLE, FEISHU_SIMAO_1_BODY)
+        right = claim_blob(FEISHU_SIMAO_2_TITLE, FEISHU_SIMAO_2_BODY)
+        assert similar_photo_event(left, right) is True
+
+    def test_feishu_simao_second_card_near_duplicate(self, tmp_path) -> None:
+        db = str(tmp_path / "feishu_simao.db")
+        repo = PostRepository(db)
+        repo.save_posts(
+            [
+                _wechat_post(51, FEISHU_SIMAO_1_BODY, published_at=BJ),
+                _wechat_post(52, FEISHU_SIMAO_2_BODY, published_at=BJ),
+            ],
+            group_id="old_photos",
+        )
+
+        def builder(batch):
+            items = [
+                self._photo_item(batch[0], FEISHU_SIMAO_1_TITLE, FEISHU_SIMAO_1_BODY),
+                self._photo_item(batch[1], FEISHU_SIMAO_2_TITLE, FEISHU_SIMAO_2_BODY),
+            ]
+            items[1].rank = 2
+            return DigestBrief(headline="影像", overview="", items=items, has_material_news=True)
+
+        sender = MockWebhookSender()
+        runner = NewsMonitorRunner(
+            self._photo_settings(db),
+            repo,
+            MockScraper(),
+            MockEvaluator(digest_builder=builder),
+            sender,
+        )
+        summary = runner.process_pending(now=BJ)
+        assert summary["alerts_sent"] == 1
+        assert len(sender.sent_payloads) == 1
+        row = repo.get_post("oldpix", 52, group_id="old_photos")
+        assert row["filter_reason"] == "near_duplicate"
+        first = repo.get_post("oldpix", 51, group_id="old_photos")
+        assert first["alert_sent"] == 1
 
     def test_different_era_simao_pair_still_sends(self, tmp_path) -> None:
         db = str(tmp_path / "simao_era.db")

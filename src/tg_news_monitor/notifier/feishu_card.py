@@ -81,6 +81,33 @@ RELIABLE_VERIFICATION = frozenset({"official", "multi_source"})
 ALLOWED_VERIFICATION = frozenset({"official", "multi_source", "single_source", "rumor"})
 NON_NEUTRAL_BIAS = frozenset({"利多", "利空"})
 UNVERIFIED_DISPLAY_CAP = 8  # orange / 4 flames; never red 特急
+VERIFICATION_LABELS = {
+    "official": "官方",
+    "multi_source": "多源确认",
+    "single_source": "单源待核实",
+    "rumor": "传闻",
+}
+# Conservative negative-evidence markers from post/summary text, not channel names.
+_RUMOR_MARKERS = (
+    "传闻",
+    "匿名消息",
+    "未经证实",
+    "尚无官方确认",
+    "未获官方证实",
+    "尚无官方证实",
+    "社交媒体流传",
+    "据称",
+)
+_CONFIRM_MARKERS = (
+    "现已获官方确认",
+    "已获官方确认",
+    "现已获官方证实",
+    "已获官方证实",
+    "现已得到官方确认",
+    "现已得到官方证实",
+    "官方已确认",
+    "官方已证实",
+)
 
 
 def normalize_verification_status(value: Any) -> str:
@@ -90,7 +117,26 @@ def normalize_verification_status(value: Any) -> str:
     return "single_source"
 
 
-def display_score(item: Any, raw_score: Any = None) -> int:
+def effective_verification_status(claimed: Any, *texts: Any) -> str:
+    """Downgrade official/multi_source when the text itself is rumor-grade.
+
+    Confirmation phrases win so「此前未经证实，但现已获官方确认」stays official.
+    Does not read channel names.
+    """
+    status = normalize_verification_status(claimed)
+    if status not in RELIABLE_VERIFICATION:
+        return status
+    evidence = "\n".join(str(part) for part in texts if part)
+    if not evidence:
+        return status
+    if any(marker in evidence for marker in _CONFIRM_MARKERS):
+        return status
+    if any(marker in evidence for marker in _RUMOR_MARKERS):
+        return "rumor"
+    return status
+
+
+def display_score(item: Any, raw_score: Any = None, evidence_text: Any = None) -> int:
     """Presentation score. Does not write back to item.score."""
     if raw_score is None:
         raw_score = getattr(item, "score", None)
@@ -102,7 +148,11 @@ def display_score(item: Any, raw_score: Any = None) -> int:
             score = max(1, min(10, int(raw_score)))
         except (TypeError, ValueError):
             score = max(1, min(10, 11 - rank))
-    status = normalize_verification_status(getattr(item, "verification_status", None))
+    status = effective_verification_status(
+        getattr(item, "verification_status", None),
+        evidence_text,
+        getattr(item, "summary", None),
+    )
     if status not in RELIABLE_VERIFICATION:
         return min(score, UNVERIFIED_DISPLAY_CAP)
     return score
@@ -128,11 +178,7 @@ def should_show_investment_impact(
     return str(category or "").strip() in INVESTMENT_IMPACT_CATEGORIES
 
 
-def _urgency_level(shown: int, status: str) -> str:
-    if status == "rumor":
-        return "传闻"
-    if status == "single_source":
-        return "待核实"
+def _importance_level(shown: int) -> str:
     if shown >= 9:
         return "特急"
     if shown >= 7:
@@ -140,6 +186,10 @@ def _urgency_level(shown: int, status: str) -> str:
     if shown >= 5:
         return "一般"
     return "低优"
+
+
+def verification_label(status: str) -> str:
+    return VERIFICATION_LABELS.get(status, "单源待核实")
 
 
 def investment_impact_rows(item: Any) -> List[tuple[str, str, str]]:
@@ -492,6 +542,7 @@ class FeishuCardBuilder:
         published_at: Optional[datetime] = None,
         subtitle: str = "投资情报快报",
         include_investment_impact: bool = True,
+        evidence_text: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Build Schema 2.0 single-item card. No Telegram/links/buttons/italics.
 
@@ -512,8 +563,12 @@ class FeishuCardBuilder:
             except (TypeError, ValueError):
                 score = max(1, min(10, 11 - rank))
 
-        status = normalize_verification_status(getattr(item, "verification_status", None))
-        shown = display_score(item, raw_score=score)
+        status = effective_verification_status(
+            getattr(item, "verification_status", None),
+            evidence_text,
+            getattr(item, "summary", None),
+        )
+        shown = display_score(item, raw_score=score, evidence_text=evidence_text)
         color_template = get_color_template(shown)
         if shown >= 9:
             tier_emoji = "🚨"
@@ -523,8 +578,9 @@ class FeishuCardBuilder:
             tier_emoji = "📢"
         else:
             tier_emoji = "ℹ️"
-        urgency_label = _urgency_level(shown, status)
-        header_title = f"{tier_emoji} {category}｜{urgency_label}"
+        importance = _importance_level(shown)
+        cred_label = verification_label(status)
+        header_title = f"{tier_emoji} {category}｜{importance}·{cred_label}"
 
         dt = published_at if published_at is not None else getattr(item, "published_at", None)
         if isinstance(dt, datetime):
@@ -538,7 +594,8 @@ class FeishuCardBuilder:
         flames = "🔥" * min(5, max(1, (shown + 1) // 2))
         time_md = (
             f"🕒 **发布时间** {time_str}（北京时间）\n"
-            f"🎚️ **紧急** **{urgency_label}** {flames}"
+            f"🎚️ 等级 **{importance}** {flames}\n"
+            f"🔎 核验 **{cred_label}**"
         )
 
         summary = (getattr(item, "summary", None) or "").strip()
