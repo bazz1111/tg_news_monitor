@@ -15,6 +15,8 @@ def test_delivery_follows_channel_time_not_importance(tmp_path):
         items=[item_for(newer, 10, 'newer', rank=1), item_for(older, 7, 'older', rank=2)],
     )
     sent = []
-    runner._send_digest_item_card = lambda item, published_at: sent.append(item.message_id) or True
+    runner._send_digest_item_card = (
+        lambda item, published_at=None, **_kwargs: sent.append(item.message_id) or True
+    )
     assert runner.process_pending(now=now)['alerts_sent'] == 2
     assert sent == [1, 2]
