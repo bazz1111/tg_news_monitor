@@ -165,6 +165,8 @@ DIGEST_SYSTEM_PROMPT = """你是全球新闻编辑，覆盖美股、A股、宏�
 精选0–5条具有新事实且重要的新闻，宁缺毋滥，不凑数。过滤广告、评论、回顾、旧闻和所有加密货币/区块链内容。遵守本组站点主题策略，不得选用受限主题。面向抖音/国内短视频合规，宁可漏报不可放行：凡涉及中国大陆党政军领导人（姓名、职务、代称、影像、行程）、国内政治/军事/外交议题、敏感党史叙事，以及主权相关表述（台海、南海、新疆、西藏、香港等框架）一律不选。
 同一事件的相同事实合并，跨语言也合并；对比近期历史，没有新增关键事实不得重复。不同事件不可仅因同主题合并。
 若历史摘要已覆盖同一事件，仅当 is_update=true 且 update_reason 写明新增关键事实时才保留该条；仅换标题、补地点或「创纪录」等同一事实展开不要放入 items。
+近期历史已覆盖同一事件或同一主体时，后续条目必须：title 与 summary_bullets 只写本次新增事实，不得把历史里已有的结论再当新闻讲一遍；禁止把「CEO再次呼吁放缓」这类已推送结论写成第1条要点。is_update=true 时，update_reason 必须点出具体新动作/数字/实体；summary 如需语法衔接，旧语境最多一句短从句，不得用旧结论铺垫。
+同一批次：同一事件合并；不同角度优先一张卡同时写清两条新事实；仅当两条都有互不重复的新事实、且不共用套话时才拆成两条。
 event_at必须是正文所述事件或本次新增事实的时间（带时区ISO8601）；无法确定则null，不得用转发时间伪造事件时间。旧事件的新进展仅描述新事实。
 channel和message_id必须来自输入，不输出来源链接。score为1–10的重要性评分；军事/AI新闻不必有直接股市影响。
 category必须为以下之一：["军事", "地缘政治", "宏观财经", "科技/AI", "行业快讯", "突发安全", "宏观监管"]。军事=战争/冲突/演习/武器/国防工业；地缘政治=外交/制裁/选举等且非以军事为主。
@@ -296,7 +298,8 @@ def build_digest_user_prompt(
         return _build_wechat_photo_user_prompt(posts, max_text_chars)
     lines: List[str] = [
         f"【本轮待汇总 Telegram 快讯】共 {len(posts)} 条，请去噪、精选 0–5 条；"
-        "每条输出 summary_bullets(最多3条完整句、禁止省略号结尾)、score、actionable_insight；bias_* 必须为利多/利空/中性/不确定且与 impact_* 方向一致。",
+        "每条输出 summary_bullets(最多3条完整句、禁止省略号结尾)、score、actionable_insight；bias_* 必须为利多/利空/中性/不确定且与 impact_* 方向一致。"
+        "对比近期已推送历史：同一事件后续只写新事实，禁止复述已推送结论；不同角度可保留，但 title 与要点不得重复旧前提。",
         "",
     ]
     for idx, post in enumerate(posts, start=1):
@@ -315,7 +318,8 @@ def build_digest_user_prompt(
 
 DIGEST_HISTORY_SUFFIX = (
     "过去24小时最近已推送或投递状态待核实的事件（历史已覆盖的同一事件不要重复，"
-    "除非 is_update=true 且 update_reason 写明新事实）："
+    "除非 is_update=true 且 update_reason 写明具体新动作/数字/实体；"
+    "后续卡片的 title 与 summary_bullets 必须只写新增事实，禁止复述历史中已有的结论）："
 )
 
 

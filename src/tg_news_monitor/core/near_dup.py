@@ -19,6 +19,10 @@ Thresholds (documented so they can be retuned):
 Tuned to block the 2026-09-11 diesel pair (零售均价 $6 vs 创历史新高 $6.06)
 while still sending distinct macro stories (Fed vs diesel, gasoline vs diesel).
 
+Follow-up cards with a new angle are allowed. Before send, overlapping bullets
+that only restate a recent delivery are dropped so the card leads with the delta.
+Skip only when nothing meaningful remains.
+
 ponytail: 2-gram overlap is not NLU. Low-overlap paraphrases can miss;
 ``is_update`` + a new number/entity in ``update_reason`` is the escape hatch.
 """
@@ -27,7 +31,7 @@ from __future__ import annotations
 
 import re
 import unicodedata
-from typing import Iterable, Optional, Set
+from typing import Iterable, List, NamedTuple, Optional, Sequence, Set
 
 NEAR_DUP_JACCARD = 0.45
 NEAR_DUP_SPECIFIC_MIN = 1
@@ -35,6 +39,10 @@ NEAR_DUP_LOOSE_JACCARD = 0.30
 NEAR_DUP_LOOSE_SPECIFIC_MIN = 4
 NEAR_DUP_WINDOW_SECONDS = 86400
 EVENT_KEY_MIN_PARTS = 3
+# update_reason / leftover copy must add a new magnitude or ≥2 leftover tokens.
+# One new place-name (加州) on the same $6 print is not a material update.
+MATERIAL_UPDATE_MIN_NEW_TOKENS = 2
+FOLLOWUP_TITLE_MAX_LEN = 40
 
 # Longest first. Framing / units / rate-hike boilerplate, not entities.
 _TEMPLATE_PHRASES = tuple(
@@ -146,6 +154,7 @@ _NUM_RE = re.compile(
 )
 _LATIN_RE = re.compile(r"[a-z]{2,}")
 _CJK_RE = re.compile(r"[\u4e00-\u9fff]+")
+_CLAUSE_SPLIT_RE = re.compile(r"[。！？；;：:\n]|，(?=\S)")
 
 
 def normalize_news_text(text: str) -> str:
@@ -228,16 +237,33 @@ def similar_event(left: str, right: str) -> bool:
     return False
 
 
+def has_new_specific_content(
+    text: str,
+    previous: str,
+    *,
+    min_new_tokens: int = MATERIAL_UPDATE_MIN_NEW_TOKENS,
+) -> bool:
+    """True when text adds a new number bucket or enough leftover entities."""
+    new_nums = number_buckets(text) - number_buckets(previous)
+    new_toks = specific_tokens(text) - specific_tokens(previous)
+    return bool(new_nums) or len(new_toks) >= min_new_tokens
+
+
 def is_material_update(is_update: bool, update_reason: str, previous_summary: str) -> bool:
-    """True when the model marked an update and the reason adds a new number or entity."""
+    """True when the model marked an update and the reason adds a new number or entity.
+
+    A lone place-name add-on (加州) is not enough; need a new magnitude or a
+    longer leftover phrase with at least two specific tokens.
+    """
     if not is_update:
         return False
     reason = (update_reason or "").strip()
     if not reason:
         return False
-    new_nums = number_buckets(reason) - number_buckets(previous_summary)
+    if number_buckets(reason) - number_buckets(previous_summary):
+        return True
     new_toks = specific_tokens(reason) - specific_tokens(previous_summary)
-    return bool(new_nums) or bool(new_toks)
+    return len(reason) >= 10 and len(new_toks) >= MATERIAL_UPDATE_MIN_NEW_TOKENS
 
 
 def is_near_duplicate_blob(
@@ -258,3 +284,160 @@ def is_near_duplicate_blob(
             continue
         return True
     return False
+
+
+def reader_copy_blob(title: str, summary: str, bullets: Optional[Sequence[str]] = None) -> str:
+    parts = [claim_blob(title, summary)]
+    for raw in bullets or ():
+        bullet = str(raw).strip()
+        if bullet:
+            parts.append(bullet)
+    return " ".join(p for p in parts if p)
+
+
+def lead_title_from_text(text: str, max_len: int = FOLLOWUP_TITLE_MAX_LEN) -> str:
+    """Short headline from a kept delta sentence; cut at a clause mark when possible."""
+    s = re.sub(r"\s+", " ", (text or "").strip()).lstrip("•-* ")
+    if not s:
+        return ""
+    for sep in ("。", "！", "？", "；", "，"):
+        if sep in s:
+            head = s.split(sep, 1)[0].strip()
+            if head:
+                s = head
+                break
+    if len(s) > max_len:
+        s = s[:max_len].rstrip()
+    return s
+
+
+def _clauses(text: str) -> List[str]:
+    """Split a delivery blob into clauses so a follow-up sentence can match one fact."""
+    parts: List[str] = []
+    for raw in _CLAUSE_SPLIT_RE.split(text or ""):
+        part = raw.strip(" ，,、:：")
+        if len(part) >= 6:
+            parts.append(part)
+    body = re.sub(r"\s+", " ", (text or "").strip())
+    if body:
+        parts.append(body)
+    seen = set()
+    out: List[str] = []
+    for part in parts:
+        if part not in seen:
+            seen.add(part)
+            out.append(part)
+    return out
+
+
+def restates_previous(text: str, previous: str) -> bool:
+    """True when this sentence matches a recently delivered clause without a new number."""
+    body = (text or "").strip()
+    prev = (previous or "").strip()
+    if not body or not prev:
+        return False
+    if number_buckets(body) - number_buckets(prev):
+        return False
+    if similar_event(body, prev):
+        return True
+    prev_clauses = _clauses(prev)
+    for cand in (body, *_clauses(body)):
+        for clause in prev_clauses:
+            if similar_event(cand, clause):
+                return True
+    return False
+
+
+def _clean_recent(recent_summaries: Iterable[str]) -> List[str]:
+    out: List[str] = []
+    for raw in recent_summaries:
+        prev = (raw or "").strip()
+        if prev:
+            out.append(prev)
+    return out
+
+
+def _restates_any(text: str, recents: Sequence[str]) -> bool:
+    return any(restates_previous(text, prev) for prev in recents)
+
+
+def _delta_against_any(text: str, recents: Sequence[str]) -> bool:
+    body = (text or "").strip()
+    if not body or not recents:
+        return False
+    return any(has_new_specific_content(body, prev) for prev in recents)
+
+
+class FollowupSanitize(NamedTuple):
+    skip: bool
+    rewritten: bool
+    title: str
+    summary: str
+    bullets: List[str]
+
+
+def sanitize_followup_copy(
+    title: str,
+    summary: str,
+    bullets: Optional[Sequence[str]] = None,
+    recent_summaries: Iterable[str] = (),
+    *,
+    is_update: bool = False,
+    update_reason: str = "",
+) -> FollowupSanitize:
+    """Drop restated premise from a news digest card; skip if no delta remains.
+
+    Does not tighten Jaccard. A new angle still sends after overlapping bullets
+    are stripped. Same-event rewrites with only framing/location stay skipped.
+    """
+    title = (title or "").strip()
+    summary = (summary or "").strip()
+    raw_bullets = [str(b).strip() for b in (bullets or ()) if str(b).strip()]
+    recents = _clean_recent(recent_summaries)
+    if not recents:
+        return FollowupSanitize(False, False, title, summary, raw_bullets)
+
+    reader_blob = reader_copy_blob(title, summary, raw_bullets)
+    title_summary = claim_blob(title, summary)
+    high_overlap = any(
+        similar_event(title_summary, prev) or similar_event(reader_blob, prev) for prev in recents
+    )
+    material = any(is_material_update(is_update, update_reason, prev) for prev in recents)
+    kept = [b for b in raw_bullets if not _restates_any(b, recents)]
+    stripped_some = len(kept) < len(raw_bullets)
+
+    if not raw_bullets:
+        if summary and not _restates_any(summary, recents):
+            kept = [summary]
+        elif material or _delta_against_any(update_reason, recents):
+            seed = (update_reason or "").strip()
+            if seed:
+                kept = [seed]
+        elif high_overlap and not (material or _delta_against_any(title_summary, recents)):
+            return FollowupSanitize(True, False, title, summary, raw_bullets)
+
+    if not kept:
+        if material or _delta_against_any(update_reason, recents):
+            seed = (update_reason or "").strip()
+            if seed:
+                kept = [seed]
+        elif raw_bullets or high_overlap:
+            return FollowupSanitize(True, False, title, summary, raw_bullets)
+        else:
+            return FollowupSanitize(False, False, title, summary, raw_bullets)
+
+    if not (high_overlap or stripped_some or material):
+        return FollowupSanitize(False, False, title, summary, raw_bullets)
+
+    new_title = title
+    new_summary = summary
+    title_old = _restates_any(title, recents)
+    summary_old = _restates_any(summary, recents)
+    if title_old or is_update or stripped_some:
+        lead = lead_title_from_text(kept[0])
+        if lead:
+            new_title = lead
+    if summary_old or is_update or stripped_some:
+        new_summary = kept[0]
+    rewritten = new_title != title or new_summary != summary or kept != raw_bullets
+    return FollowupSanitize(False, rewritten, new_title, new_summary, kept)
