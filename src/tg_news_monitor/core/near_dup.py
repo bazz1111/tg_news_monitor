@@ -37,6 +37,9 @@ NEAR_DUP_JACCARD = 0.45
 NEAR_DUP_SPECIFIC_MIN = 1
 NEAR_DUP_LOOSE_JACCARD = 0.30
 NEAR_DUP_LOOSE_SPECIFIC_MIN = 4
+# wechat_photo only. Do not use these on news24.
+PHOTO_NEAR_DUP_JACCARD = 0.22
+PHOTO_NEAR_DUP_SPECIFIC_MIN = 10
 NEAR_DUP_WINDOW_SECONDS = 86400
 EVENT_KEY_MIN_PARTS = 3
 # update_reason / leftover copy must add a new magnitude or ≥2 leftover tokens.
@@ -82,6 +85,14 @@ _TEMPLATE_PHRASES = tuple(
             "宣布",
             "表示",
             "指出",
+            "照片为",
+            "照片记录",
+            "照片显示",
+            "画面呈现",
+            "画面中",
+            "珍贵影像",
+            "繁荣景象",
+            "历史瞬间",
         ),
         key=len,
         reverse=True,
@@ -152,6 +163,27 @@ _NUM_RE = re.compile(
     r"(\d{1,3}(?:,\d{3})+|\d+)(?:\.(\d+))?",
     re.I,
 )
+_ERA_RE = re.compile(
+    r"(春日|夏日|秋日|冬日|春季|夏季|秋季|冬季|春天|夏天|秋天|冬天|"
+    r"民国|清朝|清代|明朝|宋代|唐代|元代)"
+)
+_ERA_ALIASES = {"清朝": "清代"}
+_CN_DIGIT = {
+    "零": "0",
+    "〇": "0",
+    "○": "0",
+    "一": "1",
+    "二": "2",
+    "三": "3",
+    "四": "4",
+    "五": "5",
+    "六": "6",
+    "七": "7",
+    "八": "8",
+    "九": "9",
+}
+_CN_YEAR_RE = re.compile(r"([零〇○一二三四五六七八九]{2,4})年")
+_CN_CENTURY_DECADE_RE = re.compile(r"二十世纪([零〇○一二三四五六七八九十]+)年代")
 _LATIN_RE = re.compile(r"[a-z]{2,}")
 _CJK_RE = re.compile(r"[\u4e00-\u9fff]+")
 _CLAUSE_SPLIT_RE = re.compile(r"[。！？；;：:\n]|，(?=\S)")
@@ -161,10 +193,36 @@ def normalize_news_text(text: str) -> str:
     return re.sub(r"\s+", " ", unicodedata.normalize("NFKC", text or "").casefold()).strip()
 
 
+def era_buckets(text: str) -> Set[str]:
+    """Season / dynasty markers so 春日 vs 冬日 is not the same event."""
+    return {_ERA_ALIASES.get(m, m) for m in _ERA_RE.findall(normalize_news_text(text))}
+
+
+def _cn_digit_run_to_int(text: str) -> Optional[int]:
+    if not text or any(ch not in _CN_DIGIT for ch in text):
+        return None
+    return int("".join(_CN_DIGIT[ch] for ch in text))
+
+
+def _cn_numeral_to_int(text: str) -> Optional[int]:
+    """五十→50, 十→10, 一九二六→1926. Digit-run years, not 一千九百."""
+    if "十" not in text:
+        return _cn_digit_run_to_int(text)
+    if text == "十":
+        return 10
+    left, _, right = text.partition("十")
+    tens = 1 if not left else _cn_digit_run_to_int(left)
+    ones = 0 if not right else _cn_digit_run_to_int(right)
+    if tens is None or ones is None:
+        return None
+    return tens * 10 + ones
+
+
 def number_buckets(text: str) -> Set[str]:
     """Integer-truncated magnitudes so 6.06 and 6 share a bucket; 6 vs 7 do not."""
     buckets: Set[str] = set()
-    for match in _NUM_RE.finditer(normalize_news_text(text)):
+    norm = normalize_news_text(text)
+    for match in _NUM_RE.finditer(norm):
         whole = match.group(1).replace(",", "")
         frac = match.group(2) or ""
         try:
@@ -175,6 +233,14 @@ def number_buckets(text: str) -> Set[str]:
             buckets.add(str(int(value)))
         else:
             buckets.add(f"{value:.2f}")
+    for match in _CN_YEAR_RE.finditer(norm):
+        year = _cn_digit_run_to_int(match.group(1))
+        if year is not None and year >= 1:
+            buckets.add(str(year))
+    for match in _CN_CENTURY_DECADE_RE.finditer(norm):
+        decade = _cn_numeral_to_int(match.group(1))
+        if decade is not None:
+            buckets.add(str(1900 + decade))
     return buckets
 
 
@@ -217,24 +283,46 @@ def claim_blob(title: str, summary: str) -> str:
     return title or summary
 
 
-def similar_event(left: str, right: str) -> bool:
-    left_tokens = content_tokens(left)
-    right_tokens = content_tokens(right)
-    if not left_tokens or not right_tokens:
-        return False
-    union = left_tokens | right_tokens
-    jaccard = len(left_tokens & right_tokens) / len(union)
+def _numbers_eras_compatible(left: str, right: str) -> bool:
     left_nums = number_buckets(left)
     right_nums = number_buckets(right)
     numbers_ok = (not left_nums or not right_nums) or bool(left_nums & right_nums)
     if not numbers_ok:
         return False
+    left_eras = era_buckets(left)
+    right_eras = era_buckets(right)
+    return (not left_eras or not right_eras) or bool(left_eras & right_eras)
+
+
+def similar_event(left: str, right: str) -> bool:
+    left_tokens = content_tokens(left)
+    right_tokens = content_tokens(right)
+    if not left_tokens or not right_tokens:
+        return False
+    if not _numbers_eras_compatible(left, right):
+        return False
+    union = left_tokens | right_tokens
+    jaccard = len(left_tokens & right_tokens) / len(union)
     specific = (left_tokens & right_tokens) - _GENERIC_TOKENS
     if jaccard >= NEAR_DUP_JACCARD and len(specific) >= NEAR_DUP_SPECIFIC_MIN:
         return True
     if jaccard >= NEAR_DUP_LOOSE_JACCARD and len(specific) >= NEAR_DUP_LOOSE_SPECIFIC_MIN:
         return True
     return False
+
+
+def similar_photo_event(left: str, right: str) -> bool:
+    """wechat_photo only: looser leftover overlap, same number/era compatibility."""
+    left_tokens = content_tokens(left)
+    right_tokens = content_tokens(right)
+    if not left_tokens or not right_tokens:
+        return False
+    if not _numbers_eras_compatible(left, right):
+        return False
+    union = left_tokens | right_tokens
+    jaccard = len(left_tokens & right_tokens) / len(union)
+    specific = (left_tokens & right_tokens) - _GENERIC_TOKENS
+    return jaccard >= PHOTO_NEAR_DUP_JACCARD and len(specific) >= PHOTO_NEAR_DUP_SPECIFIC_MIN
 
 
 def has_new_specific_content(
@@ -279,6 +367,27 @@ def is_near_duplicate_blob(
     for previous in recent_summaries:
         prev = (previous or "").strip()
         if not prev or not similar_event(blob, prev):
+            continue
+        if is_material_update(is_update, update_reason, prev):
+            continue
+        return True
+    return False
+
+
+def is_photo_near_duplicate_blob(
+    candidate: str,
+    recent_summaries: Iterable[str],
+    *,
+    is_update: bool = False,
+    update_reason: str = "",
+) -> bool:
+    """wechat_photo send-time near-dup. Does not change news Jaccard."""
+    blob = (candidate or "").strip()
+    if not blob:
+        return False
+    for previous in recent_summaries:
+        prev = (previous or "").strip()
+        if not prev or not similar_photo_event(blob, prev):
             continue
         if is_material_update(is_update, update_reason, prev):
             continue

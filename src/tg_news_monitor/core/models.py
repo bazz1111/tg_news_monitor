@@ -70,6 +70,10 @@ class DigestItem(BaseModel):
         le=10,
         description="Urgency score 1-10; if missing, card falls back to 11-rank",
     )
+    verification_status: str = Field(
+        default="single_source",
+        description="Evidence grade from post text only: official|multi_source|single_source|rumor",
+    )
     summary_bullets: List[str] = Field(
         default_factory=list,
         description="3-4 concise factual bullets for the single-card body",
@@ -107,6 +111,17 @@ class DigestItem(BaseModel):
         default="无直接影响",
         description="Impact on commodities (黄金/原油等)",
     )
+
+    @field_validator("verification_status", mode="before")
+    @classmethod
+    def _coerce_verification_status(cls, value: Any) -> str:
+        # Exact tokens only. Do not case-fold: "OFFICIAL" is not evidence.
+        if value is None:
+            return "single_source"
+        text = str(value).strip()
+        if text in {"official", "multi_source", "single_source", "rumor"}:
+            return text
+        return "single_source"
 
     @field_validator(
         "impact_overall",

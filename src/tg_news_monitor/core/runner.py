@@ -792,6 +792,7 @@ class NewsMonitorRunner:
         self,
         item: DigestItem,
         published_at: Optional[datetime] = None,
+        evidence_text: Optional[str] = None,
     ) -> bool:
         """Send one Feishu card for a single DigestItem."""
         profile = self._card_profile
@@ -817,6 +818,7 @@ class NewsMonitorRunner:
                 published_at=published_at,
                 subtitle=profile.subtitle or "投资情报快报",
                 include_investment_impact=profile.include_investment_impact,
+                evidence_text=evidence_text,
             )
         if hasattr(self.webhook_sender, "send"):
             return bool(self.webhook_sender.send(payload))
@@ -1524,32 +1526,39 @@ class NewsMonitorRunner:
                 delivery_text = self._delivery_text(matched_post)
                 extra_event_key = not self._is_wechat_photo()
                 skip_near_dup = False
-                if extra_event_key:
-                    followup = sanitize_followup_copy(
+                followup = sanitize_followup_copy(
+                    item.title,
+                    item.summary,
+                    getattr(item, "summary_bullets", None) or [],
+                    self.policy.recent_summaries(),
+                    is_update=bool(getattr(item, "is_update", False)),
+                    update_reason=getattr(item, "update_reason", "") or "",
+                )
+                if followup.skip:
+                    skip_near_dup = True
+                elif followup.rewritten:
+                    logger.info(
+                        f"group={self._group_id} Stripped overlapping follow-up copy: "
+                        f"#{item.rank} {item.title!r} -> {followup.title!r}"
+                    )
+                    item.title = followup.title
+                    item.summary = followup.summary
+                    item.summary_bullets = followup.bullets
+                elif self.policy.is_near_duplicate(
+                    item.title,
+                    item.summary,
+                    is_update=bool(getattr(item, "is_update", False)),
+                    update_reason=getattr(item, "update_reason", "") or "",
+                ) or (
+                    self._is_wechat_photo()
+                    and self.policy.is_photo_near_duplicate(
                         item.title,
                         item.summary,
-                        getattr(item, "summary_bullets", None) or [],
-                        self.policy.recent_summaries(),
                         is_update=bool(getattr(item, "is_update", False)),
                         update_reason=getattr(item, "update_reason", "") or "",
                     )
-                    if followup.skip:
-                        skip_near_dup = True
-                    elif followup.rewritten:
-                        logger.info(
-                            f"group={self._group_id} Stripped overlapping follow-up copy: "
-                            f"#{item.rank} {item.title!r} -> {followup.title!r}"
-                        )
-                        item.title = followup.title
-                        item.summary = followup.summary
-                        item.summary_bullets = followup.bullets
-                    elif self.policy.is_near_duplicate(
-                        item.title,
-                        item.summary,
-                        is_update=bool(getattr(item, "is_update", False)),
-                        update_reason=getattr(item, "update_reason", "") or "",
-                    ):
-                        skip_near_dup = True
+                ):
+                    skip_near_dup = True
                 claim_summary = reader_copy_blob(
                     item.title,
                     item.summary,
@@ -1577,7 +1586,13 @@ class NewsMonitorRunner:
                 ):
                     continue
                 try:
-                    send_ok = self._send_digest_item_card(item, published_at=published_at)
+                    send_ok = self._send_digest_item_card(
+                        item,
+                        published_at=published_at,
+                        evidence_text=(
+                            matched_post.text if matched_post is not None else None
+                        ),
+                    )
                 except Exception as exc:
                     logger.error(f"Delivery uncertain, do not automatically resend: {exc}")
                     send_ok = False

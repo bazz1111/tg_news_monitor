@@ -10,6 +10,7 @@ from tg_news_monitor.core.near_dup import (
     claim_blob,
     event_key,
     is_near_duplicate_blob,
+    is_photo_near_duplicate_blob,
 )
 from tg_news_monitor.storage.database import db_session, ensure_runtime_tables, get_connection, safe_group_id
 
@@ -152,6 +153,15 @@ class DeliveryPolicy:
     def is_near_duplicate(self, title, summary, is_update=False, update_reason=""):
         """True if title+summary is the same event as a recent claim without a material update."""
         return is_near_duplicate_blob(
+            claim_blob(title, summary),
+            self.recent_summaries(),
+            is_update=is_update,
+            update_reason=update_reason or "",
+        )
+
+    def is_photo_near_duplicate(self, title, summary, is_update=False, update_reason=""):
+        """wechat_photo-only leftover overlap. News24 must keep using is_near_duplicate."""
+        return is_photo_near_duplicate_blob(
             claim_blob(title, summary),
             self.recent_summaries(),
             is_update=is_update,

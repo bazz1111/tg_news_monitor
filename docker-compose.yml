@@ -16,7 +16,9 @@ services:
     volumes:
       - ./data:/app/data
       - ./config.yaml:/app/config.yaml:ro
-      # Optional: copy topic_filters.yaml.example first; do not commit the live file.
+      # Optional read-only mount after copying topic_filters.yaml.example.
+      # Missing file is fine: topic filter is a no-op and startup must not fail.
+      # Do not commit the live wordlist.
       # - ./topic_filters.yaml:/app/topic_filters.yaml:ro
     logging:
       driver: "json-file"

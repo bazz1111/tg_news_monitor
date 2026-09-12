@@ -26,6 +26,7 @@ from tg_news_monitor.evaluator.prompt import (
     build_digest_user_prompt,
     build_system_prompt,
     build_user_prompt,
+    get_digest_item_json_schema,
     get_news_evaluation_json_schema,
 )
 
@@ -59,6 +60,7 @@ __all__ = [
     "NEWS_EVALUATION_JSON_SCHEMA",
     "build_system_prompt",
     "build_user_prompt",
+    "get_digest_item_json_schema",
     "get_news_evaluation_json_schema",
     "MultiStageFallbackHandler",
     "calculate_backoff_delay",

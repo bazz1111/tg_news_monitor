@@ -145,6 +145,82 @@ class TestSimilarEventDieselPair:
         assert event_key("美联储维持利率不变: 美联储宣布将联邦基金利率维持在现有区间。") != key1
 
 
+class TestChineseEraRecognition:
+    def test_century_decades_fifty_vs_eighty_are_not_duplicates(self):
+        a = "二十世纪五十年代北京大学校园建筑"
+        b = "二十世纪八十年代北京大学校园建筑"
+        assert similar_event(a, b) is False
+
+    def test_chinese_years_1926_vs_1986_are_not_duplicates(self):
+        a = "一九二六年拉卜楞寺闻思学院经堂建筑外观"
+        b = "一九八六年拉卜楞寺闻思学院经堂修缮后建筑外观"
+        assert similar_event(a, b) is False
+
+    def test_arabic_decades_1930_vs_1980_are_not_duplicates(self):
+        a = "1930年代云南思茅马帮商队"
+        b = "1980年代云南思茅马帮商队"
+        assert similar_event(a, b) is False
+
+    def test_minguo_vs_qing_are_not_duplicates(self):
+        a = "民国时期北京大学校园建筑"
+        b = "清代北京大学校园建筑"
+        assert similar_event(a, b) is False
+
+    def test_same_century_decade_paraphrase_is_duplicate(self):
+        a = "二十世纪五十年代北京大学校园建筑外观"
+        b = "二十世纪五十年代北大校园建筑景象"
+        assert similar_event(a, b) is True
+
+    def test_same_chinese_year_paraphrase_is_duplicate(self):
+        a = "一九二六年拉卜楞寺闻思学院经堂建筑外观"
+        b = "一九二六年拉卜楞寺闻思学院经堂外观"
+        assert similar_event(a, b) is True
+
+    def test_no_era_still_subject_scene_based(self):
+        a = "云南思茅马帮商队穿行于古城街巷"
+        b = "云南思茅马帮商队穿行古城街巷"
+        assert similar_event(a, b) is True
+
+
+class TestPhotoPredicateDoesNotChangeNewsJaccard:
+    def test_feishu_simao_pair_both_send_on_news24(self, tmp_path):
+        """Photo-only near-dup must not filter this paraphrase pair on news24."""
+        from tests.test_verification_status import (
+            FEISHU_SIMAO_1_BODY,
+            FEISHU_SIMAO_1_TITLE,
+            FEISHU_SIMAO_2_BODY,
+            FEISHU_SIMAO_2_TITLE,
+        )
+
+        db = str(tmp_path / "news_simao.db")
+        repo = PostRepository(db)
+        repo.save_post(_post(501, FEISHU_SIMAO_1_BODY, BJ_1541, channel="wire"))
+        repo.save_post(_post(502, FEISHU_SIMAO_2_BODY, BJ_1541, channel="wire"))
+        config = _news_settings(db, telegram_channels=["wire"], news_max_age_seconds=86400)
+
+        def builder(posts):
+            items = [
+                _item(posts[0], FEISHU_SIMAO_1_TITLE, FEISHU_SIMAO_1_BODY),
+                _item(posts[1], FEISHU_SIMAO_2_TITLE, FEISHU_SIMAO_2_BODY, score=8),
+            ]
+            items[1].rank = 2
+            return DigestBrief(
+                headline="影像", overview="", items=items, has_material_news=True
+            )
+
+        sender = MockWebhookSender()
+        runner = NewsMonitorRunner(
+            config, repo, MockScraper(), MockEvaluator(digest_builder=builder), sender
+        )
+        summary = runner.process_pending(now=BJ_1541)
+        assert summary["alerts_sent"] == 2
+        assert len(sender.sent_payloads) == 2
+        assert similar_event(
+            f"{FEISHU_SIMAO_1_TITLE}: {FEISHU_SIMAO_1_BODY}",
+            f"{FEISHU_SIMAO_2_TITLE}: {FEISHU_SIMAO_2_BODY}",
+        ) is False
+
+
 class TestDeliveryPolicyNearDup:
     def test_claim_and_near_dup_are_per_group(self, tmp_path):
         db = str(tmp_path / "iso.db")
